@@ -1,0 +1,26 @@
+## Build output
+bin/
+obj/
+.vs/
+dist/
+*.dll
+*.exe
+*.pdb
+*.zip
+
+## Logs
+*.log
+events.log
+
+## IDE
+.idea/
+*.user
+*.suo
+
+## Data (large game data files, fetch separately)
+data/
+preview/
+
+## OS
+Thumbs.db
+Desktop.ini
