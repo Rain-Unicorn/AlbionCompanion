@@ -59,7 +59,9 @@ namespace AlbionCompanion.Core
         public static bool IsPartyMember(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
-            if (name == "我自己") return true;
+            // R2/C4：本地玩家显示名统一走 LocalPlayerIdentity.DisplaySelfName（识别前=「我（识别中）」，
+            // 确认后=确认名），废弃旧的硬编码自称字面量（设计 §4.7 自检项）。
+            if (!string.IsNullOrEmpty(LocalPlayerIdentity.DisplaySelfName) && name == LocalPlayerIdentity.DisplaySelfName) return true;
             if (!string.IsNullOrEmpty(LocalPlayerName) && name == LocalPlayerName) return true;
             return _partyMembers.ContainsKey(name);
         }

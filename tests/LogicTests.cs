@@ -3,6 +3,7 @@ using System.IO;
 using System.Text;
 using System.Collections.Generic;
 using AlbionCompanion.Core;
+using AlbionCompanion.Core.DamageMeter;
 using AlbionCompanion.Core.Income;
 
 static class LogicTests
@@ -527,7 +528,164 @@ static class LogicTests
             Eq("T-05 确认来源 = NewCharacterMatch", LocalPlayerIdentity.CurrentSource, ConfirmSource.NewCharacterMatch);
             Eq("T-05 IsSelf 判定", LocalPlayerIdentity.IsSelf(2001), true);
             Eq("T-05 IsSelf 拒绝非本人", LocalPlayerIdentity.IsSelf(2002), false);
+        }
 
+        // ---------------------------------------------------------------
+        // T-06 R2 统一 ResolveCauser：未知 causer 归档到 -1「未知玩家」，
+        // 绝不落 key=0（key=0 是「我」专属，写错会把别人的输出算到我头上）
+        // ---------------------------------------------------------------
+        {
+            LocalPlayerIdentity.Reset();
+            GameEvents.DamageTracker.Clear();
+            var mobs = new Dictionary<long, string>();
+            var players = new Dictionary<long, string> { { 3001, "队友A" } };
+
+            // 有 id 但两字典都查不到 → -1（可被后补认领）
+            var ci1 = CauserResolver.Resolve(7777, true, mobs, players);
+            Eq("T-06 未知 causer → key=-1", ci1.TrackerKey, -1L);
+            Eq("T-06 显示名 = 未知玩家", ci1.DisplayName, "未知玩家");
+            Check("T-06 未知玩家可计数", ci1.Countable, "countable=false");
+
+            // 参数 6 缺失 → 同样 -1（与显式 0 语义不同）
+            var ci2 = CauserResolver.Resolve(0, false, mobs, players);
+            Eq("T-06 参数缺失 → key=-1", ci2.TrackerKey, -1L);
+
+            // 显式 causer=0 → -3「未知来源」（环境/DoT，不该冒充未知玩家去认领）
+            var ci3 = CauserResolver.Resolve(0, true, mobs, players);
+            Eq("T-06 显式 0 → key=-3", ci3.TrackerKey, -3L);
+            Eq("T-06 -3 显示名 = 未知来源", ci3.DisplayName, "未知来源");
+
+            // 怪物 → -9 且不可计数（不进 tracker）
+            mobs[8888] = "小蜘蛛";
+            var ci4 = CauserResolver.Resolve(8888, true, mobs, players);
+            Eq("T-06 怪物 → key=-9", ci4.TrackerKey, -9L);
+            Check("T-06 怪物不可计数", !ci4.Countable, "countable=true");
+
+            // 已知玩家 → 真实 id；本地玩家 → key=0
+            var ci5 = CauserResolver.Resolve(3001, true, mobs, players);
+            Eq("T-06 已知玩家 → key=真实 id", ci5.TrackerKey, 3001L);
+            LocalPlayerIdentity.OnJoinResponse(2001, "Me");
+            var ci6 = CauserResolver.Resolve(2001, true, mobs, players);
+            Eq("T-06 本地玩家 → key=0", ci6.TrackerKey, 0L);
+            Eq("T-06 key=0 显示名 = 确认名", ci6.DisplayName, "Me");
+        }
+
+        // ---------------------------------------------------------------
+        // T-07 负键显示名：-1/-2/-3/-9 全部有非数字、非空的人类可读名
+        // ---------------------------------------------------------------
+        {
+            LocalPlayerIdentity.Reset(); // T-06 末尾确认了身份，这里回到未确认态验证「我（识别中）」
+            string[] negNames = new[] {
+                CauserResolver.DisplayName(-1),
+                CauserResolver.DisplayName(-2),
+                CauserResolver.DisplayName(-3),
+                CauserResolver.DisplayName(-9)
+            };
+            string[] expect = { "未知玩家", "未知召唤物", "未知来源", "怪物" };
+            for (int i = 0; i < negNames.Length; i++)
+            {
+                Check("T-07 负键 " + (new[] { -1, -2, -3, -9 })[i] + " 显示名 = " + expect[i],
+                      negNames[i] == expect[i], "got <" + negNames[i] + ">");
+                Check("T-07 负键 " + (new[] { -1, -2, -3, -9 })[i] + " 非空非数字",
+                      !string.IsNullOrEmpty(negNames[i]) && !long.TryParse(negNames[i], out _),
+                      "got <" + negNames[i] + ">");
+            }
+            Eq("T-07 key=0 显示名 = 我（识别中）（未确认时）", CauserResolver.DisplayName(0), "我（识别中）");
+        }
+
+        // ---------------------------------------------------------------
+        // T-08 击杀三态（P1-5）：newHp 恰好=0 才算最后一击；
+        // 缺失（-1）与负值都不得当成击杀
+        // ---------------------------------------------------------------
+        {
+            LocalPlayerIdentity.Reset();
+            var trk = GameEvents.DamageTracker;
+            trk.Clear();
+            // 三种状态各打目标 500：恰好归零 / 缺失(-1) / 负值(-5)
+            trk.RecordDamage(4001, "测试者", 500, 100, 0, true);     // 击杀
+            trk.RecordDamage(4001, "测试者", 501, 100, -1, true);    // 血量未知 → 不算
+            trk.RecordDamage(4001, "测试者", 502, 100, -5, true);    // 血量负值 → 不算（旧代码 <=0 会误计）
+            Eq("T-08 仅恰好归零计 1 次击杀", trk.GetLastHitTargetCount(4001), 1);
+
+            // 换目标再补一击归零 → 计数 +1（HashSet 按目标去重）
+            trk.RecordDamage(4001, "测试者", 600, 50, 0, true);
+            trk.RecordDamage(4001, "测试者", 600, 50, 0, true);
+            Eq("T-08 同目标重复击杀去重", trk.GetLastHitTargetCount(4001), 2);
+
+            // target<=0（无目标信息）不计击杀
+            trk.RecordDamage(4001, "测试者", 0, 100, 0, true);
+            Eq("T-08 无目标 id 不计击杀", trk.GetLastHitTargetCount(4001), 2);
+
+            // 不存在的玩家 → 0 而非抛异常
+            Eq("T-08 未注册玩家计数 = 0", trk.GetLastHitTargetCount(9999), 0);
+        }
+
+        // ---------------------------------------------------------------
+        // T-09 大数字恒等式（R4/C5 前提）：GetTotals(All) 必须覆盖全部键
+        // （含隐藏负键），UI 逐榜求和会漏隐藏项。
+        // 注：-9 在生产路径永不进 tracker（Countable=false 门禁，§4.2）；
+        // 本测试在 tracker 层直接注入 -9=20，验证「即使存在隐藏键，
+        // GetTotals 也不丢」且排行榜仍排除 -9——两者合并读出 T 表口径 150。
+        // ---------------------------------------------------------------
+        {
+            LocalPlayerIdentity.Reset();
+            var trk = GameEvents.DamageTracker;
+            trk.Clear();
+            trk.RecordDamage(5001, "A", 100, 100, -1, true);   // A=100
+            trk.RecordDamage(-1, "未知玩家", 100, 30, -1, true); // -1=30
+            trk.RecordDamage(-9, "怪物", 100, 20, -1, true);    // -9=20（隐藏键）
+
+            var all = trk.GetTotals(DamageStatsTracker.DamageFilter.All);
+            Eq("T-09 GetTotals(All) 含隐藏项 = 150", all.TotalDamage, 150L);
+
+            // 恒等式：GetTotals == Σ GetAllPlayers()（大数字同源，不允许两套口径）
+            long sumAll = 0;
+            foreach (var p in trk.GetAllPlayers()) sumAll += p.TotalDamage;
+            Eq("T-09 恒等式 ΣGetAllPlayers = 150", sumAll, 150L);
+
+            // 排行榜排除 -9（不进主榜），但 -1 以「未知玩家」身份上榜
+            var top = trk.GetTopDamage();
+            Check("T-09 主榜不含怪物(-9)", top.TrueForAll(x => x.PlayerName != "怪物"), "monster leaked");
+            Check("T-09 主榜含未知玩家(-1)", top.Exists(x => x.PlayerName == "未知玩家"), "-1 missing");
+            long topSum = 0;
+            foreach (var x in top) topSum += x.TotalDamage;
+            Eq("T-09 主榜求和 = 130（少 20 怪物伤害）", topSum, 130L);
+        }
+
+        // ---------------------------------------------------------------
+        // T-10 RenameKey 合并语义（§L766 覆盖即丢的风险）：
+        // -1=100 后 A=50，rename(-1→A) 后 A 必须 = 150 而非 50
+        // ---------------------------------------------------------------
+        {
+            LocalPlayerIdentity.Reset();
+            var trk = GameEvents.DamageTracker;
+            trk.Clear();
+            trk.RecordDamage(-1, "未知玩家", 100, 100, -1, true);   // -1 累计 100
+            trk.RecordDamage(6001, "A", 100, 50, -1, true);         // A 累计 50
+            // -1 曾单杀过目标 700（这一击本身 +10，并入后伤害与击杀数都应转移到 A 名下）
+            trk.RecordDamage(-1, "未知玩家", 700, 10, 0, true);      // -1 累计 110
+            Eq("T-10 前置 -1 击杀数 = 1", trk.GetLastHitTargetCount(-1), 1);
+
+            bool ok = trk.RenameKey(-1, 6001, "A");
+            Check("T-10 rename 成功", ok, "ok=false");
+            Eq("T-10 合并相加：A=160（100+10+50，覆盖即丢的旧实现会只剩 110 或 50）",
+               trk.GetAllPlayers().Find(p => p.Key == 6001).TotalDamage, 160L);
+            Eq("T-10 合并后全表合计 = 160", trk.GetTotals(DamageStatsTracker.DamageFilter.All).TotalDamage, 160L);
+            Check("T-10 -1 已消失", !trk.GetAllPlayers().Exists(p => p.Key == -1), "-1 still exists");
+            Eq("T-10 击杀集合并集：A 继承 1 次击杀", trk.GetLastHitTargetCount(6001), 1);
+
+            // toKey 不存在 → 整条搬迁（数值不丢）
+            trk.Clear();
+            trk.RecordDamage(-1, "未知玩家", 100, 80, -1, true);
+            Check("T-10 搬迁到新键成功", trk.RenameKey(-1, 7001, "B"), "ok=false");
+            var b = trk.GetAllPlayers().Find(p => p.Key == 7001);
+            Check("T-10 新键承接全部数值", b.TotalDamage == 80 && b.Name == "B", "got " + (b.TotalDamage) + "/" + b.Name);
+
+            // fromKey == toKey → 拒绝（防误用清零自己）
+            Check("T-10 同键 rename 拒绝", !trk.RenameKey(7001, 7001, null), "ok=true");
+
+            // fromKey 不存在 → false 而非抛异常
+            Check("T-10 空 fromKey 返回 false", !trk.RenameKey(-12345, 7001, null), "ok=true");
         }
 
         Console.WriteLine();

@@ -7,6 +7,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using AlbionCompanion.Core.DamageMeter;
 using AlbionCompanion.Core.Income;
 
 namespace AlbionCompanion.Core
@@ -25,11 +26,49 @@ namespace AlbionCompanion.Core
         private static readonly ConcurrentDictionary<long, string> _playerNames = new ConcurrentDictionary<long, string>(); // 玩家名字字典
         private static readonly ConcurrentDictionary<long, string> _mobNames = new ConcurrentDictionary<long, string>(); // 怪物名字字典（照搬 SAT：区分玩家和怪物）
 
+        // R2/C4：-1「未知玩家」后补认领（设计 §4.6）——10 秒窗口内的唯一新角色才有资格认领
+        private static readonly object _attrGate = new object();
+        private static DateTime _lastUnknownHitUtc = DateTime.MinValue;                       // -1 最近一次命中的 UtcNow
+        private static readonly List<(long Id, string Name, DateTime Utc)> _recentNewChars = new List<(long, string, DateTime)>(); // 窗口内新见到的角色
+
         private static void UpdatePlayerLastSeen(long objectId)
         {
             if (GameEvents.Players.TryGetValue(objectId, out var player))
             {
                 player.LastSeen = DateTime.Now;
+            }
+        }
+
+        // R2/C4（设计 §4.6）：evt=29 新角色出现时尝试把 -1「未知玩家」的累计并入该角色。
+        // 保守三条件（任一不满足即放弃归因，-1 以「未知玩家」常驻——宁可未知，不可错挂）：
+        //   ① -1 在最近 10 秒内有伤害命中；② 该 10 秒窗口内只出现了这一个新角色（唯一候选）；
+        //   ③ 该 id 此前不在 _playerNames（真正的新面孔，由调用方在写字典前取快照传入）。
+        private static void TryAttributeUnknownPlayer(long id, string name, bool wasKnownPlayer)
+        {
+            DateTime nowUtc = DateTime.UtcNow;
+            lock (_attrGate)
+            {
+                // 记录本次新面孔，并把 10 秒窗口外的旧记录裁掉
+                if (!wasKnownPlayer)
+                    _recentNewChars.Add((id, name, nowUtc));
+                _recentNewChars.RemoveAll(x => (nowUtc - x.Utc).TotalSeconds > 10);
+
+                if (wasKnownPlayer) return;                    // 条件③：旧面孔不参与归因
+                if (_lastUnknownHitUtc == DateTime.MinValue) return; // 从未出现过 -1 命中
+                if ((nowUtc - _lastUnknownHitUtc).TotalSeconds > 10) return; // 条件①
+
+                var inWindow = _recentNewChars;                 // 已裁剪，剩窗口内新面孔
+                if (inWindow.Count != 1 || inWindow[0].Id != id) return; // 条件②：唯一候选且就是本人
+
+                // 三条件全满足 → 把 -1 的累计并入该角色（数值相加，见 DamageStatsTracker.RenameKey）
+                bool merged = GameEvents.DamageTracker.RenameKey(-1, id, string.IsNullOrEmpty(name) ? null : name);
+                if (merged)
+                {
+                    // 归因后清窗口，避免同一次 -1 份额被第二个新角色再认领
+                    _recentNewChars.Clear();
+                    _lastUnknownHitUtc = DateTime.MinValue;
+                    ReportStatus($"[归因] 未知玩家的战绩已并入 {name}");
+                }
             }
         }
 
@@ -411,6 +450,8 @@ namespace AlbionCompanion.Core
                         {
                             long id = Convert.ToInt64(objId);
                             string charName = name.ToString();
+                            // R2/C4：是否属于「真正的新面孔」——在写字典前先取快照（§4.6 条件③）
+                            bool wasKnownPlayer = _playerNames.ContainsKey(id);
                             _objectNames[id] = charName;
                             _playerNames[id] = charName; // 标记这是玩家
 
@@ -441,6 +482,12 @@ namespace AlbionCompanion.Core
                             // R1/C3：名字字典写完之后再联动身份状态机（设计 §3.5 固定顺序，
                             // 确保后续逻辑能读到自己）。C6 将在此追加 PartyState.OnNewCharacter。
                             LocalPlayerIdentity.OnNewCharacter(id, charName);
+
+                            // R2/C4：-1 未知玩家的后补认领（设计 §4.6，保守规则）——
+                            // 仅当 ① -1 在最近 10 秒内有命中；② 该窗口内只新增了这一个角色（唯一候选）；
+                            // ③ 此 id 此前不在 _playerNames（真正的新面孔）。三者同时成立才把 -1 的累计
+                            // 并入该角色；否则 -1 以「未知玩家」常驻（宁可未知，不可错挂队友头上）。
+                            TryAttributeUnknownPlayer(id, charName, wasKnownPlayer);
                         }
                         catch { }
                     }
@@ -488,94 +535,60 @@ namespace AlbionCompanion.Core
                             // 更新玩家最后出现时间
                             UpdatePlayerLastSeen(target);
 
-                            // 也更新造成伤害的玩家
-                            object causerObj;
+                            // R2/C4：causer 存在性单独判定（参数缺失 ≠ 显式 0），不再默认 causer=0
+                            bool hasCauserParam = evt.Parameters.ContainsKey(6);
                             long causer = 0;
-                            if (evt.Parameters.TryGetValue(6, out causerObj))
+                            if (hasCauserParam)
                             {
-                                causer = Convert.ToInt64(causerObj);
+                                causer = Convert.ToInt64(evt.Parameters[6]);
                                 UpdatePlayerLastSeen(causer);
                             }
 
-                            if (change < 0)
+                            // 统一 causer 解析（伤害/治疗共用，消除原两段复制粘贴分叉）：
+                            // 怪物 → -9 不统计；我 → 0；已知玩家 → 真实 id；未知 → -1/-3 负键
+                            var ci = CauserResolver.Resolve(causer, hasCauserParam, _mobNames, _playerNames);
+                            if (ci.Countable)
                             {
-                                // 血量下降 = 伤害
-                                // 完全照搬 SAT：只有当造成伤害的人不是怪物时才记录（也就是说，可能是玩家）
-                                // 怪物打我们的伤害不记录
-                                if (!_mobNames.ContainsKey(causer))
+                                if (ci.TrackerKey == -1)
                                 {
+                                    // 未知玩家命中时间戳，供 evt=29 后补认领的 10 秒窗口判定（设计 §4.6）
+                                    lock (_attrGate) { _lastUnknownHitUtc = DateTime.UtcNow; }
+                                }
+
+                                string targetName = _objectNames.TryGetValue(target, out var tn) ? tn : $"目标 {target}";
+                                if (change < 0)
+                                {
+                                    // 血量下降 = 伤害（怪物打人已在 ResolveCauser 过滤，不进榜）
                                     long damage = (long)Math.Abs(change);
-                                    // 名字 + tracker key 判定：
-                                    // - 已知玩家字典里的 = 其他玩家，用真实 causerId 做 key
-                                    // - 不在任何字典里 = 自己（含直接攻击/召唤物/DoT等），统一用 key=0 合并成一条
-                                    string causerName;
-                                    long trackerKey;
-                                    if (GameEvents.LocalPlayerObjectId.HasValue && causer == GameEvents.LocalPlayerObjectId.Value && !string.IsNullOrEmpty(GameEvents.LocalPlayerName))
-                                    {
-                                        causerName = GameEvents.LocalPlayerName;
-                                        trackerKey = 0;
-                                    }
-                                    else if (_playerNames.TryGetValue(causer, out var cn))
-                                    {
-                                        causerName = cn;
-                                        trackerKey = causer;
-                                    }
-                                    else
-                                    {
-                                        causerName = "我自己";
-                                        trackerKey = 0; // 所有"自己"相关伤害合并到同一条记录
-                                    }
-                                    string targetName = _objectNames.TryGetValue(target, out var tn) ? tn : $"目标 {target}";
                                     GameEvents.AddCombat(new GameEvents.CombatEntry
                                     {
                                         Time = DateTime.Now,
                                         Target = targetName,
                                         Damage = (int)damage,
                                         Type = "damage",
-                                        CauserName = causerName
+                                        CauserName = ci.DisplayName
                                     });
 
-                                    // 同时调用 SAT 的核心伤害追踪器（照搬 SAT）
+                                    // P1-5：读真实 p3（NewHealthValue）；缺失传 -1 表示未知，
+                                    // 禁止再用硬编码 0 冒充「刚好打死」（那会让每次命中都被记为最后一击）
+                                    double newHp = evt.Parameters.TryGetValue(3, out var hp) ? Convert.ToDouble(hp) : -1;
                                     bool isMobTarget = _mobNames.ContainsKey(target);
-                                    double newHealthValue = 0;
-                                    GameEvents.DamageTracker.RecordDamage(trackerKey, causerName, target, damage, newHealthValue, isMobTarget);
+                                    GameEvents.DamageTracker.RecordDamage(ci.TrackerKey, ci.DisplayName, target, damage, newHp, isMobTarget);
                                 }
-                            }
-                            else if (change > 0)
-                            {
-                                // 血量上升 = 治疗
-                                // 完全照搬 SAT：只有当造成治疗的人不是怪物时才记录
-                                if (!_mobNames.ContainsKey(causer))
+                                else if (change > 0)
                                 {
+                                    // 血量上升 = 治疗
                                     long heal = (long)change;
-                                    string causerName;
-                                    long trackerKey;
-                                    if (GameEvents.LocalPlayerObjectId.HasValue && causer == GameEvents.LocalPlayerObjectId.Value && !string.IsNullOrEmpty(GameEvents.LocalPlayerName))
-                                    {
-                                        causerName = GameEvents.LocalPlayerName;
-                                        trackerKey = 0;
-                                    }
-                                    else if (_playerNames.TryGetValue(causer, out var cn))
-                                    {
-                                        causerName = cn;
-                                        trackerKey = causer;
-                                    }
-                                    else
-                                    {
-                                        causerName = "我自己";
-                                        trackerKey = 0; // 所有"自己"相关治疗合并到同一条记录
-                                    }
-                                    string targetName = _objectNames.TryGetValue(target, out var tn) ? tn : $"目标 {target}";
                                     GameEvents.AddCombat(new GameEvents.CombatEntry
                                     {
                                         Time = DateTime.Now,
                                         Target = targetName,
                                         Damage = (int)heal,
                                         Type = "heal",
-                                        CauserName = causerName
+                                        CauserName = ci.DisplayName
                                     });
 
-                                    GameEvents.DamageTracker.RecordHeal(trackerKey, causerName, heal);
+                                    GameEvents.DamageTracker.RecordHeal(ci.TrackerKey, ci.DisplayName, heal);
                                 }
                             }
                         }

@@ -72,6 +72,15 @@ namespace AlbionCompanion.Core
 
         public static string? ManualName { get { lock (_gate) { return _manualName; } } }
 
+        /// <summary>
+        /// 「我」的展示名（R2 负键空间 key=0 的显示名）：已确认且有名字用真名，
+        /// 否则「我（识别中）」——不占用「未知玩家」语义。
+        /// </summary>
+        public static string DisplaySelfName
+        {
+            get { lock (_gate) { return string.IsNullOrEmpty(_confirmedName) ? "我（识别中）" : _confirmedName; } }
+        }
+
         /// <summary>判定出口：causerId 是否为已确认的本地玩家。</summary>
         public static bool IsSelf(long causerId)
         {
@@ -98,7 +107,11 @@ namespace AlbionCompanion.Core
                 string? oldName = _confirmedName;
 
                 if (_state == IdentityState.Confirmed && _confirmedId != null && _confirmedId != objectId)
+                {
                     Log("[身份冲突] JoinResponse ObjectId=" + objectId + " 与已确认 " + _confirmedId + " 不同，按服务器权威覆盖");
+                    // R2/C4（设计 §4.4 RemovePlayer）：旧 key=0 的累计是按旧 id 归因的，权威纠正后视为脏数据清掉
+                    GameEvents.DamageTracker.RemovePlayer(0);
+                }
 
                 ConfirmCore(objectId.Value, name, ConfirmSource.JoinResponse, resolvePending: true);
 
@@ -346,6 +359,11 @@ namespace AlbionCompanion.Core
                 // 挂起条目从候选起就挂在 IncomeTracker，这里一次性裁决，无中间可读状态
                 IncomeTracker.ResolvePending(objectId, candidateId);
             }
+
+            // R2/C4（设计 §936 原子性）：确认前该 ObjectId 若已以「普通玩家」身份进了 tracker
+            // （key=objectId），确认后新伤害会记到 key=0——同一人两条并列（§9.7「我出现两条」）。
+            // 必须与身份写入同一次锁序列内合并，不暴露裸的确认入口给 UI 分两次调。
+            GameEvents.DamageTracker.RenameKey(objectId, 0, string.IsNullOrEmpty(name) ? null : name);
         }
 
         /// <summary>Confirmed → Candidate 降级（T-05 推翻路径）；候选期没有 pending（Confirmed 态收益直接入账）。</summary>
