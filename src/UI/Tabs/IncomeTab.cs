@@ -45,8 +45,8 @@ namespace AlbionCompanion.UI.Tabs
             _summary.Text = "总收益：" + Th.Money(GameEvents.TotalIncome) + " 银币";
 
             var rows = new List<string[]>();
-            var list = GameEvents.Income;
-            for (int i = list.Count - 1; i >= 0 && rows.Count < 100; i--)
+            var list = GameEvents.SnapshotIncome();
+            for (int i = list.Length - 1; i >= 0 && rows.Count < 100; i--)
             {
                 var e = list[i];
                 rows.Add(new string[]

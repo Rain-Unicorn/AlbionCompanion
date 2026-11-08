@@ -11,7 +11,14 @@ namespace AlbionCompanion.Core.DamageMeter
 
         private readonly object _syncLock = new();
         private readonly Dictionary<long, DamageStatsPlayer> _players = new();
-        public DamageFilter FilterMode { get; set; } = DamageFilter.All;
+
+        // R3：FilterMode 由 UI 线程写、抓包线程读（GetTopDamage 内做 switch），必须纳入同一把锁。
+        private DamageFilter _filterMode = DamageFilter.All;
+        public DamageFilter FilterMode
+        {
+            get { lock (_syncLock) { return _filterMode; } }
+            set { lock (_syncLock) { _filterMode = value; } }
+        }
 
         /// <summary>记录伤害（照搬 SAT AddDamage 逻辑）。</summary>
         public void RecordDamage(
@@ -80,7 +87,7 @@ namespace AlbionCompanion.Core.DamageMeter
                 return _players.Values
                     .Select(x => new {
                         x.PlayerName,
-                        Damage = FilterMode switch {
+                        Damage = _filterMode switch {
                             DamageFilter.Pve => x.PveDamage,
                             DamageFilter.Pvp => x.PvpDamage,
                             _ => x.TotalDamage

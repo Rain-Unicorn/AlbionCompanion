@@ -1,0 +1,28 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    独立的测试可执行入口（设计 §10.3 / P2-9）。
+    为什么单独建工程：主工程是 WinExe + net8.0-windows，在 Linux/CI 上无法运行；
+    Core 层除 OcrHelper.cs 外不依赖 WinForms，因此这里用纯 net8.0 编译 src/Core 并可真实执行。
+    用法：在 tests 目录下执行 dotnet run（等价于 dotnet run project tests/LogicTests.csproj）
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseImplicitUsings>disable</UseImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>AlbionCompanion.Tests</AssemblyName>
+    <RootNamespace>AlbionCompanion.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 测试本体 + 主工程的全局 using -->
+    <Compile Include="LogicTests.cs" />
+    <Compile Include="..\src\GlobalUsings.cs" />
+
+    <!-- 待测的 Core 层；OcrHelper 依赖 System.Drawing/WinForms，排除 -->
+    <Compile Include="..\src\Core\**\*.cs" Exclude="..\src\Core\OcrHelper.cs" />
+  </ItemGroup>
+
+</Project>

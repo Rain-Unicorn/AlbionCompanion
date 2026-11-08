@@ -234,6 +234,121 @@ static class LogicTests
         };
         Eq("A11 单城无路线", Arbitrage.Compute(sameCity, 0.08, 0.025, 0).Count, 0);
 
+
+        // ---------------------------------------------------------------
+        // T-16 R3 并发烟雾：4 线程各写 10 万条 + 1 线程并发 Snapshot 10 万次
+        // 断言：不抛异常、快照条数单调不减、最终条数 == 500（按上限裁剪后的值）
+        // 说明：本条不需要实机，纯托管线程即可判定锁与快照是否真的生效。
+        // ---------------------------------------------------------------
+        {
+            var snapshotCounts = new List<int>();
+            var snapshotErrors = new List<string>();
+            var writeErrors = new List<string>();
+            const int PerThread = 100000;
+            const int Writers = 4;
+            const int SnapshotCalls = 100000;
+
+            var snapLock = new object();
+            var writers = new List<System.Threading.Thread>();
+            var stop = false;
+
+            for (int w = 0; w < Writers; w++)
+            {
+                int wid = w;
+                var t = new System.Threading.Thread(delegate ()
+                {
+                    try
+                    {
+                        for (int i = 0; i < PerThread; i++)
+                        {
+                            GameEvents.AddCombat(new GameEvents.CombatEntry
+                            {
+                                Time = DateTime.Now,
+                                Target = "t" + wid,
+                                Damage = 1,
+                                Type = "damage",
+                                CauserName = "w" + wid
+                            });
+                        }
+                    }
+                    catch (Exception ex) { lock (snapLock) { writeErrors.Add(ex.GetType().Name + ": " + ex.Message); } }
+                });
+                t.IsBackground = true;
+                writers.Add(t);
+            }
+
+            var snapper = new System.Threading.Thread(delegate ()
+            {
+                try
+                {
+                    int last = 0;
+                    for (int i = 0; i < SnapshotCalls; i++)
+                    {
+                        var arr = GameEvents.SnapshotCombat();
+                        // 快照内的元素必须可读（不允许拿到半构造数组）
+                        if (arr.Length > 0 && arr[arr.Length - 1] == null)
+                            lock (snapLock) { snapshotErrors.Add("快照末尾出现 null 元素"); }
+                        lock (snapLock)
+                        {
+                            if (arr.Length < last) snapshotErrors.Add("快照条数回退 " + last + " -> " + arr.Length);
+                            last = arr.Length;
+                            snapshotCounts.Add(arr.Length);
+                        }
+                    }
+                }
+                catch (Exception ex) { lock (snapLock) { snapshotErrors.Add(ex.GetType().Name + ": " + ex.Message); } }
+                finally { stop = true; }
+            });
+            snapper.IsBackground = true;
+
+            foreach (var t in writers) t.Start();
+            snapper.Start();
+            foreach (var t in writers) t.Join();
+            snapper.Join();
+
+            Check("T-16 写入线程无异常", writeErrors.Count == 0, string.Join(" | ", writeErrors.ToArray()));
+            Check("T-16 快照线程无异常", snapshotErrors.Count == 0, string.Join(" | ", snapshotErrors.ToArray()));
+            Check("T-16 快照条数单调不减", snapshotErrors.FindAll(e => e.Contains("回退")).Count == 0,
+                  string.Join(" | ", snapshotErrors.ToArray()));
+            Eq("T-16 最终条数按上限裁剪 = 500", GameEvents.CountCombat(), 500);
+            Check("T-16 快照次数达到 10 万", snapshotCounts.Count == SnapshotCalls, "count=" + snapshotCounts.Count);
+
+            // 三个集合的并发写同样跑一遍（更短的量，只验证不抛）
+            var moreErrors = new List<string>();
+            var tt = new System.Threading.Thread(delegate ()
+            {
+                try
+                {
+                    for (int i = 0; i < 20000; i++)
+                    {
+                        GameEvents.AddIncome(new GameEvents.IncomeEntry { Time = DateTime.Now, Silver = 1, Source = "x" });
+                        GameEvents.AddGathering(new GameEvents.GatheringEntry { Time = DateTime.Now, Resource = "r", Amount = 1, Fame = 0 });
+                        GameEvents.TryUpdateLastGatheringFame(i);
+                    }
+                }
+                catch (Exception ex) { lock (snapLock) { moreErrors.Add(ex.GetType().Name + ": " + ex.Message); } }
+            });
+            var rt = new System.Threading.Thread(delegate ()
+            {
+                try
+                {
+                    for (int i = 0; i < 20000; i++)
+                    {
+                        GameEvents.SnapshotIncome();
+                        GameEvents.SnapshotGathering();
+                        long inc = GameEvents.TotalIncome;
+                        int c = GameEvents.CountIncome();
+                        var byTarget = GameEvents.DamageByTarget;
+                        var byCauser = GameEvents.DamageByCauser;
+                    }
+                }
+                catch (Exception ex) { lock (snapLock) { moreErrors.Add(ex.GetType().Name + ": " + ex.Message); } }
+            });
+            tt.Start(); rt.Start(); tt.Join(); rt.Join();
+            Check("T-16 收益/采集集合并发读写无异常", moreErrors.Count == 0, string.Join(" | ", moreErrors.ToArray()));
+            Eq("T-16 收益条数按上限裁剪 = 500", GameEvents.CountIncome(), 500);
+        }
+
         Console.WriteLine();
         Console.WriteLine("passed=" + _pass + " failed=" + _fail);
         return _fail == 0 ? 0 : 1;

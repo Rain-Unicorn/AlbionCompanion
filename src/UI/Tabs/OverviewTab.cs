@@ -63,32 +63,35 @@ namespace AlbionCompanion.UI.Tabs
             // 采集
             long totalAmt = 0;
             long totalFame = 0;
-            var gList = GameEvents.Gathering;
-            for (int i = 0; i < gList.Count; i++)
+            // 快照在这里取一次，供下方三路归并复用；禁止在 Paint 内快照。
+            var gList = GameEvents.SnapshotGathering();
+            for (int i = 0; i < gList.Length; i++)
             {
                 totalAmt += gList[i].Amount;
                 totalFame += gList[i].Fame;
             }
             _gather.SetData("采集统计", Th.Money(totalAmt) + " 资源",
-                            "声望 " + Th.Money(totalFame) + "  ·  " + gList.Count + " 次");
+                            "声望 " + Th.Money(totalFame) + "  ·  " + gList.Length + " 次");
 
             // 收益
+            var income = GameEvents.SnapshotIncome();
             long inc = GameEvents.TotalIncome;
             _income.SetData("银币收益", Th.Money(inc),
-                            "明细 " + GameEvents.Income.Count + " 条");
+                            "明细 " + income.Length + " 条");
 
-            // 合并最近动态
+            // 合并最近动态：三份快照在锁外归并，UI 不再持有活集合
             var rows = new List<string[]>();
             int maxRows = 40;
-            int ci = GameEvents.Combat.Count - 1;
-            int gi = GameEvents.Gathering.Count - 1;
-            int ii = GameEvents.Income.Count - 1;
+            var combat = GameEvents.SnapshotCombat();
+            int ci = combat.Length - 1;
+            int gi = gList.Length - 1;
+            int ii = income.Length - 1;
 
             while (rows.Count < maxRows && (ci >= 0 || gi >= 0 || ii >= 0))
             {
-                DateTime ct = ci >= 0 ? GameEvents.Combat[ci].Time : DateTime.MinValue;
-                DateTime gt = gi >= 0 ? GameEvents.Gathering[gi].Time : DateTime.MinValue;
-                DateTime it = ii >= 0 ? GameEvents.Income[ii].Time : DateTime.MinValue;
+                DateTime ct = ci >= 0 ? combat[ci].Time : DateTime.MinValue;
+                DateTime gt = gi >= 0 ? gList[gi].Time : DateTime.MinValue;
+                DateTime it = ii >= 0 ? income[ii].Time : DateTime.MinValue;
                 DateTime latest = ct;
                 string type = "";
                 string detail = "";
@@ -99,21 +102,21 @@ namespace AlbionCompanion.UI.Tabs
 
                 if (latest == ct && ci >= 0)
                 {
-                    var e = GameEvents.Combat[ci]; ci--;
+                    var e = combat[ci]; ci--;
                     type = TypeText(e.Type);
                     detail = e.Target ?? "-";
                     val = e.Damage > 0 ? Th.Money(e.Damage) : "-";
                 }
                 else if (latest == gt && gi >= 0)
                 {
-                    var e = GameEvents.Gathering[gi]; gi--;
+                    var e = gList[gi]; gi--;
                     type = "采集";
                     detail = e.Resource ?? "-";
                     val = "+" + e.Amount;
                 }
                 else if (latest == it && ii >= 0)
                 {
-                    var e = GameEvents.Income[ii]; ii--;
+                    var e = income[ii]; ii--;
                     type = "收益";
                     detail = e.Source ?? "-";
                     val = "+" + Th.Money(e.Silver);

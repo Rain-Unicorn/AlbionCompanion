@@ -45,6 +45,8 @@ namespace AlbionCompanion.UI.Tabs
             if (IsDisposed) return;
 
             // 清理超过 60 秒没活动的玩家
+            // CD 枚举期间其它线程可写，因此先收集 key，再用 TryRemove 原子删除；
+            // 删除前复核 LastSeen，避免把刚被刷新的条目误删。
             var expired = new List<long>();
             foreach (var kv in GameEvents.Players)
             {
@@ -52,7 +54,13 @@ namespace AlbionCompanion.UI.Tabs
                     expired.Add(kv.Key);
             }
             foreach (var id in expired)
-                GameEvents.Players.Remove(id);
+            {
+                if (GameEvents.Players.TryGetValue(id, out var p) &&
+                    (DateTime.Now - p.LastSeen).TotalSeconds > 60)
+                {
+                    GameEvents.Players.TryRemove(id, out _);
+                }
+            }
 
             var list = new List<GameEvents.PlayerEntry>(GameEvents.Players.Values);
             list.Sort((a, b) => b.LastSeen.CompareTo(a.LastSeen));

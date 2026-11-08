@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -18,9 +19,10 @@ namespace AlbionCompanion.Core
         public static event Action<string> OnChatLine;
 
         // 目标 ObjectId -> 名字 映射
-        private static readonly Dictionary<long, string> _objectNames = new Dictionary<long, string>();
-        private static readonly Dictionary<long, string> _playerNames = new Dictionary<long, string>(); // 玩家名字字典
-        private static readonly Dictionary<long, string> _mobNames = new Dictionary<long, string>(); // 怪物名字字典（照搬 SAT：区分玩家和怪物）
+        // CD 承载：抓包线程写、UI/多抓包线程读；原先的 Dictionary 会在并发写时破坏内部结构。
+        private static readonly ConcurrentDictionary<long, string> _objectNames = new ConcurrentDictionary<long, string>();
+        private static readonly ConcurrentDictionary<long, string> _playerNames = new ConcurrentDictionary<long, string>(); // 玩家名字字典
+        private static readonly ConcurrentDictionary<long, string> _mobNames = new ConcurrentDictionary<long, string>(); // 怪物名字字典（照搬 SAT：区分玩家和怪物）
 
         private static void UpdatePlayerLastSeen(long objectId)
         {
@@ -33,7 +35,7 @@ namespace AlbionCompanion.Core
         private static bool _running;
         private static Thread _thread;
         private static readonly List<Socket> _sockets = new List<Socket>();
-        private static readonly Dictionary<string, bool> _seenPairs = new Dictionary<string, bool>();
+        private static readonly ConcurrentDictionary<string, bool> _seenPairs = new ConcurrentDictionary<string, bool>();
         private static long _lastSilver = -1; // 上次银币总量，-1表示未初始化
 
         static ChatSniffer()
@@ -207,9 +209,8 @@ namespace AlbionCompanion.Core
             if (!isPhotonPort && !looksPhoton) return;
 
             string pair = srcPort + "->" + dstPort;
-            if (!_seenPairs.ContainsKey(pair))
+            if (_seenPairs.TryAdd(pair, true))
             {
-                _seenPairs[pair] = true;
                 ReportStatus("Photon " + pair + " len=" + payloadLen);
             }
 
@@ -315,11 +316,10 @@ namespace AlbionCompanion.Core
                             if (OnChatLine != null) try { OnChatLine(debug); } catch { }
 
                             // 把声望值加到最近的一条采集记录里
-                            if (gained > 0 && GameEvents.Gathering.Count > 0)
+                            if (gained > 0)
                             {
-                                var last = GameEvents.Gathering[GameEvents.Gathering.Count - 1];
-                                last.Fame = (int)gained;
-                                GameEvents.FireUpdate();
+                                // 必须走锁内更新：evt=72 与 evt=61 可能落在不同线程
+                                GameEvents.TryUpdateLastGatheringFame((int)gained);
                             }
                         }
                         catch { }
@@ -686,13 +686,13 @@ namespace AlbionCompanion.Core
                 {
                     try
                     {
-                        GameEvents.PartyMemberNames.Clear();
+                        GameEvents.ClearParty();
                         // SAT: 参数9 = 名字数组，参数8 = GUID字节数组
                         if (evt.Parameters.TryGetValue(9, out var namesObj) && namesObj != null)
                         {
                             AddNamesFromArray(namesObj);
                         }
-                        ReportStatus($"[队伍] 已加入队伍，成员 {GameEvents.PartyMemberNames.Count} 人: {string.Join(", ", GameEvents.PartyMemberNames)}");
+                        ReportStatus($"[队伍] 已加入队伍，成员 {GameEvents.PartyMemberCount} 人: {string.Join(", ", GameEvents.PartyMemberSnapshot())}");
                         GameEvents.FireUpdate();
                     }
                     catch { }
@@ -711,7 +711,7 @@ namespace AlbionCompanion.Core
                 // 237 = PartyDisbanded (队伍解散) - 预估
                 else if (evt.GameEventCode == 237)
                 {
-                    GameEvents.PartyMemberNames.Clear();
+                    GameEvents.ClearParty();
                     ReportStatus("[队伍] 队伍已解散");
                     GameEvents.FireUpdate();
                 }
@@ -730,7 +730,7 @@ namespace AlbionCompanion.Core
             {
                 foreach (var n in strNames)
                 {
-                    if (!string.IsNullOrEmpty(n)) GameEvents.PartyMemberNames.Add(n);
+                    if (!string.IsNullOrEmpty(n)) GameEvents.AddPartyName(n);
                 }
             }
             else if (namesObj is object[] objNames)
@@ -738,7 +738,7 @@ namespace AlbionCompanion.Core
                 foreach (var o in objNames)
                 {
                     var n = o?.ToString();
-                    if (!string.IsNullOrEmpty(n)) GameEvents.PartyMemberNames.Add(n);
+                    if (!string.IsNullOrEmpty(n)) GameEvents.AddPartyName(n);
                 }
             }
         }

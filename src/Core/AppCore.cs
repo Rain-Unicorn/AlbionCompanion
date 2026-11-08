@@ -168,7 +168,10 @@ namespace AlbionCompanion.Core
                 {
                     PropertyNameCaseInsensitive = true,
                     ReadCommentHandling = JsonCommentHandling.Skip,
-                    AllowTrailingCommas = true
+                    AllowTrailingCommas = true,
+                    // AppSettings 用的是公有字段而非属性，System.Text.Json 默认不序列化字段，
+                    // 不加这一项 Save 出来就是 {}，重启后设置全部回退默认值。
+                    IncludeFields = true
                 };
                 var settings = JsonSerializer.Deserialize<AppSettings>(json, options);
                 if (settings == null) return new AppSettings();
@@ -187,7 +190,7 @@ namespace AlbionCompanion.Core
         {
             var dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
-            var options = new JsonSerializerOptions { WriteIndented = true };
+            var options = new JsonSerializerOptions { WriteIndented = true, IncludeFields = true };
             File.WriteAllText(path, JsonSerializer.Serialize(settings, options), new UTF8Encoding(false));
         }
     }

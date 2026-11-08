@@ -49,8 +49,8 @@ namespace AlbionCompanion.UI.Tabs
             long totalFame = 0;
             long ore = 0, fiber = 0, wood = 0, hide = 0, stone = 0;
 
-            var list = GameEvents.Gathering;
-            for (int i = 0; i < list.Count; i++)
+            var list = GameEvents.SnapshotGathering();
+            for (int i = 0; i < list.Length; i++)
             {
                 var e = list[i];
                 totalAmount += e.Amount;
@@ -67,7 +67,7 @@ namespace AlbionCompanion.UI.Tabs
             _breakdown.Text = "矿石 " + ore + "  ·  纤维 " + fiber + "  ·  木材 " + wood + "  ·  皮革 " + hide + "  ·  石头 " + stone;
 
             var rows = new List<string[]>();
-            for (int i = list.Count - 1; i >= 0 && rows.Count < 100; i--)
+            for (int i = list.Length - 1; i >= 0 && rows.Count < 100; i--)
             {
                 var e = list[i];
                 rows.Add(new string[]
