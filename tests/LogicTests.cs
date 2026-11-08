@@ -279,6 +279,10 @@ static class LogicTests
                 + "{\"UniqueName\":\"T4_BAG@1\",\"LocalizedNames\":{\"ZH-CN\":\"老手级背包\"}},"
                 + "{\"UniqueName\":\"T4_BAG_INSIGHT\",\"LocalizedNames\":{\"ZH-CN\":\"老手级洞察背包\"}},"
                 + "{\"UniqueName\":\"T4_2H_BOW\",\"LocalizedNames\":{\"ZH-CN\":\"老手级战弓\"}},"
+        + "{\"UniqueName\":\"T4_2H_BOW@1\",\"LocalizedNames\":{\"ZH-CN\":\"老手级战弓\"}},"
+        + "{\"UniqueName\":\"T4_2H_BOW@2\",\"LocalizedNames\":{\"ZH-CN\":\"老手级战弓\"}},"
+        + "{\"UniqueName\":\"T4_CAPE_BRIDGEWATCH\",\"LocalizedNames\":{\"ZH-CN\":\"老手级桥望披风\"}},"
+        + "{\"UniqueName\":\"TREASURE_SILVERWARE_RARITY1\",\"LocalizedNames\":{\"ZH-CN\":\"银器\"}},"
                 + "{\"UniqueName\":\"T4_MAIN_SWORD\",\"LocalizedNames\":{\"ZH-CN\":\"老手级阔剑\"}},"
                 + "{\"UniqueName\":\"T5_2H_BOW\",\"LocalizedNames\":{\"ZH-CN\":\"专家级战弓\"}},"
                 + "{\"UniqueName\":\"QUESTITEM_RABBITS_FOOT\",\"LocalizedNames\":{\"EN-US\":\"Rabbit's Foot\"}},"
@@ -322,6 +326,218 @@ static class LogicTests
             Check("M3 原始版损坏不抛异常", badRawIdx != null && badRawIdx.Count == wi.Count, "count mismatch");
             Check("M3 原始版损坏 WeightJoined=false", !badRawIdx.WeightJoined, "expected false");
             Eq("M3 原始版损坏 weight 全 null", badRawIdx.WeightedCount, 0);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // M4：市场查询页三级联动筛选 —— 分类树 / 级联清空 / 查价键
+    // 全部纯逻辑，离线可测（不依赖 WinForms、不依赖网络）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    // M4 缩样：原始版 items.json 带 @shopcategory / @shopsubcategory1 / @shopsubcategory2 / @enchantmentlevel
+    // 覆盖：同一 baseId 跨类目重复（取首个带分类）、附魔等级并集、无分类物品（必须计数告警不静默丢）
+    const string SampleTaxonomyRawJson = "{"
+        + "\"?xml\":{\"@version\":\"1.0\"},"
+        + "\"items\":{"
+        + "  \"equipmentitem\":["
+        + "    {\"@uniquename\":\"T4_HEAD_CLOTH_SET1\",\"@shopcategory\":\"head\",\"@shopsubcategory1\":\"cloth_helmet\",\"@shopsubcategory2\":\"head_cloth_set1\",\"@enchantmentlevel\":\"0\",\"@weight\":\"1.2\"},"
+        + "    {\"@uniquename\":\"T5_HEAD_CLOTH_SET1\",\"@shopcategory\":\"head\",\"@shopsubcategory1\":\"cloth_helmet\",\"@shopsubcategory2\":\"head_cloth_set1\",\"@enchantmentlevel\":\"0\",\"@weight\":\"1.2\"},"
+        + "    {\"@uniquename\":\"T5_HEAD_CLOTH_SET1\",\"@enchantmentlevel\":\"1\"},"
+        + "    {\"@uniquename\":\"T5_HEAD_CLOTH_SET1\",\"@enchantmentlevel\":\"2\"},"
+        + "    {\"@uniquename\":\"T4_HEAD_PLATE_SET1\",\"@shopcategory\":\"head\",\"@shopsubcategory1\":\"plate_helmet\",\"@shopsubcategory2\":\"head_plate_set1\",\"@enchantmentlevel\":\"0\",\"@weight\":\"2.0\"},"
+        + "    {\"@uniquename\":\"T5_ARMOR_CLOTH_SET1\",\"@shopcategory\":\"armors\",\"@shopsubcategory1\":\"cloth_armor\",\"@shopsubcategory2\":\"armors_cloth_set1\",\"@weight\":\"2.4\"},"
+        + "    {\"@uniquename\":\"T4_BAG\",\"@shopcategory\":\"bags\",\"@shopsubcategory1\":\"bags\",\"@weight\":\"3.4\"}"
+        + "  ],"
+        + "  \"weapon\":["
+        + "    {\"@uniquename\":\"T4_2H_BOW\",\"@shopcategory\":\"weapons\",\"@shopsubcategory1\":\"bow\",\"@shopsubcategory2\":\"bow_bow\",\"@weight\":\"6.8\"},"
+        + "    {\"@uniquename\":\"T5_2H_BOW\",\"@shopcategory\":\"weapons\",\"@shopsubcategory1\":\"bow\",\"@shopsubcategory2\":\"bow_bow\",\"@weight\":\"6.8\"},"
+        + "    {\"@uniquename\":\"T5_MAIN_SWORD\",\"@shopcategory\":\"weapons\",\"@shopsubcategory1\":\"sword\",\"@weight\":\"5.1\"}"
+        + "  ],"
+        + "  \"simpleitem\":["
+        + "    {\"@uniquename\":\"T4_ROCK\",\"@shopcategory\":\"crafting\",\"@shopsubcategory1\":\"resources\",\"@weight\":\"1.0\"},"
+        + "    {\"@uniquename\":\"T8_UNKNOWN_NO_CAT\"}"                                 // 无分类 → 计数，不进树
+        + "  ],"
+        + "  \"cape\":[{\"@uniquename\":\"T4_CAPE_BRIDGEWATCH\",\"@shopcategory\":\"capes\",\"@shopsubcategory1\":\"accessoires_capes_bridgewatch\",\"@weight\":\"1.0\"}]," 
+        + "  \"treasure\":[{\"@uniquename\":\"TREASURE_SILVERWARE_RARITY1\",\"@shopcategory\":\"other\",\"@shopsubcategory1\":\"luxurygoods\"}]"
+        + "}}";
+
+    const string SampleTaxonomyFmtJson = "["
+        + "{\"UniqueName\":\"T4_HEAD_CLOTH_SET1\",\"LocalizedNames\":{\"ZH-CN\":\"老手级学士风帽\"}},"
+        + "{\"UniqueName\":\"T5_HEAD_CLOTH_SET1\",\"LocalizedNames\":{\"ZH-CN\":\"专家级学士风帽\"}},"
+        + "{\"UniqueName\":\"T5_HEAD_CLOTH_SET1@1\",\"LocalizedNames\":{\"ZH-CN\":\"专家级学士风帽\"}},"
+        + "{\"UniqueName\":\"T5_HEAD_CLOTH_SET1@2\",\"LocalizedNames\":{\"ZH-CN\":\"专家级学士风帽\"}},"
+        + "{\"UniqueName\":\"T4_HEAD_PLATE_SET1\",\"LocalizedNames\":{\"ZH-CN\":\"老手级士兵头盔\"}},"
+        + "{\"UniqueName\":\"T5_ARMOR_CLOTH_SET1\",\"LocalizedNames\":{\"ZH-CN\":\"专家级学士长袍\"}},"
+        + "{\"UniqueName\":\"T4_BAG\",\"LocalizedNames\":{\"ZH-CN\":\"老手级背包\"}},"
+        + "{\"UniqueName\":\"T4_2H_BOW\",\"LocalizedNames\":{\"ZH-CN\":\"老手级战弓\"}},"
+        + "{\"UniqueName\":\"T4_2H_BOW@1\",\"LocalizedNames\":{\"ZH-CN\":\"老手级战弓\"}},"
+        + "{\"UniqueName\":\"T4_2H_BOW@2\",\"LocalizedNames\":{\"ZH-CN\":\"老手级战弓\"}},"
+        + "{\"UniqueName\":\"T4_CAPE_BRIDGEWATCH\",\"LocalizedNames\":{\"ZH-CN\":\"老手级桥望披风\"}},"
+        + "{\"UniqueName\":\"TREASURE_SILVERWARE_RARITY1\",\"LocalizedNames\":{\"ZH-CN\":\"银器\"}},"
+        + "{\"UniqueName\":\"T5_2H_BOW\",\"LocalizedNames\":{\"ZH-CN\":\"专家级战弓\"}},"
+        + "{\"UniqueName\":\"T5_MAIN_SWORD\",\"LocalizedNames\":{\"ZH-CN\":\"专家级阔剑\"}},"
+        + "{\"UniqueName\":\"T4_ROCK\",\"LocalizedNames\":{\"ZH-CN\":\"老手级石头\"}},"
+        + "{\"UniqueName\":\"T8_UNKNOWN_NO_CAT\",\"LocalizedNames\":{\"ZH-CN\":\"未知物品\"}}"
+        + "]";
+
+    static void RunTaxonomyTests()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ac_m4_tax_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string fmt = Path.Combine(dir, ItemIndex.FormattedFileName);
+            string raw = Path.Combine(dir, ItemIndex.RawFileName);
+            File.WriteAllText(fmt, SampleTaxonomyFmtJson);
+            File.WriteAllText(raw, SampleTaxonomyRawJson);
+
+            var idx = ItemIndex.Load(fmt, raw);
+            var tax = ItemTaxonomy.Build(idx);
+            Check("M4 分类树非空", tax.Categories.Count > 0, "categories=" + tax.Categories.Count);
+
+            // 一级：按游戏集市习惯排序，装备部位在前
+            var head = tax.Find("head");
+            Check("M4 一级 head 存在", head != null, "head missing");
+            Eq("M4 一级中文标签", head != null ? head.DisplayName : null, "头部护甲");
+            var weapons = tax.Find("weapons");
+            Eq("M4 一级 weapons 标签", weapons != null ? weapons.DisplayName : null, "武器");
+            Check("M4 一级排序：武器在头部护甲之前",
+                  tax.Categories.FindIndex(c => c.Key == "weapons") < tax.Categories.FindIndex(c => c.Key == "head"),
+                  "weapons should rank before head");
+
+            // 二级：材质分支
+            Check("M4 head 下有布甲风帽与板甲头盔",
+                  head != null && head.SubCategories.Exists(s => s.Key == "cloth_helmet")
+                              && head.SubCategories.Exists(s => s.Key == "plate_helmet"),
+                  "subcategories missing");
+            var clothHelmet = head == null ? null : head.SubCategories.Find(s => s.Key == "cloth_helmet");
+            Eq("M4 二级 cloth_helmet 标签", clothHelmet != null ? clothHelmet.DisplayName : null, "布甲风帽");
+
+            // 三级族：跨阶级合并成一个族，名字去掉阶级前缀
+            var fam = clothHelmet == null ? null : clothHelmet.Families.Find(f => f.Family == "HEAD_CLOTH_SET1");
+            Check("M4 三级族 HEAD_CLOTH_SET1 存在", fam != null, "family missing");
+            Eq("M4 族名去掉阶级前缀（老手级/专家级 → 学士风帽）",
+               fam != null ? fam.DisplayName : null, "学士风帽");
+            var tiers = fam == null ? new List<int>() : fam.Tiers();
+            Eq("M4 族阶级集合 = T4,T5", string.Join(",", tiers.ToArray()), "4,5");
+
+            // 附魔展开：@enchantmentlevel 并集 → (阶级,附魔) 矩阵，层级深度不变
+            var ench = fam == null ? new List<int>() : fam.Enchants(5);
+            Eq("M4 T5 附魔集合 = 0,1,2", string.Join(",", ench.ToArray()), "0,1,2");
+            Check("M4 T4 无附魔变体只含 0", fam != null && fam.Enchants(4).Count == 1 && fam.Enchants(4)[0] == 0,
+                  "T4 enchant set mismatch");
+            Check("M4 附魔变体 uniqueName 正确", fam != null && fam.Find(5, 2) != null
+                  && fam.Find(5, 2).UniqueName == "T5_HEAD_CLOTH_SET1@2", "variant uniqueName mismatch");
+            Check("M4 无附魔变体 uniqueName 不带 @0", fam != null && fam.Find(4, 0).UniqueName == "T4_HEAD_CLOTH_SET1",
+                  "T4 variant uniqueName mismatch");
+            Check("M4 族标记有附魔变体", fam != null && fam.HasEnchantVariants(), "HasEnchantVariants=false");
+
+            // 附魔全集来自 formatted 的 @N 后缀：raw 武器节点没有 @enchantmentlevel（真实数据即如此），
+            // 只靠 raw 会漏掉全部武器附魔，这里必须由 formatted 补齐。
+            var bow = tax.Find("weapons") == null ? null : tax.Find("weapons").SubCategories.Find(x => x.Key == "bow");
+            var bowFam = bow == null ? null : bow.Families.Find(f => f.Family == "2H_BOW");
+            Check("M4 raw 无附魔属性的族靠 formatted 补齐附魔", bowFam != null
+                  && string.Join(",", bowFam.Enchants(4).ToArray()) == "0,1,2", "bow enchants should be 0,1,2");
+            Check("M4 补齐后附魔变体 uniqueName 正确", bowFam != null && bowFam.Find(4, 2) != null
+                  && bowFam.Find(4, 2).UniqueName == "T4_2H_BOW@2", "bow @2 variant missing");
+
+            // 披风按城市分支必须有人类可读标签（真实数据 16 个分支，漏一个就显示原始 key）
+            var capes = tax.Find("capes");
+            Check("M4 披风一级存在", capes != null, "capes missing");
+            var bridgeCape = capes == null ? null : capes.SubCategories.Find(x => x.Key == "accessoires_capes_bridgewatch");
+            Eq("M4 披风城市分支标签", bridgeCape != null ? bridgeCape.DisplayName : null, "桥望披风");
+
+            // 珍宝（luxurygoods）标签补齐，不再落到 HumanizeKey
+            var otherCat = tax.Find("other");
+            var luxury = otherCat == null ? null : otherCat.SubCategories.Find(x => x.Key == "luxurygoods");
+            Eq("M4 珍宝二级标签", luxury != null ? luxury.DisplayName : null, "珍宝");
+
+            // 无分类物品：必须计数告警，绝不静默丢弃也不臆造分类
+            Eq("M4 无分类物品计数", tax.UnclassifiedItemCount, 1);
+            Check("M4 无分类物品不进任何一级", tax.Find("head") != null
+                  && !tax.Find("head").SubCategories.Exists(s => s.Families.Exists(f => f.Family == "UNKNOWN_NO_CAT")),
+                  "unclassified leaked into tree");
+
+            // 标签表缺项 → 记 UntranslatedKeys，但仍然出现在树里（丢标签不能丢物品）
+            Eq("M4 未翻译 key 记录（示例数据全覆盖则为 0）", tax.UntranslatedKeys.Count, 0);
+
+            // ── 级联清空：设计 §4.2 硬条件 ──
+            var sel = new MarketSelection();
+            sel.SelectCategory("head");
+            sel.SelectSubCategory("cloth_helmet");
+            sel.SelectFamily("HEAD_CLOTH_SET1");
+            sel.SelectVariant(5, 2);
+            Check("M4 三级选满", sel.IsComplete, "expected complete");
+            sel.SelectCategory("weapons"); // 换一级
+            Check("M4 换一级清空二级", !sel.HasSubCategory, "sub should be cleared");
+            Check("M4 换一级清空三级", !sel.HasFamily && sel.Tier == 0 && sel.Enchant == 0, "family/tier should be cleared");
+
+            sel.SelectSubCategory("bow");
+            sel.SelectFamily("2H_BOW");
+            sel.SelectVariant(5, 0);
+            sel.SelectSubCategory("sword");
+            Check("M4 换二级清空三级族", !sel.HasFamily && sel.Tier == 0, "family should be cleared");
+
+            // ── 查价键映射：筛选产物 = (uniqueName, quality) ──
+            var key = MarketQueryPlanner.Build(tax, new MarketSelection());
+            Check("M4 未选满产空键（M5 不发请求）", key.IsEmpty, "expected empty key");
+
+            var sel2 = new MarketSelection();
+            sel2.SelectCategory("head");
+            sel2.SelectSubCategory("cloth_helmet");
+            sel2.SelectFamily("HEAD_CLOTH_SET1");
+            sel2.SelectVariant(5, 1);
+            var key2 = MarketQueryPlanner.Build(tax, sel2);
+            Eq("M4 查价键物品数 = 1", key2.ItemCount, 1);
+            Eq("M4 查价键 uniqueName 含附魔", string.Join(",", key2.UniqueNames.ToArray()), "T5_HEAD_CLOTH_SET1@1");
+            Eq("M4 查价键品质全集 = 1..5", string.Join(",", key2.Qualities.ToArray()), "1,2,3,4,5");
+            Eq("M4 查价键格子数 = 1×6×5", key2.CellCount(6), 30);
+
+            // 品质收窄：只查指定品质
+            sel2.Qualities.Clear();
+            sel2.Qualities.Add(3);
+            var key3 = MarketQueryPlanner.Build(tax, sel2);
+            Eq("M4 品质收窄影响键", string.Join(",", key3.Qualities.ToArray()), "3");
+            Eq("M4 品质收窄后格子数 = 1×6×1", key3.CellCount(6), 6);
+
+            // 签名稳定：同一组合签名相同（缓存命中依据）
+            var selA = new MarketSelection();
+            selA.SelectCategory("head"); selA.SelectSubCategory("cloth_helmet");
+            selA.SelectFamily("HEAD_CLOTH_SET1"); selA.SelectVariant(5, 1);
+            var selB = new MarketSelection();
+            selB.SelectCategory("head"); selB.SelectSubCategory("cloth_helmet");
+            selB.SelectFamily("HEAD_CLOTH_SET1"); selB.SelectVariant(5, 1);
+            Eq("M4 同一筛选签名一致", MarketQueryPlanner.Build(tax, selA).Signature,
+               MarketQueryPlanner.Build(tax, selB).Signature);
+
+            // 组合不存在 → 空键（M9）
+            var selBad = new MarketSelection();
+            selBad.SelectCategory("weapons"); selBad.SelectSubCategory("bow");
+            selBad.SelectFamily("HEAD_CLOTH_SET1"); selBad.SelectVariant(5, 0);
+            Check("M4 组合不存在产空键（M9）", MarketQueryPlanner.Build(tax, selBad).IsEmpty, "expected empty");
+
+            // 不存在的附魔等级（T4 没有 @3）→ 空键，不臆造
+            var selNoEnch = new MarketSelection();
+            selNoEnch.SelectCategory("head"); selNoEnch.SelectSubCategory("cloth_helmet");
+            selNoEnch.SelectFamily("HEAD_CLOTH_SET1"); selNoEnch.SelectVariant(4, 3);
+            Check("M4 不存在的附魔等级产空键", MarketQueryPlanner.Build(tax, selNoEnch).IsEmpty, "expected empty");
+
+            // 面包屑三段
+            var crumbs = MarketQueryPlanner.Breadcrumbs(tax, sel2);
+            Eq("M4 面包屑一级", crumbs[0], "头部护甲");
+            Eq("M4 面包屑二级", crumbs[1], "布甲风帽");
+            Eq("M4 面包屑三级", crumbs[2], "T5 · 附魔 .1");
+            var crumbsNone = MarketQueryPlanner.Breadcrumbs(tax, new MarketSelection());
+            Check("M4 未选时面包屑为空", crumbsNone[0] == null && crumbsNone[1] == null && crumbsNone[2] == null,
+                  "expected all null");
+
+            // 空索引 → 空树（UI 显式告警依据）
+            var emptyTax = ItemTaxonomy.Build(null);
+            Eq("M4 索引为 null 时分类树为空", emptyTax.Categories.Count, 0);
         }
         finally
         {
@@ -1488,6 +1704,9 @@ static class LogicTests
 
         // ───────────────── M3 ItemIndex：本地物品元数据索引 ─────────────────
         RunItemIndexTests();
+
+        // ───────────────── M4 三级筛选：元数据分类树 + 查价键 ─────────────────
+        RunTaxonomyTests();
 
         Console.WriteLine("passed=" + _pass + " failed=" + _fail);
         return _fail == 0 ? 0 : 1;

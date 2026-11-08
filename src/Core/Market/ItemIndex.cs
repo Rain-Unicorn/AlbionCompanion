@@ -27,6 +27,20 @@ namespace AlbionCompanion.Core
         public double? Weight { get { return WeightKg; } }
 
         public bool HasWeight { get { return WeightKg.HasValue; } }
+
+        // ── 集市分类与变体（M4 三级联动筛选的数据来源）───────────────────────────
+        // 全部来自原始版 items.json 的 @shopcategory / @shopsubcategory1 / @shopsubcategory2 /
+        // @enchantmentlevel，是游戏集市菜单的同源字段。缺失即 null/空集合，由 ItemTaxonomy 计数告警，
+        // 绝不臆造分类。formatted 版完全没有这三个字段，故同样必须双文件 join。
+
+        /// <summary>一级分类原始值（如 weapons / head / armors），缺失为 null。</summary>
+        public string ShopCategory;
+        /// <summary>二级子类原始值（如 bow / cloth_helmet），缺失为 null。</summary>
+        public string ShopSubCategory1;
+        /// <summary>游戏内第三档店铺分类（本设计不下探，仅诊断保留），缺失为 null。</summary>
+        public string ShopSubCategory2;
+        /// <summary>该 baseId 在元数据里出现的附魔等级（0 = 无附魔本体；集合含 1..4 表示存在附魔变体）。</summary>
+        public List<int> EnchantLevels;
     }
 
     /// <summary>
@@ -113,7 +127,23 @@ namespace AlbionCompanion.Core
                             NameEn = ReadLocalized(item, "EN-US")
                         };
                         // 同一 baseId 只留一条（附魔变体中文名一致，实测 0 冲突；首个胜出）
-                        if (!index._byBase.ContainsKey(entry.BaseId)) index._byBase[entry.BaseId] = entry;
+                        ItemIndexEntry existing;
+                        if (!index._byBase.TryGetValue(entry.BaseId, out existing))
+                        {
+                            index._byBase[entry.BaseId] = entry;
+                            existing = entry;
+                        }
+
+                        // 附魔等级：formatted 版才是全集（武器/护甲等很多类目在 raw 版没有
+                        // @enchantmentlevel 节点，只有 craftresource 有）。以 UniqueName 的 @N 后缀为准，
+                        // 无后缀即 0 级；这里只累计集合，不改 name/baseId。
+                        if (existing.EnchantLevels == null) existing.EnchantLevels = new List<int>();
+                        int lv = 0;
+                        int at = uniqueName.IndexOf('@');
+                        if (at >= 0 && at + 1 < uniqueName.Length)
+                            int.TryParse(uniqueName.Substring(at + 1), NumberStyles.Integer,
+                                         CultureInfo.InvariantCulture, out lv);
+                        if (!existing.EnchantLevels.Contains(lv)) existing.EnchantLevels.Add(lv);
                     }
                 }
             }
@@ -132,6 +162,10 @@ namespace AlbionCompanion.Core
         /// 结构：根对象 {"?xml":..., "items":{类目:[{... "@uniquename","@weight"...}]}}。
         /// 原始版键名是小写 u 的 @uniquename（formatted 版是 PascalCase UniqueName），
         /// weight 是字符串（单位 kg），转 double 写入；转不出来或缺失一律留 null。
+        ///
+        /// M4 扩展：同一趟 join 还带上集市分类（@shopcategory / @shopsubcategory1 / @shopsubcategory2）
+        /// 与附魔等级（@enchantmentlevel）。三者与 weight 同源同文件，分开跑两趟毫无意义；
+        /// 分类缺失一律留 null（由 ItemTaxonomy 计数告警），绝不臆造。
         /// </summary>
         private void JoinWeights(string rawPath)
         {
@@ -194,10 +228,59 @@ namespace AlbionCompanion.Core
             string baseId = uniqueName.Split('@')[0];
             ItemIndexEntry entry;
             if (!_byBase.TryGetValue(baseId, out entry)) return;
+
+            ApplyMetadata(node, entry, uniqueName);
             if (entry.WeightKg.HasValue) return; // 已拿到（同一 baseId 多条时首个胜出）
 
             double? kg = ParseWeightKg(node);
             if (kg.HasValue) entry.WeightKg = kg; // 缺失/异常保持 null，绝不当 0
+        }
+
+        /// <summary>
+        /// 从同一个原始节点读集市分类与附魔等级（M4）。
+        /// 语义：分类**首个非空胜出**（同一 baseId 可能在多个类目节点下重复出现，实测 head/armors 等
+        /// 会在 equipmentitem 与 weapon 里各挂一次，取首个带分类的即可，不覆盖已有值）；
+        /// 附魔等级**并集累积**（T4_X 本体与 T4_X@1..@4 是不同节点，baseId 相同，必须合并才不失真）。
+        /// </summary>
+        private static void ApplyMetadata(JsonElement node, ItemIndexEntry entry, string uniqueName)
+        {
+            if (entry.ShopCategory == null)
+            {
+                string cat = ReadStringAttr(node, "@shopcategory");
+                if (!string.IsNullOrEmpty(cat))
+                {
+                    entry.ShopCategory = cat;
+                    entry.ShopSubCategory1 = ReadStringAttr(node, "@shopsubcategory1");
+                    entry.ShopSubCategory2 = ReadStringAttr(node, "@shopsubcategory2");
+                }
+            }
+
+            if (entry.EnchantLevels == null) entry.EnchantLevels = new List<int>();
+            int level = 0;
+            int at = uniqueName.IndexOf('@');
+            if (at >= 0 && at + 1 < uniqueName.Length)
+            {
+                int.TryParse(uniqueName.Substring(at + 1), NumberStyles.Integer,
+                             CultureInfo.InvariantCulture, out level);
+            }
+            else
+            {
+                // 名里没有 @ 时退回节点属性 @enchantmentlevel（存在但为 "0" 时同样算本体）
+                string raw = ReadStringAttr(node, "@enchantmentlevel");
+                if (!string.IsNullOrEmpty(raw))
+                    int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out level);
+            }
+            if (level < 0) level = 0;
+            if (!entry.EnchantLevels.Contains(level)) entry.EnchantLevels.Add(level);
+        }
+
+        private static string ReadStringAttr(JsonElement node, string name)
+        {
+            JsonElement v;
+            if (!node.TryGetProperty(name, out v)) return null;
+            if (v.ValueKind == JsonValueKind.String) return v.GetString();
+            if (v.ValueKind == JsonValueKind.Number) return v.ToString();
+            return null;
         }
 
         /// <summary>解析 @weight（字符串，单位 kg）：只接受有限且 >0 的值，其余返回 null。</summary>
