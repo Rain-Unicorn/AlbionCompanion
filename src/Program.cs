@@ -67,6 +67,11 @@ namespace AlbionCompanion.UI
                 string itemsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data", "indexedItems.json");
                 ItemDatabase.Load(itemsPath);
 
+                // M3：加载物品元数据本地索引（ao-bin-dumps items.json：UniqueName + 本地化名）。
+                // exe/data 与 AppData 择新；两者都缺失时返回 null，由 UI（市场页状态栏/版本标签）显式告警，
+                // 绝不静默（HANDOFF 已知问题 6 合并处理）。
+                ItemIndex.LoadDefault();
+
                 // 加载怪物数据库（MobIndex -> 怪物名字 映射）
                 string mobsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data", "mobs.json");
                 string locPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data", "localization.xml");

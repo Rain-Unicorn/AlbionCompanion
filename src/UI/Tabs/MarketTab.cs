@@ -34,6 +34,8 @@ namespace AlbionCompanion.UI.Tabs
         private string _dbPath;
         private NameCache _cache;
         private string _cachePath;
+        private readonly LinkLabel _dataVersion;
+        private bool _updatingData;
 
         private List<string> _shownIds = new List<string>();
         private DateTime _lastRefresh;
@@ -65,6 +67,18 @@ namespace AlbionCompanion.UI.Tabs
 
             _status = CardText("本地库 " + _db.Rows.Count + " 条 · 点击查询后自动入库，之后每 5 分钟刷新",
                                14, 70, 540, 20, Th.Sub, 8f, false);
+
+            // M3：物品数据版本号 + 手动更新入口（ao-bin-dumps items.json 本地索引）
+            _dataVersion = new LinkLabel();
+            _dataVersion.Bounds = new Rectangle(420, 10, 146, 18);
+            _dataVersion.Font = Th.F(8f);
+            _dataVersion.BackColor = System.Drawing.Color.Transparent;
+            _dataVersion.ForeColor = Th.Sub;
+            _dataVersion.TextAlign = ContentAlignment.MiddleRight;
+            _dataVersion.LinkBehavior = LinkBehavior.HoverUnderline;
+            _dataVersion.Click += delegate { OnUpdateItemData(); };
+            Controls.Add(_dataVersion);
+            UpdateDataVersionLabel();
 
             Card(0, 112, 580, 86);
             CardText("城市", 14, 118, 200, 18, Th.Text, 9.5f, true);
@@ -131,6 +145,53 @@ namespace AlbionCompanion.UI.Tabs
         {
             _status.Text = text;
             _status.ForeColor = color;
+        }
+
+        /// <summary>M3：物品数据版本显示（缺失 = 显式告警，绝不静默——HANDOFF 已知问题 6）。</summary>
+        private void UpdateDataVersionLabel()
+        {
+            if (ItemIndex.Default == null && ItemIndex.LoadDefault() == null)
+            {
+                _dataVersion.Text = "物品数据未加载 · 点击下载";
+                _dataVersion.ForeColor = Th.Bad;
+                _dataVersion.LinkColor = Th.Bad;
+            }
+            else
+            {
+                _dataVersion.Text = "物品数据 v" + (ItemIndex.DataVersion ?? "?") + " · 更新";
+                _dataVersion.ForeColor = Th.Sub;
+                _dataVersion.LinkColor = Th.Info;
+            }
+        }
+
+        /// <summary>M3：手动更新入口——GitHub REST API 版本号 + raw 短连接下载（不用 git clone/tarball）。</summary>
+        private void OnUpdateItemData()
+        {
+            if (_updatingData) return;
+            _updatingData = true;
+            SetStatus("正在下载物品数据（约 24MB，来自 ao-bin-dumps）…", Th.Info);
+            System.Threading.Tasks.Task.Run(delegate
+            {
+                string err = null;
+                try { ItemIndexUpdater.UpdateToAppData(); }
+                catch (Exception ex) { err = ex.Message; }
+                if (IsDisposed || !IsHandleCreated) return;
+                BeginInvoke(new MethodInvoker(delegate
+                {
+                    _updatingData = false;
+                    if (err == null && ItemIndex.LoadDefault() != null)
+                    {
+                        UpdateDataVersionLabel();
+                        SetStatus("物品数据已更新：" + ItemIndex.Default.Count + " 条 · 版本 v"
+                                  + ItemIndex.DataVersion, Th.Good);
+                    }
+                    else
+                    {
+                        UpdateDataVersionLabel();
+                        SetStatus("物品数据更新失败：" + (err ?? "解析为空"), Th.Bad);
+                    }
+                }));
+            });
         }
 
         private List<string> CheckedCities()
@@ -278,7 +339,7 @@ namespace AlbionCompanion.UI.Tabs
                     var shown = new List<string>();
                     if (rawText != null && rawText.Trim().Length > 0)
                     {
-                        shown = ItemCatalog.ResolveTerms(rawText, names, _cache, 20);
+                        shown = ItemCatalog.ResolveTerms(rawText, names, _cache, ItemIndex.Default);
                     }
 
                     // 2. 先把本地库里现有的全部物品作为刷新范围；首次查询时也含新解析出的 id

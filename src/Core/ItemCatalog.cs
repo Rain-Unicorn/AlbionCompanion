@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -73,72 +72,17 @@ namespace AlbionCompanion.Core
 
     /// <summary>
     /// 物品目录：把中文物品名解析成 UniqueName，并查询官方渲染服务器上的图标。
-    /// 数据源是 albion-online-data.com 自带的 /items 检索页（支持 ZH-CN 显示名，需全名匹配）。
+    /// M3 定案：物品元数据唯一来源是本地 ao-bin-dumps items.json 索引（ItemIndex），
+    /// 不再抓取 albion-online-data.com/items 的 HTML（未声明接口随时会断）。
     /// </summary>
     public static class ItemCatalog
     {
         public const string LangZh = "ZH-CN";
 
-        static ItemCatalog()
-        {
-            // 与 MarketClient 相同：显式启用 TLS 1.2
-            try
-            {
-                ServicePointManager.SecurityProtocol =
-                    (SecurityProtocolType)3072 /* Tls12 */ |
-                    (SecurityProtocolType)768 /* Tls11  */ |
-                    SecurityProtocolType.Tls;
-            }
-            catch { }
-        }
-
-        public static string BuildSearchUrl(string query, string lang)
-        {
-            return "https://www.albion-online-data.com/items?q="
-                   + Uri.EscapeDataString(query ?? "")
-                   + "&lang=" + Uri.EscapeDataString(lang ?? LangZh);
-        }
-
         public static string BuildIconUrl(string baseId, int quality)
         {
             return "https://render.albiononline.com/v1/item/" + baseId
                    + ".png?quality=" + Math.Max(1, quality);
-        }
-
-        public static List<ItemDef> ParseSearchHtml(string html)
-        {
-            var list = new List<ItemDef>();
-            if (string.IsNullOrEmpty(html)) return list;
-
-            var re = new Regex(
-                "<td class=\"items-table__unique\"><code>([^<]+)</code></td>\\s*" +
-                "<td class=\"items-table__name\">\\s*([^<]*?)\\s*</td>",
-                RegexOptions.Singleline);
-
-            foreach (Match m in re.Matches(html))
-            {
-                list.Add(new ItemDef
-                {
-                    UniqueName = m.Groups[1].Value.Trim(),
-                    DisplayName = m.Groups[2].Value.Trim()
-                });
-            }
-            return list;
-        }
-
-        public static List<ItemDef> Search(string query, string lang, int timeoutSeconds)
-        {
-            string url = BuildSearchUrl(query, lang);
-            var request = (HttpWebRequest)WebRequest.Create(url);
-            request.Method = "GET";
-            request.Timeout = timeoutSeconds * 1000;
-            request.UserAgent = "AlbionCompanion/1.0";
-            using (var response = (HttpWebResponse)request.GetResponse())
-            using (var stream = response.GetResponseStream())
-            using (var reader = new StreamReader(stream, Encoding.UTF8))
-            {
-                return ParseSearchHtml(reader.ReadToEnd());
-            }
         }
 
         public static List<string> SplitTerms(string text)
@@ -501,11 +445,13 @@ namespace AlbionCompanion.Core
         }
 
         /// <summary>
-        /// 把用户输入解析成实际要查的物品 ID 列表。中文词先在本地缓存里模糊匹配，
-        /// 未命中再走 /items 全名检索；检索结果会写回 idToName（由调用方并入缓存）。
+        /// 把用户输入解析成实际要查的物品 ID 列表（全离线）：像 ID 的词直通；
+        /// 中文词先查本地名称缓存（用户积累），未命中查 ItemIndex 本地索引
+        /// （ao-bin-dumps items.json，M3 起唯一元数据来源，不再走 /items HTML 检索）。
+        /// 命中的名称写回 idToName（由调用方并入缓存）。
         /// </summary>
         public static List<string> ResolveTerms(string text, Dictionary<string, string> idToName,
-                                                NameCache cache, int timeoutSeconds)
+                                                NameCache cache, ItemIndex index)
         {
             var result = new List<string>();
             var seen = new HashSet<string>();
@@ -534,23 +480,20 @@ namespace AlbionCompanion.Core
                 }
                 if (localHit) continue;
 
-                List<ItemDef> found;
-                try { found = Search(token, LangZh, timeoutSeconds); }
-                catch { found = new List<ItemDef>(); }
-
-                int taken = 0;
-                foreach (ItemDef def in found)
+                // 本地索引兜底（离线可用；index 为 null = 数据未加载，不静默造数据）
+                if (index != null)
                 {
-                    string baseId = (def.UniqueName ?? "").Split('@')[0];
-                    if (baseId.Length == 0) continue;
-                    if (!seen.Contains(baseId))
+                    foreach (string id in index.SearchBaseIds(token, 8))
                     {
-                        seen.Add(baseId);
-                        result.Add(baseId);
+                        if (!seen.Contains(id))
+                        {
+                            seen.Add(id);
+                            result.Add(id);
+                            string name = index.DisplayNameOf(id);
+                            if (!string.IsNullOrEmpty(name) && idToName != null && !idToName.ContainsKey(id))
+                                idToName[id] = name;
+                        }
                     }
-                    if (!string.IsNullOrEmpty(def.DisplayName) && !idToName.ContainsKey(baseId))
-                        idToName[baseId] = def.DisplayName;
-                    if (++taken >= 5) break;
                 }
             }
             return result;

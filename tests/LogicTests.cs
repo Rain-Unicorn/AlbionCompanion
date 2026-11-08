@@ -47,12 +47,73 @@ static class LogicTests
 
     static string SampleJson = @"[{""item_id"":""T4_BAG"",""city"":""Caerleon"",""quality"":1,""sell_price_min"":7493,""sell_price_min_date"":""2026-11-04T14:30:00"",""sell_price_max"":7495,""sell_price_max_date"":""2026-11-04T14:30:00"",""buy_price_min"":0,""buy_price_min_date"":""0001-01-01T00:00:00"",""buy_price_max"":6999,""buy_price_max_date"":""2026-11-04T13:00:00""},{""item_id"":""T4_BAG"",""city"":""Bridgewatch"",""quality"":1,""sell_price_min"":0,""sell_price_min_date"":""0001-01-01T00:00:00"",""sell_price_max"":0,""sell_price_max_date"":""0001-01-01T00:00:00"",""buy_price_min"":0,""buy_price_min_date"":""0001-01-01T00:00:00"",""buy_price_max"":0,""buy_price_max_date"":""0001-01-01T00:00:00""}]";
 
-    // 从 albion-online-data.com/items 实际抓取的一行结果 HTML（截取三行）
-    const string SampleSearchHtml = "<table class=\"items-table\"><tbody>"
-        + "<tr><td class=\"items-table__index\">2888</td><td class=\"items-table__unique\"><code>T4_BAG</code></td><td class=\"items-table__name\">\r\n  老手级背包\r\n </td></tr>"
-        + "<tr><td class=\"items-table__index\">2890</td><td class=\"items-table__unique\"><code>T4_BAG@2</code></td><td class=\"items-table__name\">老手级背包</td></tr>"
-        + "<tr><td class=\"items-table__index\">2913</td><td class=\"items-table__unique\"><code>T4_BAG_INSIGHT</code></td><td class=\"items-table__name\">老手级洞察背包</td></tr>"
-        + "</tbody></table>";
+    // M3：ao-bin-dumps formatted/items.json 缩样（覆盖 ZH 缺失 EN 兜底、@附魔、非 T 前缀条目）
+    const string SampleItemsJson = "["
+        + "{\"UniqueName\":\"T4_BAG\",\"LocalizedNames\":{\"ZH-CN\":\"老手级背包\",\"EN-US\":\"Adept's Bag\"}},"
+        + "{\"UniqueName\":\"T4_BAG@1\",\"LocalizedNames\":{\"ZH-CN\":\"老手级背包\",\"EN-US\":\"Adept's Bag\"}},"
+        + "{\"UniqueName\":\"T4_BAG_INSIGHT\",\"LocalizedNames\":{\"ZH-CN\":\"老手级洞察背包\",\"EN-US\":\"Adept's Insight Bag\"}},"
+        + "{\"UniqueName\":\"T5_2H_BOW\",\"LocalizedNames\":{\"EN-US\":\"Expert's Bow\"}},"
+        + "{\"UniqueName\":\"QUESTITEM_RABBITS_FOOT\",\"LocalizedNames\":{\"EN-US\":\"Rabbit's Foot\"}}"
+        + "]";
+
+    // M3：ItemIndex 加载/查询/搜索/分层过滤/侧车元数据 单测
+    static void RunItemIndexTests()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ac_m3_itemindex_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string jsonPath = Path.Combine(dir, "items.json");
+            File.WriteAllText(jsonPath, SampleItemsJson);
+
+            var idx = ItemIndex.Load(jsonPath);
+            Check("M3 Load 返回非空索引", idx != null, "Load returned null");
+            if (idx != null)
+            {
+                ItemIndexEntry entry;
+                Check("M3 TryGetEntry 命中 T4_BAG", idx.TryGetEntry("T4_BAG", out entry) && entry.UniqueName == "T4_BAG", "TryGetEntry failed");
+                Check("M3 TryGetEntry 未命中返回 false", !idx.TryGetEntry("T9_NOT_EXIST", out entry), "expected false");
+                Eq("M3 中文名", idx.DisplayNameOf("T4_BAG"), "老手级背包");
+                Eq("M3 ZH 缺失回退 EN", idx.DisplayNameOf("T5_2H_BOW"), "Expert's Bow");
+                Check("M3 未知物品返回 null（调用方兜底显示原 ID）", idx.DisplayNameOf("T9_NOT_EXIST") == null, "expected null");
+
+                // 离线子串搜索：中文名 / ID
+                var byZh = idx.SearchBaseIds("老手级", 10);
+                Check("M3 中文名搜索命中含 T4_BAG", byZh.Contains("T4_BAG"), "got " + string.Join(",", byZh));
+                var byId = idx.SearchBaseIds("T4_BAG", 10);
+                Check("M3 ID 搜索命中含 T4_BAG", byId.Contains("T4_BAG"), "got " + string.Join(",", byId));
+                Check("M3 ID 搜索附魔折叠 baseId", byId.Contains("T4_BAG") && !byId.Contains("T4_BAG@1"), "got " + string.Join(",", byId));
+                var byMiss = idx.SearchBaseIds("不存在的物品名", 10);
+                Eq("M3 搜索无结果返回空", byMiss.Count, 0);
+
+                // 可交易分层：T 前缀全集（含 @1 折叠进 baseId）
+                var tiered = idx.TieredBaseIds();
+                Check("M3 TieredBaseIds 含 T4_BAG", tiered.Contains("T4_BAG"), "got " + string.Join(",", tiered));
+                Check("M3 TieredBaseIds 含 T5_2H_BOW", tiered.Contains("T5_2H_BOW"), "got " + string.Join(",", tiered));
+                Check("M3 TieredBaseIds 排除非 T 前缀", !tiered.Contains("QUESTITEM_RABBITS_FOOT"), "got " + string.Join(",", tiered));
+                Check("M3 TieredBaseIds 排除附魔变体原 ID", !tiered.Contains("T4_BAG@1"), "got " + string.Join(",", tiered));
+            }
+
+            // 缺文件 / 损坏 JSON → 空索引不抛异常（null 告警语义由 LoadDefault 负责）
+            var missIdx = ItemIndex.Load(Path.Combine(dir, "missing.json"));
+            Check("M3 缺文件 Load 返回空索引", missIdx != null && missIdx.Count == 0, "expected empty index");
+            string badPath = Path.Combine(dir, "bad.json");
+            File.WriteAllText(badPath, "{not json");
+            var badIdx = ItemIndex.Load(badPath);
+            Check("M3 损坏 JSON Load 返回空索引不抛异常", badIdx != null && badIdx.Count == 0, "expected empty index");
+
+            // 侧车元数据：保存后可读回版本号
+            ItemIndexMeta.Save(jsonPath, "abcd1234", "2026-11-01T00:00:00Z", 12248);
+            Eq("M3 侧车版本读回", ItemIndexMeta.LoadVersion(jsonPath), "abcd1234");
+            string emptyDir = Path.Combine(dir, "no_sidecar");
+            Directory.CreateDirectory(emptyDir);
+            Check("M3 侧车缺文件版本为 null", ItemIndexMeta.LoadVersion(Path.Combine(emptyDir, "items.json")) == null, "expected null");
+        }
+        finally
+        {
+            try { Directory.Delete(dir, true); } catch { }
+        }
+    }
 
     public static int Main()
     {
@@ -149,21 +210,7 @@ static class LogicTests
         Eq("A6 缺文件回退默认置顶", defaults.AlwaysOnTop, true);
         Eq("A6 缺文件回退透明度", defaults.OpacityPercent, 92);
 
-        // A8 物品搜索 / 图标
-        string searchUrl = ItemCatalog.BuildSearchUrl("老手级背包", "ZH-CN");
-        Check("A8 搜索URL指向 items 页", searchUrl.StartsWith("https://www.albion-online-data.com/items?q="), searchUrl);
-        Check("A8 搜索URL带语言", searchUrl.Contains("lang=ZH-CN"), searchUrl);
-        Check("A8 中文查询被 URL 编码", searchUrl.Contains("%E8"), searchUrl);
-
-        List<ItemDef> found = ItemCatalog.ParseSearchHtml(SampleSearchHtml);
-        Eq("A8 解析搜索结果条数", found.Count, 3);
-        Eq("A8 结果含 T4_BAG", found[0].UniqueName, "T4_BAG");
-        Eq("A8 中文名", found[0].DisplayName, "老手级背包");
-        Eq("A8 结果含附魔变体", found[1].UniqueName, "T4_BAG@2");
-
-        List<ItemDef> none = ItemCatalog.ParseSearchHtml("<p class=\"items-results__empty\">No items match \"x\".</p>");
-        Eq("A8 无结果页面解析为空", none.Count, 0);
-
+        // A8 物品图标 / 离线解析（M3 后 HTML 抓取已删，物品元数据走 ItemIndex 本地索引）
         string iconUrl = ItemCatalog.BuildIconUrl("T4_BAG", 3);
         Eq("A8 图标URL", iconUrl, "https://render.albiononline.com/v1/item/T4_BAG.png?quality=3");
 
@@ -1218,6 +1265,9 @@ static class LogicTests
             Check("M2 限流异常上抛（不裸重试）", threw, "应抛 MarketRateLimitedException");
             Eq("M2 失败不写入缓存", failing.CachedEntryCount, 0);
         }
+
+        // ───────────────── M3 ItemIndex：本地物品元数据索引 ─────────────────
+        RunItemIndexTests();
 
         Console.WriteLine("passed=" + _pass + " failed=" + _fail);
         return _fail == 0 ? 0 : 1;

@@ -180,57 +180,32 @@ namespace AlbionCompanion.UI.Tabs
                     SetProgress("准备关键词...");
                     SetPhase("扫描物品列表", 0, 1);
 
-                    // 收集关键词（仅首次扫描，后续轮次跳过）
+                    // 收集物品列表（仅首次，后续轮次跳过）
                     bool needScan = (allIds.Count < 50); // 物品列表文件为空才重扫
 
                     if (needScan)
                     {
-                        SetDetail("首次扫描物品列表...");
-                        var allKeywords = new List<string>();
-                        var l1s = ItemCatalog.Taxonomy.L1List();
-                        foreach (string l1 in l1s)
+                        // M3：物品列表来自本地 ao-bin-dumps items.json 索引（离线、无 HTTP 扫描），
+                        // 不再对 albion-online-data.com/items 逐关键词抓 HTML（未声明接口随时会断）。
+                        if (ItemIndex.Default == null)
                         {
-                            if (l1 == "全部") continue;
-                            var l2s = ItemCatalog.Taxonomy.L2List(l1);
-                            foreach (string l2 in l2s)
-                            {
-                                if (l2 == "全部") continue;
-                                string kw = ItemCatalog.Taxonomy.KeywordFor(l1, l2);
-                                if (!string.IsNullOrEmpty(kw) && !allKeywords.Contains(kw))
-                                    allKeywords.Add(kw);
-                            }
+                            // HANDOFF 已知问题 6 合并处理：数据缺失显式告警，绝不静默跳过
+                            SetProgress("物品数据未加载：缺少 data/items.json，请在市场页点击『更新物品数据』");
+                            SetPhase("物品数据缺失", 0, 1);
+                            Thread.Sleep(3000);
+                            continue;
                         }
-
-                        int kwIndex = 0;
-                        foreach (string kw in allKeywords)
+                        SetDetail("从本地物品索引读取 " + ItemIndex.Default.Count + " 条…");
+                        foreach (string baseId in ItemIndex.Default.TieredBaseIds())
                         {
-                            if (!_running) break;
-                            kwIndex++;
-                            SetPhase("扫描 AODP 物品列表", kwIndex, allKeywords.Count);
-                            SetProgress("关键词 " + kwIndex + "/" + allKeywords.Count + "：" + kw);
-                            try
-                            {
-                                var found = ItemCatalog.Search(kw, "ZH-CN", 10);
-                                int batchNew = 0;
-                                foreach (var def in found)
-                                {
-                                    string baseId = (def.UniqueName ?? "").Split('@')[0];
-                                    if (baseId.Length > 3 && baseId.StartsWith("T"))
-                                    {
-                                        if (!allIds.Contains(baseId)) { allIds.Add(baseId); batchNew++; }
-                                        if (!string.IsNullOrEmpty(def.DisplayName) && !nameCache.Map.ContainsKey(baseId))
-                                            nameCache.Map[baseId] = def.DisplayName;
-                                    }
-                                }
-                                if (batchNew > 0)
-                                    SetDetail("[" + kw + "] 新增 " + batchNew + " 个，累计 " + allIds.Count);
-                                nameCache.Save(cachePath);
-                                // 每扫完一个关键词就保存物品列表
-                                System.IO.File.WriteAllLines(itemListPath, new List<string>(allIds));
-                                Thread.Sleep(300);
-                            }
-                            catch { SetDetail("[" + kw + "] 请求失败，跳过"); }
+                            if (!allIds.Contains(baseId)) allIds.Add(baseId);
+                            string name = ItemIndex.Default.DisplayNameOf(baseId);
+                            if (!string.IsNullOrEmpty(name) && !nameCache.Map.ContainsKey(baseId))
+                                nameCache.Map[baseId] = name;
                         }
+                        nameCache.Save(cachePath);
+                        System.IO.File.WriteAllLines(itemListPath, new List<string>(allIds));
+                        SetDetail("物品库载入 " + allIds.Count + " 个（本地索引，离线完成）");
                     }
                     else
                     {
