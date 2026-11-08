@@ -76,6 +76,21 @@ namespace AlbionCompanion.Core
         public string SellMinDate;
         public long BuyMax;
         public string BuyMaxDate;
+
+        // M2 定案：0 价 = 无上报数据（不是免费），Parse 层标记，不得进套利卖价；buy 侧 >0 保留给收货参考。
+        public bool SellHasData; // sell_price_min > 0
+        public bool SellStale;   // sell_price_min_date 距今 > 24h（陈旧无数据；读取时按当前时间重算）
+
+        public MarketQuote Clone()
+        {
+            return new MarketQuote
+            {
+                ItemId = ItemId, City = City, Quality = Quality,
+                SellMin = SellMin, SellMinDate = SellMinDate,
+                BuyMax = BuyMax, BuyMaxDate = BuyMaxDate,
+                SellHasData = SellHasData, SellStale = SellStale
+            };
+        }
     }
 
     /// <summary>
@@ -136,6 +151,28 @@ namespace AlbionCompanion.Core
 
         public static List<MarketQuote> Parse(string json)
         {
+            return Parse(json, DateTimeOffset.UtcNow);
+        }
+
+        /// <summary>sell_price_min_date 距今超过此值 → 陈旧无数据（M2 定案：24h）。</summary>
+        public static readonly TimeSpan SellStaleAge = TimeSpan.FromHours(24);
+
+        /// <summary>解析 AODP 时间戳；空串与 0001-01-01 哨兵（无数据）返回 null。</summary>
+        public static DateTimeOffset? TryParsePriceDate(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return null;
+            DateTimeOffset v;
+            if (!DateTimeOffset.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal, out v))
+                return null;
+            if (v.UtcDateTime.Year < 2000) return null; // 0001-01-01T00:00:00 = 无上报哨兵
+            return v;
+        }
+
+        /// <summary>解析并标记：sell_price_min=0 → SellHasData=false（无数据，不得进套利卖价）；
+        /// sell_price_min_date 距 now > 24h → SellStale。now 可注入以便单测。</summary>
+        public static List<MarketQuote> Parse(string json, DateTimeOffset now)
+        {
             var result = new List<MarketQuote>();
             if (string.IsNullOrEmpty(json) || json.Trim().Length == 0) return result;
 
@@ -149,7 +186,7 @@ namespace AlbionCompanion.Core
 
                 long sellMin = ReadLongElem(row, "sell_price_min");
                 long buyMax = ReadLongElem(row, "buy_price_max");
-                if (sellMin <= 0 && buyMax <= 0) continue;
+                if (sellMin <= 0 && buyMax <= 0) continue; // 全零行：无任何上报，不入缓存不入套利
 
                 var q = new MarketQuote();
                 q.ItemId = ReadStringElem(row, "item_id");
@@ -159,9 +196,19 @@ namespace AlbionCompanion.Core
                 q.SellMinDate = ReadStringElem(row, "sell_price_min_date");
                 q.BuyMax = buyMax;
                 q.BuyMaxDate = ReadStringElem(row, "buy_price_max_date");
+                q.SellHasData = sellMin > 0;
+                q.SellStale = IsSellStale(q.SellHasData, q.SellMinDate, now);
                 result.Add(q);
             }
             return result;
+        }
+
+        /// <summary>陈旧判定（读取时可按当前时间重算，缓存中数据年龄会增长）。</summary>
+        public static bool IsSellStale(bool sellHasData, string sellMinDate, DateTimeOffset now)
+        {
+            if (!sellHasData) return false;
+            var date = TryParsePriceDate(sellMinDate);
+            return date.HasValue && (now - date.Value) > SellStaleAge;
         }
 
         /// <summary>同步入口（旧调用方：MarketTab / AutoUpdateTab 后台线程）。</summary>

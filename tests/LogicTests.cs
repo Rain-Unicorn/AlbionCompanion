@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Text;
 using System.Linq;
+using System.Threading;
 using System.Collections.Generic;
 using AlbionCompanion.Core;
 using AlbionCompanion.Core.DamageMeter;
@@ -1049,6 +1050,173 @@ static class LogicTests
                 IncomeTracker.Reset();
                 try { Directory.Delete(tdir, true); } catch { }
             }
+        }
+
+        // ───────────────── M2 MarketDataService：缓存 TTL 分档 / 0 价过滤 / 切批 / single-flight / 限流器 ─────────────────
+        {
+            // M2-1 TTL 分档
+            Eq("M2 TTL 分档：查价/比价 30 分钟", MarketCacheTtl.For(MarketQueryPurpose.ManualQuery), TimeSpan.FromMinutes(30));
+            Eq("M2 TTL 分档：估值 4 小时", MarketCacheTtl.For(MarketQueryPurpose.Valuation), TimeSpan.FromHours(4));
+
+            var baseTime = DateTimeOffset.FromUnixTimeSeconds(1_800_000_000L);
+            var entry = new MarketCacheEntry
+            {
+                Quote = new MarketQuote { ItemId = "T4_BAG", City = "Caerleon", Quality = 1 },
+                Ttl = MarketCacheTtl.For(MarketQueryPurpose.ManualQuery),
+                FetchedAt = baseTime
+            };
+            Check("M2 30 分钟档：+29 分钟仍新鲜",
+                entry.IsFresh(baseTime.AddMinutes(29), MarketCacheTtl.ManualQuery), "应新鲜");
+            Check("M2 30 分钟档：+31 分钟已过期",
+                !entry.IsFresh(baseTime.AddMinutes(31), MarketCacheTtl.ManualQuery), "应过期");
+            Check("M2 4 小时档：+3 小时仍新鲜",
+                entry.IsFresh(baseTime.AddHours(3), MarketCacheTtl.Valuation), "应新鲜");
+            Check("M2 4 小时档：+4 小时 1 分已过期",
+                !entry.IsFresh(baseTime.AddHours(4).AddMinutes(1), MarketCacheTtl.Valuation), "应过期");
+            Eq("M2 缓存键三元组", MarketDataCache.Key("T4_BAG", "Caerleon", 3), "T4_BAG|Caerleon|3");
+
+            // M2-2 0 价过滤 / 陈旧标记（Parse 层）
+            string m2Json = "["
+                + "{\"item_id\":\"T4_BAG\",\"city\":\"Caerleon\",\"quality\":1,\"sell_price_min\":0,\"sell_price_min_date\":\"0001-01-01T00:00:00\",\"sell_price_max\":0,\"buy_price_min\":0,\"buy_price_max\":5000,\"buy_price_max_date\":\"2026-11-08T10:00:00\"},"
+                + "{\"item_id\":\"T4_BAG\",\"city\":\"Lymhurst\",\"quality\":1,\"sell_price_min\":5998,\"sell_price_min_date\":\"2026-11-08T12:00:00\",\"sell_price_max\":6100,\"buy_price_min\":0,\"buy_price_max\":5100,\"buy_price_max_date\":\"2026-11-08T11:00:00\"},"
+                + "{\"item_id\":\"T4_BAG\",\"city\":\"Bridgewatch\",\"quality\":1,\"sell_price_min\":7000,\"sell_price_min_date\":\"2026-11-06T12:00:00\",\"sell_price_max\":7100,\"buy_price_min\":0,\"buy_price_max\":6100,\"buy_price_max_date\":\"2026-11-08T11:00:00\"},"
+                + "{\"item_id\":\"T4_BAG\",\"city\":\"Martlock\",\"quality\":1,\"sell_price_min\":0,\"sell_price_min_date\":\"0001-01-01T00:00:00\",\"sell_price_max\":0,\"buy_price_min\":0,\"buy_price_max\":0,\"buy_price_max_date\":\"0001-01-01T00:00:00\"}"
+                + "]";
+            var parseNow = DateTimeOffset.Parse("2026-11-09T00:00:00Z");
+            var parsed = MarketClient.Parse(m2Json, parseNow);
+            Eq("M2 解析条数 = 3（全零行剔除）", parsed.Count, 3);
+            var caerleon = parsed.Find(q => q.City == "Caerleon");
+            Check("M2 卖价 0 → SellHasData=false（无数据，不是免费）",
+                caerleon != null && !caerleon.SellHasData && caerleon.SellMin == 0, "应标记无数据");
+            Check("M2 卖价 0 行 buy>0 保留（收货参考）",
+                caerleon != null && caerleon.BuyMax == 5000L, "buy_max 应保留");
+            var lym = parsed.Find(q => q.City == "Lymhurst");
+            Check("M2 卖价>0 → SellHasData=true 且 12h 内不陈旧",
+                lym != null && lym.SellHasData && !lym.SellStale, "应新鲜");
+            var bridge = parsed.Find(q => q.City == "Bridgewatch");
+            Check("M2 sell_price_min_date 距今 >24h → SellStale（陈旧无数据）",
+                bridge != null && bridge.SellStale, "应陈旧");
+            Check("M2 无数据哨兵日期解析为 null",
+                MarketClient.TryParsePriceDate("0001-01-01T00:00:00") == null, "应 null");
+            Check("M2 空串日期解析为 null", MarketClient.TryParsePriceDate("") == null, "应 null");
+            Check("M2 正常日期解析非空",
+                MarketClient.TryParsePriceDate("2026-11-08T12:00:00").HasValue, "应有值");
+
+            // M2-3 批量切批（URL ≤ 3000 字符）
+            var manyItems = new List<string>();
+            for (int i = 0; i < 260; i++) manyItems.Add("T8_MAIN_FIRESTAFF_ITEM_" + i.ToString("0000"));
+            var batchCities = new[] { "Caerleon", "Bridgewatch", "Lymhurst", "Martlock", "Fort Sterling", "Thetford" };
+            var batches = PriceBatcher.CreatePriceBatches(manyItems, batchCities);
+            Check("M2 切批：260 个长物品名切出多批", batches.Count >= 2, "批数=" + batches.Count);
+            bool allUnderLimit = true, allCovered = true;
+            var seenIds = new HashSet<string>();
+            foreach (var b in batches)
+            {
+                if (b.Count == 0) { allCovered = false; break; }
+                int len = PriceBatcher.EstimateUrlLength(b, batchCities);
+                if (len > 3000) allUnderLimit = false;
+                foreach (var id in b) if (!seenIds.Add(id)) allCovered = false;
+            }
+            Check("M2 切批：每批 URL ≤ 3000 字符", allUnderLimit, "有批次超限");
+            Check("M2 切批：物品全覆盖无重复", allCovered && seenIds.Count == manyItems.Count,
+                "覆盖 " + seenIds.Count + "/" + manyItems.Count);
+            var single = PriceBatcher.CreatePriceBatches(new[] { "T4_BAG" }, batchCities);
+            Eq("M2 切批：单个物品一批", single.Count, 1);
+            Eq("M2 切批：空物品列表零批", PriceBatcher.CreatePriceBatches(new string[0], batchCities).Count, 0);
+
+            // M2-4 服务：single-flight / 缓存命中 / 无数据合成行 / 陈旧重算
+            int fetchCalls = 0;
+            string m2Body = "["
+                + "{\"item_id\":\"T4_BAG\",\"city\":\"Caerleon\",\"quality\":1,\"sell_price_min\":5998,\"sell_price_min_date\":\"2026-11-08T12:00:00\",\"sell_price_max\":6100,\"buy_price_min\":0,\"buy_price_max\":5100,\"buy_price_max_date\":\"2026-11-08T11:00:00\"}"
+                + "]"; // 只有 q1 有上报；q2-5 应合成"暂无上报数据"行
+            var svcClockTime = DateTimeOffset.Parse("2026-11-09T00:00:00Z");
+            var svc = new MarketDataService(
+                delegate (string url, CancellationToken token)
+                {
+                    fetchCalls++;
+                    return Task.Delay(50).ContinueWith(t => m2Body);
+                },
+                () => svcClockTime,
+                new MarketRateLimiter(60, () => svcClockTime));
+
+            // 并发两次同参查询 → single-flight 去重为一个在途请求
+            var t1 = svc.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" }, MarketQueryPurpose.ManualQuery);
+            var t2 = svc.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" }, MarketQueryPurpose.ManualQuery);
+            Task.WhenAll(t1, t2).GetAwaiter().GetResult();
+            Eq("M2 single-flight：并发同批去重为 1 次请求", fetchCalls, 1);
+
+            var rows = svc.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" },
+                MarketQueryPurpose.ManualQuery).GetAwaiter().GetResult();
+            Eq("M2 缓存命中：第二次查询不再发请求", fetchCalls, 1);
+            Eq("M2 返回行数 = 5（q1-q5 全品质）", rows.Count, 5);
+            var q1Row = rows.Find(r => r.Quality == 1);
+            Check("M2 q1 有数据行", q1Row != null && q1Row.SellHasData && q1Row.SellMin == 5998L, "q1 应有数据");
+            var q3Row = rows.Find(r => r.Quality == 3);
+            Check("M2 q3 合成暂无上报数据行（SellHasData=false）",
+                q3Row != null && !q3Row.SellHasData && q3Row.SellMin == 0L && q3Row.BuyMax == 0L, "应合成无数据");
+            Eq("M2 缓存条目数 = 5（1 真实 + 4 合成）", svc.CachedEntryCount, 5);
+
+            // TTL 过期后重拉：时钟推进 31 分钟 → 手动档过期 → 重新请求
+            svcClockTime = svcClockTime.AddMinutes(31);
+            svc.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" },
+                MarketQueryPurpose.ManualQuery).GetAwaiter().GetResult();
+            Eq("M2 30 分钟档过期后重拉", fetchCalls, 2);
+            // 估值档 4 小时：同一批数据对估值读者仍新鲜（距上次拉取 31 分钟 < 4h）
+            svcClockTime = svcClockTime.AddMinutes(1);
+            svc.RefreshAsync(new[] { "T4_BAG" }, new[] { "Caerleon" }).GetAwaiter().GetResult();
+            Eq("M2 估值档 4 小时内不重拉", fetchCalls, 2);
+
+            // 陈旧重算：推进时钟使 q1 的 sell 日期距今 >24h，读取时 SellStale 应翻转为 true
+            svcClockTime = DateTimeOffset.Parse("2026-11-11T00:00:00Z"); // 距 2026-11-08T12:00 > 24h
+            var staleRows = svc.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" },
+                MarketQueryPurpose.Valuation).GetAwaiter().GetResult();
+            var staleQ1 = staleRows.Find(r => r.Quality == 1);
+            Check("M2 读取时按当前时间重算陈旧（>24h → SellStale）",
+                staleQ1 != null && staleQ1.SellStale, "应陈旧");
+
+            // M2-5 限流器：滚动窗口 + 优先级
+            long limiterClock = 1_800_000_000L;
+            var limiter = new MarketRateLimiter(2, () => DateTimeOffset.FromUnixTimeSeconds(limiterClock));
+            var a1 = limiter.AcquireAsync(false);
+            var a2 = limiter.AcquireAsync(false);
+            Check("M2 限流：窗口内前 2 次立即放行", a1.IsCompleted && a2.IsCompleted, "应立即完成");
+            var a3 = limiter.AcquireAsync(false);
+            Check("M2 限流：第 3 次排队等待", !a3.IsCompleted, "应等待");
+            limiterClock += 61; // 窗口滑过
+            limiter.Release();  // 归还触发权 → 唤醒队首
+            Check("M2 限流：窗口滑过 + 释放后放行", a3.IsCompleted, "应完成");
+
+            var limiter2 = new MarketRateLimiter(1, () => DateTimeOffset.FromUnixTimeSeconds(limiterClock));
+            var m1 = limiter2.AcquireAsync(false); // 占用唯一名额（后台）
+            Check("M2 限流：名额占用", m1.IsCompleted, "应完成");
+            var bg = limiter2.AcquireAsync(false); // 后台排队
+            var manual = limiter2.AcquireAsync(true); // 手动插队
+            Check("M2 限流：名额满时两者均等待", !bg.IsCompleted && !manual.IsCompleted, "应等待");
+            limiterClock += 61;
+            limiter2.Release(); // a1 释放 + 窗口已滑过 → 名额空出
+            Check("M2 优先级：手动查询先于后台刷新获得名额",
+                manual.IsCompleted && !bg.IsCompleted, "手动应先完成");
+            limiterClock += 61;
+            limiter2.Release();
+            Check("M2 优先级：后台刷新随后获得名额", bg.IsCompleted, "后台应完成");
+
+            // M2-6 服务退避路径：拉取异常向上抛（429 用尽由调用方停止本轮）
+            var failing = new MarketDataService(
+                delegate (string url, CancellationToken token)
+                {
+                    throw new MarketRateLimitedException(3, url);
+                },
+                () => DateTimeOffset.UtcNow,
+                new MarketRateLimiter(60));
+            bool threw = false;
+            try
+            {
+                failing.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" },
+                    MarketQueryPurpose.ManualQuery).GetAwaiter().GetResult();
+            }
+            catch (MarketRateLimitedException) { threw = true; }
+            Check("M2 限流异常上抛（不裸重试）", threw, "应抛 MarketRateLimitedException");
+            Eq("M2 失败不写入缓存", failing.CachedEntryCount, 0);
         }
 
         Console.WriteLine("passed=" + _pass + " failed=" + _fail);
