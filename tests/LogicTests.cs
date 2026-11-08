@@ -56,7 +56,26 @@ static class LogicTests
         + "{\"UniqueName\":\"QUESTITEM_RABBITS_FOOT\",\"LocalizedNames\":{\"EN-US\":\"Rabbit's Foot\"}}"
         + "]";
 
-    // M3：ItemIndex 加载/查询/搜索/分层过滤/侧车元数据 单测
+    // M3：根目录原始版 items.json 缩样（@uniquename 小写 u + @weight 字符串 kg；含缺 weight / weight=0 边界）
+    const string SampleRawItemsJson = "{"
+        + "\"?xml\":{\"@version\":\"1.0\"},"
+        + "\"items\":{"
+        + "  \"equipmentitem\":["
+        + "    {\"@uniquename\":\"T4_BAG\",\"@weight\":\"3.4\"},"
+        + "    {\"@uniquename\":\"T4_BAG_INSIGHT\",\"@weight\":\"3.4\"},"
+        + "    {\"@uniquename\":\"T4_2H_BOW\",\"@weight\":\"6.8\"}"
+        + "  ],"
+        + "  \"simpleitem\":["
+        + "    {\"@uniquename\":\"T4_MAIN_SWORD\",\"@weight\":\"5.1\"},"
+        + "    {\"@uniquename\":\"QUESTITEM_RABBITS_FOOT\",\"@weight\":\"0\"},"      // 0 = 异常，必须留 null
+        + "    {\"@uniquename\":\"T5_2H_BOW\"}"                                     // 缺 @weight → null
+        + "  ],"
+        + "  \"mountskin\":["
+        + "    {\"@uniquename\":\"SKIN_HORSE_STARTERPACK\"}"                        // 皮肤类整体无 weight
+        + "  ]"
+        + "}}";
+
+    // M3：ItemIndex 加载/查询/搜索/分层过滤/侧车/weight join 单测
     static void RunItemIndexTests()
     {
         string dir = Path.Combine(Path.GetTempPath(), "ac_m3_itemindex_" + Guid.NewGuid().ToString("N").Substring(0, 8));
@@ -108,6 +127,60 @@ static class LogicTests
             string emptyDir = Path.Combine(dir, "no_sidecar");
             Directory.CreateDirectory(emptyDir);
             Check("M3 侧车缺文件版本为 null", ItemIndexMeta.LoadVersion(Path.Combine(emptyDir, "items.json")) == null, "expected null");
+
+            // ── M3 修正：weight 双文件 join（formatted 版没有 weight，原始版 @weight 是 kg 字符串）──
+            string wDir = Path.Combine(dir, "weights");
+            Directory.CreateDirectory(wDir);
+            string wFmt = Path.Combine(wDir, ItemIndex.FormattedFileName);
+            string wRaw = Path.Combine(wDir, ItemIndex.RawFileName);
+            File.WriteAllText(wFmt, "["
+                + "{\"UniqueName\":\"T4_BAG\",\"LocalizedNames\":{\"ZH-CN\":\"老手级背包\"}},"
+                + "{\"UniqueName\":\"T4_BAG@1\",\"LocalizedNames\":{\"ZH-CN\":\"老手级背包\"}},"
+                + "{\"UniqueName\":\"T4_BAG_INSIGHT\",\"LocalizedNames\":{\"ZH-CN\":\"老手级洞察背包\"}},"
+                + "{\"UniqueName\":\"T4_2H_BOW\",\"LocalizedNames\":{\"ZH-CN\":\"老手级战弓\"}},"
+                + "{\"UniqueName\":\"T4_MAIN_SWORD\",\"LocalizedNames\":{\"ZH-CN\":\"老手级阔剑\"}},"
+                + "{\"UniqueName\":\"T5_2H_BOW\",\"LocalizedNames\":{\"ZH-CN\":\"专家级战弓\"}},"
+                + "{\"UniqueName\":\"QUESTITEM_RABBITS_FOOT\",\"LocalizedNames\":{\"EN-US\":\"Rabbit's Foot\"}},"
+                + "{\"UniqueName\":\"SKIN_HORSE_STARTERPACK\",\"LocalizedNames\":{\"EN-US\":\"Skin\"}}"
+                + "]");
+            File.WriteAllText(wRaw, SampleRawItemsJson);
+
+            var wi = ItemIndex.Load(wFmt, wRaw);
+            Check("M3 weight 双文件加载非空", wi.Count > 0, "count=" + wi.Count);
+            Check("M3 weight join 已跑（WeightJoined）", wi.WeightJoined, "expected WeightJoined=true");
+            Eq("M3 weight 覆盖率分母 = 条目数", wi.WeightedCount + wi.MissingWeightCount, wi.Count);
+            Eq("M3 背包 weight = 3.4kg", wi.WeightKgOf("T4_BAG"), 3.4d);
+            Eq("M3 附魔变体折叠到 baseId 取 weight", wi.WeightKgOf("T4_BAG@1"), 3.4d);
+            Eq("M3 战弓 weight = 6.8kg", wi.WeightKgOf("T4_2H_BOW"), 6.8d);
+            Eq("M3 长剑 weight = 5.1kg", wi.WeightKgOf("T4_MAIN_SWORD"), 5.1d);
+            Check("M3 缺 @weight 条目 weight 为 null（不是 0）", wi.WeightKgOf("T5_2H_BOW") == null,
+                  "got " + wi.WeightKgOf("T5_2H_BOW"));
+            Check("M3 weight=0 视为缺失留 null（不是 0，防每公斤排序假最优）",
+                  wi.WeightKgOf("QUESTITEM_RABBITS_FOOT") == null,
+                  "got " + wi.WeightKgOf("QUESTITEM_RABBITS_FOOT"));
+            Check("M3 皮肤类无 weight 也留 null", wi.WeightKgOf("SKIN_HORSE_STARTERPACK") == null, "expected null");
+            Check("M3 未知物品 weight null", wi.WeightKgOf("T9_NOT_EXIST") == null, "expected null");
+            ItemIndexEntry wEntry;
+            Check("M3 条目公开 weight 字段（跑商读取名）",
+                  wi.TryGetEntry("T4_BAG", out wEntry) && wEntry.Weight.HasValue && Math.Abs(wEntry.Weight.Value - 3.4d) < 1e-9,
+                  "Weight getter mismatch");
+            Eq("M3 有 weight 条目计数 = 4", wi.WeightedCount, 4);
+            Check("M3 weight 覆盖率落在 (0,1)", wi.WeightCoverageRatio > 0d && wi.WeightCoverageRatio < 1d,
+                  "ratio=" + wi.WeightCoverageRatio);
+
+            // 只给 formatted（无原始版）→ 索引可用但 weight 全 null 且 WeightJoined=false（UI 告警依据）
+            var noRaw = ItemIndex.Load(wFmt);
+            Check("M3 缺原始版时索引仍可用", noRaw.Count == wi.Count, "count=" + noRaw.Count);
+            Check("M3 缺原始版时 WeightJoined=false（显式告警依据）", !noRaw.WeightJoined, "expected false");
+            Eq("M3 缺原始版时 weight 全部 null", noRaw.WeightedCount, 0);
+
+            // 原始版损坏 → 不抛异常、weight 全 null、WeightJoined=false
+            string badRaw = Path.Combine(wDir, "bad-raw.json");
+            File.WriteAllText(badRaw, "{broken");
+            var badRawIdx = ItemIndex.Load(wFmt, badRaw);
+            Check("M3 原始版损坏不抛异常", badRawIdx != null && badRawIdx.Count == wi.Count, "count mismatch");
+            Check("M3 原始版损坏 WeightJoined=false", !badRawIdx.WeightJoined, "expected false");
+            Eq("M3 原始版损坏 weight 全 null", badRawIdx.WeightedCount, 0);
         }
         finally
         {

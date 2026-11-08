@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Test
 )
 
@@ -17,6 +17,8 @@ $coreSources = @(
     "$root\src\Core\MarketClient.cs",
     "$root\src\Core\ItemCatalog.cs",
     "$root\src\Core\MarketDb.cs",
+    "$root\src\Core\Market\ItemIndex.cs",
+    "$root\src\Core\Market\MarketDataService.cs",
     "$root\src\Core\Arbitrage.cs",
     "$root\src\Core\Runtime.cs",
     "$root\src\Core\OcrHelper.cs",
@@ -57,7 +59,8 @@ $common = @(
     "/r:$fw\System.dll",
     "/r:$fw\System.Windows.Forms.dll",
     "/r:$fw\System.Drawing.dll",
-    "/r:$fw\System.Web.Extensions.dll"
+    "/r:$fw\System.Web.Extensions.dll",
+    "/r:$fw\System.Net.Http.dll"
 )
 
 if ($Test) {

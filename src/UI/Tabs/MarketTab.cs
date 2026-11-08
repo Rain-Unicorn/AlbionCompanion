@@ -147,12 +147,21 @@ namespace AlbionCompanion.UI.Tabs
             _status.ForeColor = color;
         }
 
-        /// <summary>M3：物品数据版本显示（缺失 = 显式告警，绝不静默——HANDOFF 已知问题 6）。</summary>
+        /// <summary>M3：物品数据版本显示（缺失 = 显式告警，绝不静默——HANDOFF 已知问题 6）。
+        /// M3 修正：weight 未 join（缺 items-raw.json）也属数据不完整，单独告警——跑商算每公斤净利要靠它。</summary>
         private void UpdateDataVersionLabel()
         {
-            if (ItemIndex.Default == null && ItemIndex.LoadDefault() == null)
+            ItemIndex index = ItemIndex.Default;
+            if (index == null) index = ItemIndex.LoadDefault();
+            if (index == null)
             {
                 _dataVersion.Text = "物品数据未加载 · 点击下载";
+                _dataVersion.ForeColor = Th.Bad;
+                _dataVersion.LinkColor = Th.Bad;
+            }
+            else if (!index.WeightJoined)
+            {
+                _dataVersion.Text = "物品数据 v" + (ItemIndex.DataVersion ?? "?") + " · 缺重量数据 · 点击补齐";
                 _dataVersion.ForeColor = Th.Bad;
                 _dataVersion.LinkColor = Th.Bad;
             }
@@ -182,8 +191,10 @@ namespace AlbionCompanion.UI.Tabs
                     if (err == null && ItemIndex.LoadDefault() != null)
                     {
                         UpdateDataVersionLabel();
-                        SetStatus("物品数据已更新：" + ItemIndex.Default.Count + " 条 · 版本 v"
-                                  + ItemIndex.DataVersion, Th.Good);
+                        SetStatus("物品数据已更新：" + ItemIndex.Default.Count + " 条 · 重量 "
+                                  + ItemIndex.Default.WeightedCount + "/" + ItemIndex.Default.Count
+                                  + "（" + (ItemIndex.Default.WeightCoverageRatio * 100).ToString("F1") + "%）"
+                                  + " · 版本 v" + ItemIndex.DataVersion, Th.Good);
                     }
                     else
                     {
