@@ -26,6 +26,27 @@ namespace AlbionCompanion.Core
         /// <summary>OperationResponse 解析/校验失败累计（诊断用，原子递增）。</summary>
         public static long OperationResponseFailures => System.Threading.Interlocked.Read(ref _opRespParseFail);
 
+        /// <summary>
+        /// JoinResponse 的权威 OperationCode（P0-1）。**当前为 null = 白名单为空**。
+        /// </summary>
+        /// <remarks>
+        /// 设计文档自相矛盾：§2.2.2 / §3.3 写「Join = OperationCode==0」，
+        /// 而 §9.1 / §10.3(T-01) / §9.8(V1) 要求「比较值必须是真实 JoinResponse 码，且不为 0」。
+        /// 本实现采信后者（依据见 PhotonParser 类注释与交付说明），并要求**实机抓包取证**后才填值。
+        ///
+        /// 为什么默认 null 而不是先填 0 或某个猜测值：
+        ///   - 填 0 会让「任何解析失败 → opCode 默认 0」的退化路径再次变成确认入口；
+        ///   - 填猜测的非零值会让所有真实 Join 响应被丢弃（主路径永不触发，用户看不到自己的数据）；
+        ///   - null = 完全不确认，是唯一**不会产生错误结论**的状态，且身份仍有 evt=81 / evt=29 / 手选名字兜底。
+        ///
+        /// 取值方式（V1）：实机连开 5 次，从 events.log 的 `[OpResp] opCode=..` 观测行取到稳定值，
+        /// 填进本字段并把对应用例（T-01）改成该值；**禁止**为了让用例变绿而放宽成「非零即接受」。
+        /// </remarks>
+        public static byte? JoinResponseOperationCode = null;
+
+        /// <summary>最近一次观测到的非零 OperationCode 与其参数键（实机 V1 取证用，不做判定）。</summary>
+        public static string LastOperationCodeSample = "";
+
         private static int _udpCount;
         private static int _evtCount;
         private static int _cmd6, _cmd7, _cmd8, _other;
@@ -268,18 +289,36 @@ namespace AlbionCompanion.Core
                 try
                 {
                     var span = new ReadOnlySpan<byte>(d, off, operationLength);
-                    if (TryParseJoinResponse(span, out long localObjectId, out string? localUsername))
+                    Protocol18.Photon.OperationResponse? opData;
+                    try
                     {
-                        if (OnDebug != null)
-                            OnDebug("  [JoinResponse] LocalPlayer ObjectId=" + localObjectId + " Name=" + localUsername);
+                        opData = Protocol18Deserializer.DeserializeOperationResponse(span);
+                    }
+                    catch
+                    {
+                        // 解析失败必须显式计数并跳过，不得退化为「opCode 默认 0 → 视为 Join」
+                        System.Threading.Interlocked.Increment(ref _opRespParseFail);
+                        opData = null;
+                    }
 
-                        // R1/C3：身份唯一写入入口是状态机（强证据，确认或纠正）
-                        LocalPlayerIdentity.OnJoinResponse(localObjectId, localUsername);
+                    if (opData != null)
+                    {
+                        // V1 取证：记录响应码与参数键（只记录，不参与判定）
+                        RecordOperationCodeSample(opData);
+
+                        if (ValidateJoinResponse(opData, out long localObjectId, out string? localUsername))
+                        {
+                            if (OnDebug != null)
+                                OnDebug("  [JoinResponse] LocalPlayer ObjectId=" + localObjectId + " Name=" + localUsername);
+
+                            // R1/C3：身份唯一写入入口是状态机（强证据，确认或纠正）
+                            LocalPlayerIdentity.OnJoinResponse(localObjectId, localUsername);
+                        }
                     }
                 }
                 catch
                 {
-                    // 解析失败必须显式计数并跳过，不得退化为「opCode 默认 0 → 视为 Join」
+                    // 兜底：任何意外都只计数，不影响同包其它内容
                     System.Threading.Interlocked.Increment(ref _opRespParseFail);
                 }
             }
@@ -288,15 +327,26 @@ namespace AlbionCompanion.Core
 
 
         /// <summary>
-        /// R0 内核（可注入原始字节，供单测 T-01 构造输入）：
-        /// 用 OperationResponse 的真实布局反序列化，并按「JoinResponse 判定 + 有效身份」双重校验。
-        /// 判定规则（依据设计风险表与 T-01）：
-        ///   - opCode 为 0 不视为 JoinResponse（旧代码把 0 当 Join，是反复清空身份的根因之一）；
-        ///   - ReturnCode != 0（失败响应）不写状态；
-        ///   - 参数 0（UserObjectId）必须可解析且 > 0 才提交；
+        /// R0 内核（可注入原始字节，供单测构造输入）：
+        /// 用 OperationResponse 的真实布局反序列化，并按「JoinResponse 精确码 + 有效身份」双重校验。
+        ///
+        /// **判定规则（P0-1 定案）**：
+        ///   - `ReturnCode != 0`（服务器失败响应）→ 不写身份；
+        ///   - `OperationCode` 必须**精确等于** <see cref="JoinResponseOperationCode"/> → 否则不写身份；
+        ///   - 参数 0（UserObjectId）必须可解析且 &gt; 0 才提交；
         ///   - 参数 2（Username）可为空（允许「有 id 无名」）。
-        /// 注意：真实 Join 的 opCode 码值未经实机确认（V1），当前采用「非零即候选」的宽松判定，
-        /// 实机若发现漂移应改为精确码值匹配而不是继续放宽。
+        ///
+        /// **已删除的旧判定**：`OperationCode == 0 → return false`，其余非零值一律放行。
+        /// 两个方向都有害：
+        ///   ① 若真实 Join 码落在 0，主路径永不触发（用户永远看不到自己的数据）；
+        ///   ② 非零即放行，会让任意一条非 Join 的 OperationResponse（只要恰好带 p0&gt;0 与 p2）确认身份，
+        ///      而 `LocalPlayerIdentity.OnJoinResponse` 在身份冲突时会 `DamageTracker.RemovePlayer(0)`——
+        ///      一次无关响应就能把用户自己的累计伤害清零。
+        /// 错误确认比不确认危害大得多，故一律收紧为精确白名单匹配。
+        ///
+        /// **白名单为空时的行为**：若 <see cref="JoinResponseOperationCode"/> 为 null（实机码值未采集到），
+        /// 本方法**永远返回 false**，即完全不确认身份——这是有意的保守行为；
+        /// 身份仍可由 evt=81 余额严格匹配 / evt=29 名字匹配 / 手选名字兜底。
         /// </summary>
         public static bool TryParseJoinResponse(ReadOnlySpan<byte> operationBody, out long objectId, out string? name)
         {
@@ -314,10 +364,27 @@ namespace AlbionCompanion.Core
                 System.Threading.Interlocked.Increment(ref _opRespParseFail);
                 return false;
             }
+            if (opData == null) return false;
+
+            return ValidateJoinResponse(opData, out objectId, out name);
+        }
+
+        /// <summary>
+        /// JoinResponse 判定内核（纯校验，不解析字节）。调用点已解析出的 opData 直接复用，
+        /// 避免在热路径上重复反序列化。
+        /// </summary>
+        public static bool ValidateJoinResponse(Protocol18.Photon.OperationResponse opData,
+                                                out long objectId, out string? name)
+        {
+            objectId = 0;
+            name = null;
             if (opData == null || opData.Parameters == null) return false;
 
-            if (opData.OperationCode == 0) return false;      // 未知/无效码，绝不写身份
             if (opData.ReturnCode != 0) return false;          // 服务器返回失败，不写状态
+
+            byte? expected = JoinResponseOperationCode;
+            if (expected == null) return false;                // 白名单为空 → 绝不确认（不可放宽）
+            if (opData.OperationCode != expected.Value) return false; // 精确等值匹配
 
             object objIdObj;
             if (!opData.Parameters.TryGetValue(0, out objIdObj)) return false;
@@ -332,6 +399,38 @@ namespace AlbionCompanion.Core
 
             objectId = parsedId;
             return true;
+        }
+
+        /// <summary>
+        /// 实机取证辅助（V1）：把已解析响应的「opCode / returnCode / 参数键」记进
+        /// <see cref="LastOperationCodeSample"/> 与 events.log。**只记录，不参与身份判定**。
+        /// 目的：让「真实 Join 的 opCode 到底是多少」这个未知量由实机数据给出，而不是靠猜。
+        /// </summary>
+        private static void RecordOperationCodeSample(Protocol18.Photon.OperationResponse opData)
+        {
+            if (opData == null) return;
+
+            var sb = new StringBuilder();
+            sb.Append("opCode=").Append(opData.OperationCode)
+              .Append(" ret=").Append(opData.ReturnCode)
+              .Append(" keys=[");
+            if (opData.Parameters != null)
+            {
+                int i = 0;
+                foreach (var kv in opData.Parameters)
+                {
+                    if (i++ > 0) sb.Append(',');
+                    sb.Append(kv.Key);
+                }
+            }
+            sb.Append(']');
+            string sample = sb.ToString();
+
+            // 只在码值或参数键组合变化时打一行，避免刷屏；始终保留最近一条供 UI/LiveTab 读取
+            string prev = LastOperationCodeSample;
+            LastOperationCodeSample = sample;
+            if (prev != sample && OnDebug != null)
+                OnDebug("  [OpResp] " + sample);
         }
 
         private static int ReadInt32BE(byte[] d, int o)

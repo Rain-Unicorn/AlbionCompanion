@@ -757,6 +757,124 @@ static class LogicTests
 
 
         // ---------------------------------------------------------------
+        // A13 P0-3 陈旧报价不得参与选价（巡检 2026-11-09 第 3 项 P0）
+        // 缺陷原状：Arbitrage.cs:47-48 只看 q.SellMin > 0 就选价，
+        // SellHasData / SellStale 在整个 Arbitrage.cs 零命中 → 上月死价照样算出正净利。
+        // 修复口径：选价前按原始时间戳重算 24h 陈旧，陈旧点剔除并计入 droppedStale。
+        // ---------------------------------------------------------------
+        {
+            // 注入固定 arbNow：避免用 DateTimeOffset.UtcNow 造成跨日抖动
+            var arbNow = new DateTimeOffset(2026, 11, 9, 6, 40, 0, TimeSpan.Zero);
+            int dropped;
+
+            // ① 卖侧陈旧：SellMin=9000 但 SellMinDate=arbNow-30d。唯一能赚钱的卖城是死价，
+            //    该物品必须不产出任何路线（巡检明确要求的复验用例）。
+            var staleSell = new List<MarketQuote>
+            {
+                new MarketQuote { ItemId = "T4_STALESELL", City = "Caerleon", Quality = 1,
+                                  SellMin = 9000, SellMinDate = arbNow.AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  BuyMax = 0,    BuyMaxDate = "" },
+                new MarketQuote { ItemId = "T4_STALESELL", City = "Bridgewatch", Quality = 1,
+                                  SellMin = 0,   SellMinDate = "",
+                                  BuyMax = 6000, BuyMaxDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss") },
+            };
+            var staleSellRoutes = Arbitrage.Compute(staleSell, 0.08, 0.025, 0, arbNow, out dropped);
+            Eq("A13 陈旧卖价（arbNow-30d）不产出路线", staleSellRoutes.Count, 0);
+            Eq("A13 陈旧卖价计入 droppedStale", dropped, 1);
+
+            // ② 买侧陈旧：BuyMax 很高但 BuyMaxDate=arbNow-30d，同样不得选为买城
+            var staleBuy = new List<MarketQuote>
+            {
+                new MarketQuote { ItemId = "T4_STALEBUY", City = "Caerleon", Quality = 1,
+                                  SellMin = 9000, SellMinDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  BuyMax = 0,     BuyMaxDate = "" },
+                new MarketQuote { ItemId = "T4_STALEBUY", City = "Bridgewatch", Quality = 1,
+                                  SellMin = 0,    SellMinDate = "",
+                                  BuyMax = 6000,  BuyMaxDate = arbNow.AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ss") },
+            };
+            var staleBuyRoutes = Arbitrage.Compute(staleBuy, 0.08, 0.025, 0, arbNow, out dropped);
+            Eq("A13 陈旧买价（arbNow-30d）不产出路线", staleBuyRoutes.Count, 0);
+            Eq("A13 陈旧买价计入 droppedStale", dropped, 1);
+
+            // ③ 边界：恰好 24h 内（arbNow-23h）仍算新鲜，必须正常出路线
+            var freshEdge = new List<MarketQuote>
+            {
+                new MarketQuote { ItemId = "T4_EDGE", City = "Caerleon", Quality = 1,
+                                  SellMin = 10000, SellMinDate = arbNow.AddHours(-23).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  BuyMax = 0,      BuyMaxDate = "" },
+                new MarketQuote { ItemId = "T4_EDGE", City = "Bridgewatch", Quality = 1,
+                                  SellMin = 0,     SellMinDate = "",
+                                  BuyMax = 6000,   BuyMaxDate = arbNow.AddHours(-23).ToString("yyyy-MM-ddTHH:mm:ss") },
+            };
+            var freshEdgeRoutes = Arbitrage.Compute(freshEdge, 0.08, 0.025, 0, arbNow, out dropped);
+            Eq("A13 23h 内报价仍新鲜：出路线", freshEdgeRoutes.Count, 1);
+            Eq("A13 23h 内报价不产生剔除计数", dropped, 0);
+
+            // ④ 边界：恰好超过 24h（arbNow-25h）必须剔除
+            var staleEdge = new List<MarketQuote>
+            {
+                new MarketQuote { ItemId = "T4_EDGE2", City = "Caerleon", Quality = 1,
+                                  SellMin = 10000, SellMinDate = arbNow.AddHours(-25).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  BuyMax = 0,      BuyMaxDate = "" },
+                new MarketQuote { ItemId = "T4_EDGE2", City = "Bridgewatch", Quality = 1,
+                                  SellMin = 0,     SellMinDate = "",
+                                  BuyMax = 6000,   BuyMaxDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss") },
+            };
+            var staleEdgeRoutes = Arbitrage.Compute(staleEdge, 0.08, 0.025, 0, arbNow, out dropped);
+            Eq("A13 25h 卖价被剔除：不出路线", staleEdgeRoutes.Count, 0);
+            Eq("A13 25h 卖价计入剔除计数", dropped, 1);
+
+            // ⑤ 陈旧卖价存在、但另有新鲜卖城：必须挑新鲜那个，而不是被死价带偏
+            var preferFresh = new List<MarketQuote>
+            {
+                new MarketQuote { ItemId = "T4_MIX", City = "Caerleon", Quality = 1,
+                                  SellMin = 8000,  SellMinDate = arbNow.AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  BuyMax = 0,      BuyMaxDate = "" },
+                new MarketQuote { ItemId = "T4_MIX", City = "Martlock", Quality = 1,
+                                  SellMin = 10000, SellMinDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  BuyMax = 0,      BuyMaxDate = "" },
+                new MarketQuote { ItemId = "T4_MIX", City = "Bridgewatch", Quality = 1,
+                                  SellMin = 0,     SellMinDate = "",
+                                  BuyMax = 6000,   BuyMaxDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss") },
+            };
+            var mixRoutes = Arbitrage.Compute(preferFresh, 0.08, 0.025, 0, arbNow, out dropped);
+            Eq("A13 混合场景：仍按新鲜价出 1 条路线", mixRoutes.Count, 1);
+            if (mixRoutes.Count == 1)
+                Check("A13 混合场景：卖城取新鲜城 Martlock 而非死价城 Caerleon",
+                      mixRoutes[0].SellCity == "Martlock", mixRoutes[0].SellCity);
+            Eq("A13 混合场景：陈旧卖价计入剔除计数", dropped, 1);
+
+            // ⑥ 无时间戳（空串 / 0001 哨兵）不判陈旧 —— 与 MarketClient.IsSellStale 既有口径一致，
+            //    避免把「CSV 无日期列」的历史本地库整行清空（A11 的四条无日期报价必须继续有效）
+            var noDate = new List<MarketQuote>
+            {
+                new MarketQuote { ItemId = "T4_NODATE", City = "Caerleon", Quality = 1,
+                                  SellMin = 10000, SellMinDate = "", BuyMax = 0, BuyMaxDate = "" },
+                new MarketQuote { ItemId = "T4_NODATE", City = "Bridgewatch", Quality = 1,
+                                  SellMin = 0, SellMinDate = "", BuyMax = 6000,
+                                  BuyMaxDate = "0001-01-01T00:00:00" },
+            };
+            var noDateRoutes = Arbitrage.Compute(noDate, 0.08, 0.025, 0, arbNow, out dropped);
+            Eq("A13 无时间戳不判陈旧：仍出路线", noDateRoutes.Count, 1);
+            Eq("A13 无时间戳不产生剔除计数", dropped, 0);
+
+            // ⑦ 原四参重载（不注入 arbNow）行为与带计数重载一致：A11 的既有断言
+            //    在真实时钟下不能被陈旧逻辑破坏（arbQuotes 无日期 → 不判陈旧）
+            Eq("A13 四参重载仍可用（无日期报价不误杀）",
+               Arbitrage.Compute(arbQuotes, 0.08, 0.025, 0).Count, 1);
+
+            // ⑧ 判定内核单点校验
+            Check("A13 陈旧判定：arbNow-30d = 陈旧", Arbitrage.IsQuoteDateStale(
+                  arbNow.AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ss"), arbNow), "expected stale");
+            Check("A13 陈旧判定：arbNow-23h = 新鲜", !Arbitrage.IsQuoteDateStale(
+                  arbNow.AddHours(-23).ToString("yyyy-MM-ddTHH:mm:ss"), arbNow), "expected fresh");
+            Check("A13 陈旧判定：空串不判陈旧", !Arbitrage.IsQuoteDateStale("", arbNow), "expected fresh");
+            Check("A13 陈旧判定：0001 哨兵不判陈旧",
+                  !Arbitrage.IsQuoteDateStale("0001-01-01T00:00:00", arbNow), "expected fresh");
+        }
+
+
+        // ---------------------------------------------------------------
         // T-16 R3 并发烟雾：4 线程各写 10 万条 + 1 线程并发 Snapshot 10 万次
         // 断言：不抛异常、快照条数单调不减、最终条数 == 500（按上限裁剪后的值）
         // 说明：本条不需要实机，纯托管线程即可判定锁与快照是否真的生效。
@@ -878,37 +996,90 @@ static class LogicTests
         //   key=0 -> Long2(17) 存 UserObjectId；key=2 -> String(7) 存 Username
         // ---------------------------------------------------------------
         {
-            // 合法 JoinResponse：opCode 非零、returnCode=0、ObjectId=1001、Name="AB"
-            byte[] valid = new byte[] {
-                42,          // opCode（非零）
-                0x00, 0x00,  // returnCode = 0 (LE)
-                0x08,        // debugMessage 类型码 = Null（空调试串）
-                0x02,        // 参数表 2 条
-                0x00, 17, 0xE9, 0x03,          // key=0, Long2, 1001 (LE)
-                0x02, 7,  0x02, (byte)'A', (byte)'B' // key=2, String, "AB"
+            // 构造辅助：opCode + returnCode + ObjectId + Name
+            Func<byte, short, long, string, byte[]> build = (op, ret, objId, name) =>
+            {
+                var bytes = new List<byte>();
+                bytes.Add(op);
+                bytes.Add((byte)(ret & 0xFF));
+                bytes.Add((byte)((ret >> 8) & 0xFF));
+                bytes.Add(0x08);                                     // debugMessage 类型码 = Null
+                bytes.Add((byte)(string.IsNullOrEmpty(name) ? 1 : 2)); // 参数表条数
+                bytes.Add(0x00); bytes.Add(17);                      // key=0, Long2（UShort = 2 字节 LE）
+                bytes.Add((byte)(objId & 0xFF));
+                bytes.Add((byte)((objId >> 8) & 0xFF));
+                if (!string.IsNullOrEmpty(name))
+                {
+                    bytes.Add(0x02); bytes.Add(7);                   // key=2, String
+                    bytes.Add((byte)name.Length);
+                    foreach (char c in name) bytes.Add((byte)c);
+                }
+                return bytes.ToArray();
             };
+
+            // 合法响应字节：opCode 取候选值 42、returnCode=0、ObjectId=1001、Name="AB"
+            byte[] valid = build(42, 0, 1001, "AB");
             long parsedId; string parsedName;
-            bool ok = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(valid), out parsedId, out parsedName);
-            Check("T-01 合法响应被识别为 JoinResponse", ok, "ok=false");
-            Eq("T-01 ObjectId 解析 = 1001", ok ? parsedId : 0, 1001L);
-            Eq("T-01 Username 解析 = AB", ok ? parsedName : null, "AB");
 
-            // 异常输入 1：opCode=0（旧代码的致命默认值）
-            byte[] zeroOp = (byte[])valid.Clone(); zeroOp[0] = 0;
+            // ---- 关键：白名单为空（默认值）时，任何响应都不得确认身份 ----
+            // 这是 P0-1 修复的保守兜底：真实 Join opCode 未经实机取证前，宁可完全不确认。
+            PhotonParser.JoinResponseOperationCode = null;
+            bool okDefault = false;
+            try { okDefault = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(valid), out parsedId, out parsedName); }
+            catch { okDefault = false; }
+            Check("T-01 白名单为空：合法的 42 码响应也不确认身份", !okDefault, "okDefault=true");
+
+            // ---- 设定权威码值后才做精确匹配 ----
+            // 说明：42 仅为单测构造值，不代表真实 JoinResponse 码；真实码值由 V1 实机取证填入。
+            PhotonParser.JoinResponseOperationCode = 42;
+            long parsedId2; string parsedName2;
+            bool ok = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(valid), out parsedId2, out parsedName2);
+            Check("T-01 精确匹配：白名单=42 时 42 码响应被识别为 JoinResponse", ok, "ok=false");
+            Eq("T-01 ObjectId 解析 = 1001", ok ? parsedId2 : 0, 1001L);
+            Eq("T-01 Username 解析 = AB", ok ? parsedName2 : null, "AB");
+
             long id2; string name2;
-            bool ok2 = false;
-            try { ok2 = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(zeroOp), out id2, out name2); }
-            catch { ok2 = false; }
-            Check("T-01 opCode=0 不视为 JoinResponse", !ok2, "ok2=true");
 
-            // 异常输入 2：参数表为空（无 UserObjectId）
+            // ---- 回归 1：opCode=0（解析失败/默认值的退化入口）必须 false ----
+            // 旧的 `== 0` 判定其实也拒绝 0，这条继续守住「0 永远不是 Join」。
+            byte[] zeroOp = build(0, 0, 1001, "AB");
+            bool okZero = true;
+            try { okZero = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(zeroOp), out id2, out name2); }
+            catch { okZero = false; }
+            Check("T-01 opCode=0 不视为 JoinResponse（退化路径封堵）", !okZero, "okZero=true");
+
+            // ---- 回归 2：任意非零非 Join 码必须 false（删除「非零即接受」） ----
+            // 这是本次 P0-1 的核心回归：旧代码会让这条本应被拒的响应确认身份，
+            // 进而因身份冲突触发 DamageTracker.RemovePlayer(0)，把用户自己的伤害清零。
+            byte[] foreignOp = build(60, 0, 1001, "AB");
+            bool okForeign = true;
+            try { okForeign = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(foreignOp), out id2, out name2); }
+            catch { okForeign = false; }
+            Check("T-01 非零非 Join 码（60 vs 白名单 42）不确认身份", !okForeign, "okForeign=true");
+
+            // ---- 回归 3：换一个白名单值，同一批字节的判定方向必须随之翻转（证明是精确等值，不是范围放宽） ----
+            PhotonParser.JoinResponseOperationCode = 60;
+            bool okSwapped = false;
+            try { okSwapped = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(valid), out id2, out name2); }
+            catch { okSwapped = false; }
+            Check("T-01 白名单=60 时 42 码响应不再确认（精确等值而非范围匹配）", !okSwapped, "okSwapped=true");
+            PhotonParser.JoinResponseOperationCode = 42;
+
+            // ---- 回归 4：码值匹配但服务器掉失败码（ReturnCode != 0）仍不确认 ----
+            byte[] retFail = build(42, 3, 1001, "AB");
+            bool okRet = true;
+            try { okRet = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(retFail), out id2, out name2); }
+            catch { okRet = false; }
+            Check("T-01 ReturnCode!=0（失败响应）不确认身份", !okRet, "okRet=true");
+
+            // ---- 回归 5：参数表为空（无 UserObjectId） ----
             byte[] emptyParams = new byte[] { 42, 0x00, 0x00, 0x08, 0x00 };
             bool ok3 = false;
             try { ok3 = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(emptyParams), out id2, out name2); }
             catch { ok3 = false; }
             Check("T-01 空参数表不写身份", !ok3, "ok3=true");
 
-            // 异常输入 3：参数表截断（在 value 中间截断）
+            // ---- 回归 6：参数表截断（在 value 中间截断） ----
             byte[] truncated = new byte[8];
             Array.Copy(valid, truncated, 8);
             bool ok4 = false; bool threw = false;
@@ -917,25 +1088,62 @@ static class LogicTests
             Check("T-01 截断输入：不确认身份且不抛到调用方", (!ok4) && (!threw),
                   "ok4=" + ok4 + " threw=" + threw);
 
-            // 异常输入 4：ObjectId 无效（0）
+            // ---- 回归 7：ObjectId <= 0 ----
             byte[] zeroId = new byte[] { 42, 0x00, 0x00, 0x08, 0x01, 0x00, 17, 0x00 };
             bool ok5 = false;
             try { ok5 = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(zeroId), out id2, out name2); }
             catch { ok5 = false; }
             Check("T-01 ObjectId<=0 不写身份", !ok5, "ok5=true");
 
-            // 端到端：内核识别出的身份经 OnJoinResponse 写入状态机（C3 起 GameEvents.LocalPlayerObjectId
-            // 是只读转发，禁止直写；直接写会编译失败，这正是兼容层的意图）
+            // ---- 回归 8：有害场景实证——非 Join 响应绝不能触发身份冲突清零 ----
+            // 场景：身份已确认为 1001，此时到达一条 opCode=60（非 Join）但 p0=9999 的响应。
+            // 旧判定会把它当 Join → OnJoinResponse(9999) → 冲突 → RemovePlayer(0) → 自己的累计伤害清零。
+            // 新判定：直接不确认，DamageTracker 与身份都原封不动。
+            LocalPlayerIdentity.Reset();
+            GameEvents.ResetAll();
+            LocalPlayerIdentity.OnJoinResponse(1001, "Me");
+            GameEvents.DamageTracker.RecordDamage(0, "Me", 5001, 1000, -1, true);
+            Eq("T-01 前置：自己 key=0 累计伤害已就位", GameEvents.DamageTracker.GetTotals(
+                  AlbionCompanion.Core.DamageMeter.DamageStatsTracker.DamageFilter.All).TotalDamage, 1000L);
+
+            PhotonParser.JoinResponseOperationCode = 42;
+            byte[] foreignConflict = build(60, 0, 9999, "SomeoneElse");
+            bool okConflict = false;
+            try { okConflict = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(foreignConflict), out id2, out name2); }
+            catch { okConflict = false; }
+            Check("T-01 冲突场景：非 Join 响应不被确认为身份", !okConflict, "okConflict=true");
+            Eq("T-01 冲突场景：身份未被改动（仍是 1001）", GameEvents.LocalPlayerObjectId, 1001L);
+            Eq("T-01 冲突场景：自己的累计伤害未被打回 0", GameEvents.DamageTracker.GetTotals(
+                  AlbionCompanion.Core.DamageMeter.DamageStatsTracker.DamageFilter.All).TotalDamage, 1000L);
+
+            // 对照：真 Join 码换身份时，冲突清零逻辑本身仍生效（证明清零点是被「错误确认」引爆、不是被删掉了）
+            long id3; string name3;
+            LocalPlayerIdentity.OnJoinResponse(2002, "NewMe");
+            Eq("T-01 对照：真 Join 换 id 时 key=0 仍被清（设计 §4.4 语义保留）",
+               GameEvents.DamageTracker.GetTotals(
+                   AlbionCompanion.Core.DamageMeter.DamageStatsTracker.DamageFilter.All).TotalDamage, 0L);
+
+            // ---- 端到端：内核识别出的身份经 OnJoinResponse 写入状态机 ----
             LocalPlayerIdentity.Reset();
             IncomeTracker.Reset();
-            if (ok)
+            GameEvents.ResetAll();
+            PhotonParser.JoinResponseOperationCode = 42;
+            bool okE2E;
+            long e2eId; string e2eName;
+            try { okE2E = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(valid), out e2eId, out e2eName); }
+            catch { okE2E = false; e2eId = 0; e2eName = null; }
+            Check("T-01 端到端：合法响应确实被内核放行", okE2E, "okE2E=false");
+            if (okE2E)
             {
-                LocalPlayerIdentity.OnJoinResponse(parsedId, parsedName);
+                LocalPlayerIdentity.OnJoinResponse(e2eId, e2eName);
             }
             Eq("T-01 身份经状态机写入（GameEvents 只读转发）", GameEvents.LocalPlayerObjectId, 1001L);
             Eq("T-01 身份名写入", GameEvents.LocalPlayerName, "AB");
             Eq("T-01 确认来源 = JoinResponse", LocalPlayerIdentity.CurrentSource, ConfirmSource.JoinResponse);
             Eq("T-01 状态 = Confirmed", LocalPlayerIdentity.State, IdentityState.Confirmed);
+
+            // 复原：把白名单恢复为「空」——生产默认值，避免测试副作用泄漏到后续用例
+            PhotonParser.JoinResponseOperationCode = null;
 
             // ---------------------------------------------------------------
             // T-02 未确认态收益归零（R1）：身份 Unknown，喂 3 条 evt=62；
