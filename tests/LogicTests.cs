@@ -349,6 +349,71 @@ static class LogicTests
             Eq("T-16 收益条数按上限裁剪 = 500", GameEvents.CountIncome(), 500);
         }
 
+
+        // ---------------------------------------------------------------
+        // T-01 R0 OperationResponse 解析（可注入字节的内核）
+        // 布局：opCode(1B) + returnCode(2B LE) + debugMessage(1B长度=0) + 参数表
+        // 参数表：size(1B) + N × [key(1B) + typeCode(1B) + value]
+        //   key=0 -> Long2(17) 存 UserObjectId；key=2 -> String(7) 存 Username
+        // ---------------------------------------------------------------
+        {
+            // 合法 JoinResponse：opCode 非零、returnCode=0、ObjectId=1001、Name="AB"
+            byte[] valid = new byte[] {
+                42,          // opCode（非零）
+                0x00, 0x00,  // returnCode = 0 (LE)
+                0x08,        // debugMessage 类型码 = Null（空调试串）
+                0x02,        // 参数表 2 条
+                0x00, 17, 0xE9, 0x03,          // key=0, Long2, 1001 (LE)
+                0x02, 7,  0x02, (byte)'A', (byte)'B' // key=2, String, "AB"
+            };
+            long parsedId; string parsedName;
+            bool ok = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(valid), out parsedId, out parsedName);
+            Check("T-01 合法响应被识别为 JoinResponse", ok, "ok=false");
+            Eq("T-01 ObjectId 解析 = 1001", ok ? parsedId : 0, 1001L);
+            Eq("T-01 Username 解析 = AB", ok ? parsedName : null, "AB");
+
+            // 异常输入 1：opCode=0（旧代码的致命默认值）
+            byte[] zeroOp = (byte[])valid.Clone(); zeroOp[0] = 0;
+            long id2; string name2;
+            bool ok2 = false;
+            try { ok2 = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(zeroOp), out id2, out name2); }
+            catch { ok2 = false; }
+            Check("T-01 opCode=0 不视为 JoinResponse", !ok2, "ok2=true");
+
+            // 异常输入 2：参数表为空（无 UserObjectId）
+            byte[] emptyParams = new byte[] { 42, 0x00, 0x00, 0x08, 0x00 };
+            bool ok3 = false;
+            try { ok3 = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(emptyParams), out id2, out name2); }
+            catch { ok3 = false; }
+            Check("T-01 空参数表不写身份", !ok3, "ok3=true");
+
+            // 异常输入 3：参数表截断（在 value 中间截断）
+            byte[] truncated = new byte[8];
+            Array.Copy(valid, truncated, 8);
+            bool ok4 = false; bool threw = false;
+            try { ok4 = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(truncated), out id2, out name2); }
+            catch { threw = true; }
+            Check("T-01 截断输入：不确认身份且不抛到调用方", (!ok4) && (!threw),
+                  "ok4=" + ok4 + " threw=" + threw);
+
+            // 异常输入 4：ObjectId 无效（0）
+            byte[] zeroId = new byte[] { 42, 0x00, 0x00, 0x08, 0x01, 0x00, 17, 0x00 };
+            bool ok5 = false;
+            try { ok5 = PhotonParser.TryParseJoinResponse(new ReadOnlySpan<byte>(zeroId), out id2, out name2); }
+            catch { ok5 = false; }
+            Check("T-01 ObjectId<=0 不写身份", !ok5, "ok5=true");
+
+            // 端到端：内核识别出的身份应写进 GameEvents（C2 阶段的承接方式）
+            GameEvents.LocalPlayerObjectId = null;
+            GameEvents.LocalPlayerName = "";
+            if (ok)
+            {
+                GameEvents.LocalPlayerObjectId = parsedId;
+                GameEvents.LocalPlayerName = parsedName;
+            }
+            Eq("T-01 身份写入 GameEvents", GameEvents.LocalPlayerObjectId, 1001L);
+        }
+
         Console.WriteLine();
         Console.WriteLine("passed=" + _pass + " failed=" + _fail);
         return _fail == 0 ? 0 : 1;

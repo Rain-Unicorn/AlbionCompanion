@@ -22,10 +22,15 @@ namespace AlbionCompanion.Core
         private const int PhotonHeaderLength = 12;
 
         public static event Action<string> OnDebug;
+
+        /// <summary>OperationResponse 解析/校验失败累计（诊断用，原子递增）。</summary>
+        public static long OperationResponseFailures => System.Threading.Interlocked.Read(ref _opRespParseFail);
+
         private static int _udpCount;
         private static int _evtCount;
         private static int _cmd6, _cmd7, _cmd8, _other;
         private static int _msgCalls;
+        private static long _opRespParseFail; // OperationResponse 反序列化/校验失败次数（原子递增）
 
         // CommandType enum from SAT
         private const byte CmdDisconnect = 1;
@@ -256,55 +261,78 @@ namespace AlbionCompanion.Core
             }
             else if (messageType == MsgOperationResponse)
             {
-                // 照搬 SAT：处理 OperationResponse，提取本地玩家信息（JoinResponse）
+                // R0 修复：OperationResponse 与 EventData 的字节布局不同
+                // （opCode(1B) + returnCode(2B LE) + debugMessage(1B 长度 + N) + 参数表），
+                // 原先用 DeserializeEventData 会整体错位，parameters[253] 永远取不到，
+                // opCode 恒为默认值 0，导致每个响应都走 Join 分支并把本地玩家清成 null。
                 try
                 {
                     var span = new ReadOnlySpan<byte>(d, off, operationLength);
-                    var opData = Protocol18Deserializer.DeserializeEventData(span);
-                    if (opData != null && opData.Parameters != null)
+                    if (TryParseJoinResponse(span, out long localObjectId, out string localUsername))
                     {
-                        // OperationResponse 的格式：
-                        // parameters[253] = OperationCode（比如 Join = 0）
-                        // parameters[254] = 成功标志
-                        // parameters[255] = 结果代码
-                        // 真正的参数从 0 开始
+                        if (OnDebug != null)
+                            OnDebug("  [JoinResponse] LocalPlayer ObjectId=" + localObjectId + " Name=" + localUsername);
 
-                        byte opCode = 0;
-                        if (opData.Parameters.TryGetValue(253, out var opCodeObj))
-                        {
-                            try { opCode = Convert.ToByte(opCodeObj); } catch { }
-                        }
-
-                        // JoinResponse: OperationCode = 0
-                        if (opCode == 0)
-                        {
-                            // 参数 0: UserObjectId（本地玩家 ObjectId）
-                            // 参数 2: Username（本地玩家名字）
-                            long? localObjectId = null;
-                            string localUsername = null;
-
-                            if (opData.Parameters.TryGetValue(0, out var objIdObj))
-                            {
-                                try { localObjectId = Convert.ToInt64(objIdObj); } catch { }
-                            }
-
-                            if (opData.Parameters.TryGetValue(2, out var usernameObj))
-                            {
-                                localUsername = usernameObj?.ToString();
-                            }
-
-                            if (OnDebug != null)
-                                OnDebug("  [JoinResponse] LocalPlayer ObjectId=" + localObjectId + " Name=" + localUsername);
-
-                            // 把本地玩家信息存起来
-                            GameEvents.LocalPlayerObjectId = localObjectId;
-                            GameEvents.LocalPlayerName = localUsername;
-                        }
+                        // 仅在解析出有效身份时提交（C3 起改为 LocalPlayerIdentity.OnJoinResponse）
+                        GameEvents.LocalPlayerObjectId = localObjectId;
+                        GameEvents.LocalPlayerName = localUsername ?? "";
                     }
                 }
-                catch { /* 解析失败就跳过 */ }
+                catch
+                {
+                    // 解析失败必须显式计数并跳过，不得退化为「opCode 默认 0 → 视为 Join」
+                    System.Threading.Interlocked.Increment(ref _opRespParseFail);
+                }
             }
             // TODO: OperationRequest parsing
+        }
+
+
+        /// <summary>
+        /// R0 内核（可注入原始字节，供单测 T-01 构造输入）：
+        /// 用 OperationResponse 的真实布局反序列化，并按「JoinResponse 判定 + 有效身份」双重校验。
+        /// 判定规则（依据设计风险表与 T-01）：
+        ///   - opCode 为 0 不视为 JoinResponse（旧代码把 0 当 Join，是反复清空身份的根因之一）；
+        ///   - ReturnCode != 0（失败响应）不写状态；
+        ///   - 参数 0（UserObjectId）必须可解析且 > 0 才提交；
+        ///   - 参数 2（Username）可为空（允许「有 id 无名」）。
+        /// 注意：真实 Join 的 opCode 码值未经实机确认（V1），当前采用「非零即候选」的宽松判定，
+        /// 实机若发现漂移应改为精确码值匹配而不是继续放宽。
+        /// </summary>
+        public static bool TryParseJoinResponse(ReadOnlySpan<byte> operationBody, out long objectId, out string name)
+        {
+            objectId = 0;
+            name = null;
+
+            Protocol18.Photon.OperationResponse opData;
+            try
+            {
+                opData = Protocol18Deserializer.DeserializeOperationResponse(operationBody);
+            }
+            catch
+            {
+                // 截断/非法字节：计入失败计数（供诊断），绝不抛给调用方
+                System.Threading.Interlocked.Increment(ref _opRespParseFail);
+                return false;
+            }
+            if (opData == null || opData.Parameters == null) return false;
+
+            if (opData.OperationCode == 0) return false;      // 未知/无效码，绝不写身份
+            if (opData.ReturnCode != 0) return false;          // 服务器返回失败，不写状态
+
+            object objIdObj;
+            if (!opData.Parameters.TryGetValue(0, out objIdObj)) return false;
+            long parsedId;
+            try { parsedId = Convert.ToInt64(objIdObj); }
+            catch { return false; }
+            if (parsedId <= 0) return false;                   // ObjectId 必须为正
+
+            object usernameObj;
+            if (opData.Parameters.TryGetValue(2, out usernameObj))
+                name = usernameObj?.ToString();
+
+            objectId = parsedId;
+            return true;
         }
 
         private static int ReadInt32BE(byte[] d, int o)
