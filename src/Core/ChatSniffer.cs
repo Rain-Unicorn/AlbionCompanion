@@ -28,6 +28,14 @@ namespace AlbionCompanion.Core
         private static readonly ConcurrentDictionary<long, string> _playerNames = new ConcurrentDictionary<long, string>(); // 玩家名字字典
         private static readonly ConcurrentDictionary<long, string> _mobNames = new ConcurrentDictionary<long, string>(); // 怪物名字字典（照搬 SAT：区分玩家和怪物）
 
+        // C8/Bug A：未解析的「玩家侧」目标 ObjectId → 首次命中时刻。
+        // 作用：evt=6 命中一个判得出是玩家、但名字字典里没有的 target 时挂起，
+        // 等 evt=29 NewCharacter 写名字字典后补名（与 C6 队伍 pending 反查同一思路：
+        // 先挂起、后确认、宁可未知不可错标）。
+        private static readonly ConcurrentDictionary<long, DateTime> _pendingTargetIds = new ConcurrentDictionary<long, DateTime>();
+        private const int MaxPendingTargets = 512;                     // 防无界增长（未知目标长期不出现时裁掉最旧的）
+        private static readonly TimeSpan PendingTargetTtl = TimeSpan.FromMinutes(10); // 与 C6 队伍 pending 同一超时口径
+
         // R2/C4：-1「未知玩家」后补认领（设计 §4.6）——10 秒窗口内的唯一新角色才有资格认领
         private static readonly object _attrGate = new object();
         private static DateTime _lastUnknownHitUtc = DateTime.MinValue;                       // -1 最近一次命中的 UtcNow
@@ -509,6 +517,10 @@ namespace AlbionCompanion.Core
                             // R7/C6：队伍 pending ObjectId 反查入口（设计 §7.4——evt=234 给 id 不给名，
                             // 用 evt=29 的名字补齐；只有唯一候选才提交）
                             PartyState.OnNewCharacter(id, charName);
+
+                            // C8/Bug A：目标名 pending 反查——名字此刻已写入 _objectNames，
+                            // 该 id 若曾被标成「未知玩家」即完成补名（之后同一目标的 evt=6 直接取名字）
+                            ResolvePendingTarget(id, charName, DateTime.UtcNow);
                         }
                         catch { }
                     }
@@ -534,7 +546,10 @@ namespace AlbionCompanion.Core
                             else
                             {
                                 // 即使没找到名字，也标记为怪物
-                                _mobNames[id] = $"怪物 {id}";
+                                // C8/Bug A 同类修复：旧代码把 ObjectId 拼成「怪物 {id}」写进 _mobNames，
+                                // 而 _mobNames 的值会经 _objectNames 流到战斗页/总览页的用户可见目标名。
+                                // 缺名就显式说缺名，不拿裸 id 充数。
+                                _mobNames[id] = ChatSnifferNames.UnknownUnit;
                                 if (OnChatLine != null) try { OnChatLine("[怪物] ObjectId=" + id + " MobIndex=" + idx + " (未找到名字)"); } catch { }
                             }
                         }
@@ -576,7 +591,7 @@ namespace AlbionCompanion.Core
                                     lock (_attrGate) { _lastUnknownHitUtc = DateTime.UtcNow; }
                                 }
 
-                                string targetName = _objectNames.TryGetValue(target, out var tn) ? tn : $"目标 {target}";
+                                string targetName = TargetDisplayName(target);
                                 if (change < 0)
                                 {
                                     // 血量下降 = 伤害（怪物打人已在 ResolveCauser 过滤，不进榜）
@@ -630,7 +645,12 @@ namespace AlbionCompanion.Core
                     {
                         try
                         {
-                            string killedName = killedNameObj?.ToString() ?? "未知玩家";
+                            // C8/Bug A 同类修复：旧代码 killedNameObj?.ToString() ?? "未知玩家"，
+                            // 如果 p2 实际给的是 ObjectId，数字会直接进用户可见文案。
+                            // 改走统一口径：非空名字照用，数值一律当 ObjectId 走解析（绝不原样显示）。
+                            object? killedIdObj;
+                            evt.Parameters.TryGetValue(1, out killedIdObj);
+                            string killedName = NameOrUnknown(killedNameObj, killedIdObj, "未知玩家");
                             GameEvents.AddCombat(new GameEvents.CombatEntry
                             {
                                 Time = DateTime.Now,
@@ -651,11 +671,19 @@ namespace AlbionCompanion.Core
                     {
                         try
                         {
-                            string diedName = diedNameObj?.ToString() ?? "未知";
+                            // C8/Bug A 同类修复：旧代码 diedNameObj?.ToString() ?? "未知" 与
+                            // killedByObj?.ToString() ?? ""，两者若实际给的是 ObjectId，裸数字都会
+                            // 经 Target 拼成「119428 被 119429 击杀」进用户可见事件流。
+                            // 统一走 NameOrUnknown：非空名字照用，数值一律按 ObjectId 解析成
+                            // 「未知玩家 / 未知单位」，绝不原样显示。
+                            object? diedIdObj;
+                            evt.Parameters.TryGetValue(1, out diedIdObj);
+                            string diedName = NameOrUnknown(diedNameObj, diedIdObj, "未知");
+
                             string killedBy = "";
                             object killedByObj;
                             if (evt.Parameters.TryGetValue(10, out killedByObj))
-                                killedBy = killedByObj?.ToString() ?? "";
+                                killedBy = NameOrUnknown(killedByObj, null, "");
 
                             string target;
                             string type;
@@ -793,6 +821,101 @@ namespace AlbionCompanion.Core
             }
         }
 
+        /// <summary>
+        /// C8/Bug A：evt=6 目标名的唯一解析口径——**任何未解析目标都不得把裸 ObjectId 写进用户可见文案**。
+        /// 类型判定复用现有三份字典（与 CauserResolver 同一口径），不引入新的猜测规则：
+        ///   ① 名字字典命中 → 真实名字；
+        ///   ② _mobNames 命中 → 非玩家 → 「未知单位」；
+        ///   ③ 本地玩家或 _playerNames 命中 → 玩家 → 「未知玩家」+ 挂 pending 等 evt=29 补名；
+        ///   ④ id&lt;=0 或三份字典都判不出来 → 保守按非玩家 → 「未知单位」。
+        /// ④ 的取向是刻意的：宁可显示「未知单位」，也不给玩家挂错标签
+        /// （与 C6 队伍反查「宁可未知，不可错认」同一条数据诚实性原则）。
+        /// </summary>
+        private static string TargetDisplayName(long target)
+        {
+            var display = TargetNameResolver.Resolve(target,
+                LocalPlayerIdentity.IsSelf(target), _objectNames, _mobNames, _playerNames);
+
+            if (display.NeedsPendingLookup)
+                MarkPendingTarget(target);      // 玩家侧未解析 → 挂 pending，等 evt=29 落名字
+            else
+                _pendingTargetIds.TryRemove(target, out _); // 已解析（或判定为非玩家）→ 无需再挂
+
+            return display.DisplayName;
+        }
+
+        /// <summary>
+        /// C8/Bug A：把未解析的玩家侧目标挂进 pending（10 分钟 TTL，最多 512 条，超出裁最旧）。
+        /// 名字由 evt=29 写入字典 —— 之后同一 target 的 evt=6 就能直接取到名字，这就是「补名」。
+        /// 历史条目按 GameEvents 的不可变约定不回填，补名只对之后发生的事件生效。
+        /// </summary>
+        internal static void MarkPendingTarget(long targetId)
+        {
+            if (targetId <= 0) return;
+
+            // 先按真实时间清掉超时的陈旧条目：TTL 不能只依赖 evt=29 到达时才触发清理，
+            // 否则长时间等不到 NewCharacter 时，过期 id 会一直占着位置直到撞上 512 上限。
+            SweepPendingTargets(DateTime.UtcNow);
+
+            _pendingTargetIds[targetId] = DateTime.UtcNow;
+
+            if (_pendingTargetIds.Count <= MaxPendingTargets) return;
+            long oldestId = 0;
+            DateTime oldest = DateTime.MaxValue;
+            foreach (var kv in _pendingTargetIds)
+            {
+                if (kv.Value < oldest) { oldest = kv.Value; oldestId = kv.Key; }
+            }
+            if (oldestId != 0) _pendingTargetIds.TryRemove(oldestId, out _);
+        }
+
+        /// <summary>C8/Bug A：evt=29 到达时核对 pending —— 该 id 已被写入名字字典即算补名成功。</summary>
+        private static void ResolvePendingTarget(long id, string name, DateTime nowUtc)
+        {
+            SweepPendingTargets(nowUtc);
+
+            if (!_pendingTargetIds.TryRemove(id, out _)) return;
+            if (!string.IsNullOrEmpty(name))
+                ReportStatus($"[归因] 未知玩家已补名：{name}（ObjectId={id}）");
+        }
+
+        /// <summary>C8/Bug A：pending 目标的超时清理（与 C6 队伍 pending 同一 10 分钟口径）。</summary>
+        internal static void SweepPendingTargets(DateTime nowUtc)
+        {
+            foreach (var kv in _pendingTargetIds)
+            {
+                if ((nowUtc - kv.Value) > PendingTargetTtl) _pendingTargetIds.TryRemove(kv.Key, out _);
+            }
+        }
+
+        /// <summary>测试钩子：pending 目标数量（只读校验用）。</summary>
+        internal static int PendingTargetCount { get { return _pendingTargetIds.Count; } }
+
+        /// <summary>测试钩子：清空 pending（测试之间隔离用）。</summary>
+        internal static void ResetPendingTargets() { _pendingTargetIds.Clear(); }
+
+        /// <summary>
+        /// C8/Bug A 同类修复：把事件里「可能是名字、也可能是 ObjectId」的参数转成用户可见文案。
+        /// 非空且非纯数字 → 原样当名字用；纯数字 → 说明给的是 ObjectId，按统一口径解析成
+        /// 「未知玩家 / 未知单位」，绝不把裸 id 显示给用户；null/空 → 用调用方给的兜底文案。
+        /// </summary>
+        internal static string NameOrUnknown(object? nameObj, object? idObj, string fallback)
+        {
+            string? raw = nameObj?.ToString();
+            if (!string.IsNullOrWhiteSpace(raw) && !long.TryParse(raw, out _))
+                return raw!;
+
+            long id = 0;
+            if (raw != null && long.TryParse(raw, out var fromRaw)) id = fromRaw;
+            else if (idObj != null) { try { id = Convert.ToInt64(idObj); } catch { id = 0; } }
+
+            if (id == 0) return fallback;
+
+            var display = TargetNameResolver.Resolve(id, LocalPlayerIdentity.IsSelf(id),
+                _objectNames, _mobNames, _playerNames);
+            return display.DisplayName;
+        }
+
         private static void ReportStatus(string s)
         {
             if (OnStatus != null) try { OnStatus(s); } catch { }
@@ -813,5 +936,96 @@ namespace AlbionCompanion.Core
         }
 
 
+    }
+
+    /// <summary>Mob 名字缺失时的统一显示名（C8/Bug A：不拿 ObjectId 充数）。</summary>
+    internal static class ChatSnifferNames
+    {
+        internal const string UnknownPlayer = "未知玩家";
+        internal const string UnknownUnit = "未知单位";
+    }
+
+    /// <summary>被命中目标的实体类型判定结果（C8/Bug A）。</summary>
+    internal enum TargetKind
+    {
+        Player, // 判定为玩家（含本地玩家）
+        Unit,   // 判定为非玩家（怪物 / 环境 / 判不出来）
+    }
+
+    /// <summary>目标显示名解析结果：DisplayName 是唯一允许写进用户可见文案的值。</summary>
+    internal readonly struct TargetDisplay
+    {
+        internal readonly string DisplayName;
+        internal readonly TargetKind Kind;
+        /// <summary>true = 判得出是玩家但名字未知，调用方应挂 pending，等 evt=29 补名。</summary>
+        internal readonly bool NeedsPendingLookup;
+
+        internal TargetDisplay(string displayName, TargetKind kind, bool needsPendingLookup)
+        {
+            DisplayName = displayName;
+            Kind = kind;
+            NeedsPendingLookup = needsPendingLookup;
+        }
+    }
+
+    /// <summary>
+    /// C8/Bug A：目标名解析的纯函数口径（无静态状态，可脱离抓包直接单测）。
+    /// 规则与 ChatSniffer.TargetDisplayName 一一对应，见该方法注释。
+    /// </summary>
+    internal static class TargetNameResolver
+    {
+        internal static TargetDisplay Resolve(
+            long targetId,
+            bool isSelf,
+            IReadOnlyDictionary<long, string> objectNames,
+            IReadOnlyDictionary<long, string> mobNames,
+            IReadOnlyDictionary<long, string> playerNames)
+        {
+            // ① 名字字典命中：真实名字（ObjectId 不进文案）
+            if (targetId > 0 && objectNames != null
+                && objectNames.TryGetValue(targetId, out var name)
+                && !string.IsNullOrEmpty(name))
+            {
+                var kind = mobNames != null && mobNames.ContainsKey(targetId) ? TargetKind.Unit : TargetKind.Player;
+                return new TargetDisplay(name, kind, false);
+            }
+
+            // ② 非玩家（怪物/单位）：只判出「是单位」，名字仍缺 → 未知单位，不需要玩家侧反查
+            if (mobNames != null && mobNames.ContainsKey(targetId))
+                return new TargetDisplay(ChatSnifferNames.UnknownUnit, TargetKind.Unit, false);
+
+            // ③ 玩家侧（本地玩家 / evt=29 已建档玩家）：名字还没落到字典 → 未知玩家 + 挂 pending 等补名
+            if (isSelf || (targetId > 0 && playerNames != null && playerNames.ContainsKey(targetId)))
+                return new TargetDisplay(ChatSnifferNames.UnknownPlayer, TargetKind.Player, true);
+
+            // ④ 非正数 id 或三份字典都判不出来：保守按非玩家
+            return new TargetDisplay(ChatSnifferNames.UnknownUnit, TargetKind.Unit, false);
+        }
+    }
+
+    /// <summary>
+    /// C8/Bug B：自绘控件的布尔状态位——把「值变化才算变化」这条语义从 WinForms 控件里剥离出来，
+    /// 使其可以脱离句柄/消息循环直接单测（tests 工程只编译 src/Core，不引 WinForms）。
+    ///
+    /// 约定：<see cref="Set"/> 返回 true 表示值**真的变化**，调用方据此触发一次 Invalidate()；
+    /// 返回 false 表示值没变，调用方**不得**重绘（避免切换筛选时未受影响的按钮跟着闪）。
+    /// </summary>
+    public sealed class ToggleState
+    {
+        private bool _value;
+
+        public bool Value { get { return _value; } }
+
+        /// <summary>已发生的「值变化」次数（= 应触发重绘的次数），供测试直接断言。</summary>
+        public int ChangeCount { get; private set; }
+
+        /// <summary>设置新值；只有真正变化时才返回 true 并累加一次变化计数。</summary>
+        public bool Set(bool value)
+        {
+            if (_value == value) return false;
+            _value = value;
+            ChangeCount++;
+            return true;
+        }
     }
 }

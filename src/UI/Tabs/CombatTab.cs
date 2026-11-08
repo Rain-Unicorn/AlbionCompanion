@@ -342,8 +342,27 @@ namespace AlbionCompanion.UI.Tabs
     /// <summary>Pill 样式筛选按钮。</summary>
     public class PillButton : Control
     {
-        public string Text { get; set; }
-        public bool Active { get; set; }
+        // C8/Bug B：状态语义放在无 WinForms 依赖的 ToggleState 里，好让 tests 工程能真跑断言
+        private readonly ToggleState _active = new ToggleState();
+
+        /// <summary>
+        /// C8/Bug B：选中态。三个 PillButton 是独立 Control（在 Tab 上、不在 _panel 内），
+        /// 所以 _panel.Invalidate() 根本不会重画它们——状态变化必须自己触发 Invalidate()。
+        /// 只在值真的变化时重绘（切筛选时另外两个按钮值没变，不必跟着闪）。
+        /// </summary>
+        public bool Active
+        {
+            get { return _active.Value; }
+            set
+            {
+                if (!_active.Set(value)) return; // 值没变：不做无谓重绘
+                Invalidate();                    // 值变了：立刻重绘自身，不等系统碰巧重画
+            }
+        }
+
+        /// <summary>测试钩子：Active 已发生的真实变化次数（= 应触发的重绘次数）。</summary>
+        public int ActiveChangeCount { get { return _active.ChangeCount; } }
+
         public Action Clicked { get; set; }
 
         public PillButton(string text, int x, int y)
@@ -377,6 +396,14 @@ namespace AlbionCompanion.UI.Tabs
             }
         }
 
-        protected override void OnClick(EventArgs e) { Clicked?.Invoke(); }
+        /// <summary>
+        /// C8/Bug B：先执行业务回调（SetFilter → Render 会更新三个按钮的 Active），
+        /// 再补一次自身 Invalidate()——不依赖「系统碰巧重画」。
+        /// </summary>
+        protected override void OnClick(EventArgs e)
+        {
+            Clicked?.Invoke();
+            Invalidate();
+        }
     }
 }

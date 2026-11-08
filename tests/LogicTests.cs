@@ -75,7 +75,148 @@ static class LogicTests
         + "  ]"
         + "}}";
 
-    // M3：ItemIndex 加载/查询/搜索/分层过滤/侧车/weight join 单测
+    // ─────────────────────────────────────────────────────────────
+    // C8/Bug A：未解析目标不得把裸 ObjectId 写进用户可见文案
+    // 用户实测：「总览页治疗事件显示『目标119428』」。这里直接把解析口径钉死：
+    //   玩家侧未解析 → 「未知玩家」（且标记挂 pending，等 evt=29 补名）
+    //   非玩家侧未解析 → 「未知单位」
+    // 另加一条哨兵断言：任何分支的返回都不允许包含 ObjectId 数字本身。
+    // ─────────────────────────────────────────────────────────────
+    static void RunTargetNameTests()
+    {
+        var objectNames = new Dictionary<long, string>();
+        var mobNames = new Dictionary<long, string>();
+        var playerNames = new Dictionary<long, string>();
+
+        // --- 玩家侧：判得出是玩家（在 _playerNames 里），但名字字典里没有 → 未知玩家 + 挂 pending ---
+        playerNames[119428] = ""; // 只标类型、无名字
+        var p = TargetNameResolver.Resolve(119428, false, objectNames, mobNames, playerNames);
+        Eq("C8/A 玩家侧未解析 → 未知玩家", p.DisplayName, "未知玩家");
+        Eq("C8/A 玩家侧目标类型 = Player", p.Kind, TargetKind.Player);
+        Check("C8/A 玩家侧未解析需挂 pending 反查", p.NeedsPendingLookup, "NeedsPendingLookup=false");
+        Check("C8/A 玩家侧文案不含 ObjectId", !p.DisplayName.Contains("119428"), p.DisplayName);
+
+        // --- 非玩家侧：在 _mobNames 里但名字缺失 → 未知单位 ---
+        mobNames[555666] = ""; // 无名字的怪物/单位
+        var u = TargetNameResolver.Resolve(555666, false, objectNames, mobNames, playerNames);
+        Eq("C8/A 非玩家侧未解析 → 未知单位", u.DisplayName, "未知单位");
+        Eq("C8/A 非玩家侧目标类型 = Unit", u.Kind, TargetKind.Unit);
+        Check("C8/A 非玩家侧不需要玩家反查", !u.NeedsPendingLookup, "NeedsPendingLookup=true");
+        Check("C8/A 非玩家侧文案不含 ObjectId", !u.DisplayName.Contains("555666"), u.DisplayName);
+
+        // --- 三份字典都判不出来 → 保守按「未知单位」（宁可未知单位，不给玩家挂错标签） ---
+        var unknown = TargetNameResolver.Resolve(777888999, false, objectNames, mobNames, playerNames);
+        Eq("C8/A 判不出类型 → 保守显示未知单位", unknown.DisplayName, "未知单位");
+        Eq("C8/A 判不出类型 → Unit", unknown.Kind, TargetKind.Unit);
+
+        // --- 本地玩家自己（IsSelf=true）→ 玩家侧 ---- ---
+        var self = TargetNameResolver.Resolve(4242, true, objectNames, mobNames, playerNames);
+        Eq("C8/A 本地玩家未解析 → 未知玩家", self.DisplayName, "未知玩家");
+        Check("C8/A 本地玩家文案不含 ObjectId", !self.DisplayName.Contains("4242"), self.DisplayName);
+
+        // --- 已解析：名字字典命中，ObjectId 不进文案 ---
+        objectNames[119428] = "路人甲";
+        var known = TargetNameResolver.Resolve(119428, false, objectNames, mobNames, playerNames);
+        Eq("C8/A 已解析玩家 → 真实名字", known.DisplayName, "路人甲");
+        Eq("C8/A 已解析玩家类型 = Player", known.Kind, TargetKind.Player);
+        Check("C8/A 已解析不再挂 pending", !known.NeedsPendingLookup, "NeedsPendingLookup=true");
+
+        objectNames[555666] = "小蜘蛛";
+        var knownMob = TargetNameResolver.Resolve(555666, false, objectNames, mobNames, playerNames);
+        Eq("C8/A 已解析怪物 → 真实名字", knownMob.DisplayName, "小蜘蛛");
+        Eq("C8/A 已解析怪物类型 = Unit", knownMob.Kind, TargetKind.Unit);
+
+        // --- 非正数 id：不得进入名字字典路径，按单位保守显示 ---
+        var zero = TargetNameResolver.Resolve(0, false, objectNames, mobNames, playerNames);
+        Eq("C8/A target=0 → 未知单位", zero.DisplayName, "未知单位");
+        var neg = TargetNameResolver.Resolve(-5, false, objectNames, mobNames, playerNames);
+        Eq("C8/A target<0 → 未知单位", neg.DisplayName, "未知单位");
+
+        // --- pending 挂起机制：玩家侧未解析会挂上，上限裁剪不崩 ---
+        ChatSniffer.ResetPendingTargets();
+        ChatSniffer.MarkPendingTarget(119428);
+        Eq("C8/A 挂 pending 后计数=1", ChatSniffer.PendingTargetCount, 1);
+        ChatSniffer.MarkPendingTarget(119428);
+        Eq("C8/A 重复挂同一 id 不重复计数", ChatSniffer.PendingTargetCount, 1);
+        ChatSniffer.MarkPendingTarget(-3);   // 非正数不挂
+        Eq("C8/A 非正数 id 不挂 pending", ChatSniffer.PendingTargetCount, 1);
+        for (long i = 1; i <= 600; i++) ChatSniffer.MarkPendingTarget(i);
+        Check("C8/A pending 上限生效（<=512）", ChatSniffer.PendingTargetCount <= 512,
+              "count=" + ChatSniffer.PendingTargetCount);
+        ChatSniffer.ResetPendingTargets();
+        Eq("C8/A 清理 hook 归零", ChatSniffer.PendingTargetCount, 0);
+
+        // --- 同类修复（evt=163 KilledPlayer / evt=164 Died）走的 NameOrUnknown 口径 ---
+        // 事件参数「可能是名字、也可能给的是 ObjectId」，两种都必须不出裸数字。
+        string realName = ChatSniffer.NameOrUnknown("路人甲", 119428, "未知玩家");
+        Eq("C8/A 参数是名字 → 原样使用", realName, "路人甲");
+
+        string numericName = ChatSniffer.NameOrUnknown("119428", 119428, "未知玩家");
+        Check("C8/A 参数是纯数字 → 不原样显示", !numericName.Contains("119428"), numericName);
+
+        string idOnly = ChatSniffer.NameOrUnknown(null, 119429, "未知玩家");
+        Check("C8/A 只有 ObjectId → 不显示裸 id", !idOnly.Contains("119429"), idOnly);
+
+        string emptyBoth = ChatSniffer.NameOrUnknown(null, null, "未知玩家");
+        Eq("C8/A 名字与 id 都缺 → 用兜底文案", emptyBoth, "未知玩家");
+
+        string diedFallback = ChatSniffer.NameOrUnknown(null, 0, "未知");
+        Eq("C8/A id=0 且无名字 → 用兜底文案", diedFallback, "未知");
+
+        // --- pending 超时清理：超 TTL 的目标要被扫掉（否则 512 上限会被陈旧 id 占满） ---
+        // SweepPendingTargets(nowUtc) 的语义是「此刻的时间」：传 +30 分钟即模拟已过去 30 分钟。
+        ChatSniffer.ResetPendingTargets();
+        ChatSniffer.MarkPendingTarget(888001);
+        ChatSniffer.SweepPendingTargets(DateTime.UtcNow.AddMinutes(30));
+        Eq("C8/A 超 TTL 后清理掉陈旧 pending", ChatSniffer.PendingTargetCount, 0);
+
+        // 未超 TTL（+1 分钟）不得误删，否则补名窗口会被提前掐断
+        ChatSniffer.MarkPendingTarget(888002);
+        ChatSniffer.SweepPendingTargets(DateTime.UtcNow.AddMinutes(1));
+        Eq("C8/A 未超 TTL 不误删", ChatSniffer.PendingTargetCount, 1);
+        ChatSniffer.ResetPendingTargets();
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // C8/Bug B：自绘控件「状态真的变化才重绘」
+    // 能脱离 WinForms 验的就是这条状态语义，真实 MessageBox/句柄的重绘时序需实机验证。
+    // ─────────────────────────────────────────────────────────────
+    static void RunToggleStateTests()
+    {
+        var t = new ToggleState();
+        Eq("C8/B 初始为未选中", t.Value, false);
+        Eq("C8/B 初始变化次数=0", t.ChangeCount, 0);
+
+        Check("C8/B 设为 false（值未变）不触发重绘", !t.Set(false), "Set 返回 true");
+        Eq("C8/B 值未变不累加变化次数", t.ChangeCount, 0);
+
+        Check("C8/B false→true 触发重绘", t.Set(true), "Set 返回 false");
+        Eq("C8/B 变化后值为 true", t.Value, true);
+        Eq("C8/B 变化次数=1", t.ChangeCount, 1);
+
+        Check("C8/B 重复设为 true 不再重绘", !t.Set(true), "Set 返回 true");
+        Eq("C8/B 重复设置变化次数仍为 1", t.ChangeCount, 1);
+
+        Check("C8/B true→false 触发重绘", t.Set(false), "Set 返回 false");
+        Eq("C8/B 变化次数=2", t.ChangeCount, 2);
+
+        // 模拟切筛选：全部→PVP，三个按钮只有两个值真的变化 → 应只重绘 2 次，不是 3 次
+        var all = new ToggleState(); all.Set(true);
+        var pve = new ToggleState(); pve.Set(false);
+        var pvp = new ToggleState(); pvp.Set(false);
+        int before = all.ChangeCount + pve.ChangeCount + pvp.ChangeCount;
+        all.Set(false);   // 变
+        pve.Set(false);   // 未变
+        pvp.Set(true);    // 变
+        int after = all.ChangeCount + pve.ChangeCount + pvp.ChangeCount;
+        Eq("C8/B 切筛选只重绘真正变化的 2 个按钮", after - before, 2);
+        Eq("C8/B 切换后 PVP 高亮", pvp.Value, true);
+        Eq("C8/B 切换后 ALL 取消高亮", all.Value, false);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // M3：ItemIndex 加载/查询/搜索/分层过滤/侧车元数据 单测
+    // ─────────────────────────────────────────────────────────────
     static void RunItemIndexTests()
     {
         string dir = Path.Combine(Path.GetTempPath(), "ac_m3_itemindex_" + Guid.NewGuid().ToString("N").Substring(0, 8));
@@ -1338,6 +1479,12 @@ static class LogicTests
             Check("M2 限流异常上抛（不裸重试）", threw, "应抛 MarketRateLimitedException");
             Eq("M2 失败不写入缓存", failing.CachedEntryCount, 0);
         }
+
+        // ───────────────── C8/Bug A：未解析目标不得显示裸 ObjectId ─────────────────
+        RunTargetNameTests();
+
+        // ───────────────── C8/Bug B：自绘控件状态变化 → 重绘 ─────────────────
+        RunToggleStateTests();
 
         // ───────────────── M3 ItemIndex：本地物品元数据索引 ─────────────────
         RunItemIndexTests();
