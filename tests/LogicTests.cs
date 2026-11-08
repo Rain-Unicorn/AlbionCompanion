@@ -356,7 +356,7 @@ static class LogicTests
                     {
                         GameEvents.SnapshotIncome();
                         GameEvents.SnapshotGathering();
-                        long inc = GameEvents.TotalIncome;
+                        long inc = IncomeTracker.GetSummary().ConfirmedTotal;
                         int c = GameEvents.CountIncome();
                         var byTarget = GameEvents.DamageByTarget;
                         var byCauser = GameEvents.DamageByCauser;
@@ -686,6 +686,55 @@ static class LogicTests
 
             // fromKey 不存在 → false 而非抛异常
             Check("T-10 空 fromKey 返回 false", !trk.RenameKey(-12345, 7001, null), "ok=true");
+        }
+
+        // ---------------------------------------------------------------
+        // T-14 R4 筛选与大数字一致：PvE=80+30、PvP=70（A 一人两种）；
+        // GetTotals 必须随筛选切换，且「大数字 == 该筛选榜求和 + 隐藏项(-9)」；
+        // 并验证 500 条截断不影响 tracker 大数字、ResetAll 三处齐清
+        // ---------------------------------------------------------------
+        {
+            LocalPlayerIdentity.Reset();
+            var trk = GameEvents.DamageTracker;
+            trk.Clear();
+            trk.RecordDamage(8001, "A", 100, 80, -1, true);    // A 打怪 80（PvE）
+            trk.RecordDamage(8001, "A", 200, 70, -1, false);   // A 打人 70（PvP）
+            trk.RecordDamage(-1, "未知玩家", 100, 30, -1, true); // -1 打怪 30（PvE，榜上可见）
+            trk.RecordDamage(-9, "怪物", 100, 20, -1, true);    // -9 打怪 20（隐藏项，不进榜）
+
+            // T-09 同口径：GetTotals 覆盖隐藏键，PvE 含 -9 的 20（80+30+20=130）
+            Eq("T-14 GetTotals(Pve) = 130", trk.GetTotals(DamageStatsTracker.DamageFilter.Pve).TotalDamage, 130L);
+            Eq("T-14 GetTotals(Pvp) = 70", trk.GetTotals(DamageStatsTracker.DamageFilter.Pvp).TotalDamage, 70L);
+            Eq("T-14 GetTotals(All) = 200", trk.GetTotals(DamageStatsTracker.DamageFilter.All).TotalDamage, 200L);
+
+            // 各筛选下「大数字 == 该筛选榜求和 + 隐藏项」（§9.5 L3 恒等式）
+            trk.FilterMode = DamageStatsTracker.DamageFilter.Pve;
+            long pveBoard = 0;
+            foreach (var x in trk.GetTopDamage()) pveBoard += x.TotalDamage;
+            Eq("T-14 Pve 榜求和 = 110（-1 在榜）", pveBoard, 110L);
+            Eq("T-14 Pve 大数字 == 榜求和 + 隐藏20", pveBoard + 20, trk.GetTotals(DamageStatsTracker.DamageFilter.Pve).TotalDamage);
+            trk.FilterMode = DamageStatsTracker.DamageFilter.All;
+
+            // 截断证明（§6.5）：tracker 记 600 次，事件流只留 500 条，大数字必须全量
+            trk.Clear();
+            for (int i = 0; i < 600; i++)
+            {
+                trk.RecordDamage(8002, "B", 300, 1, -1, true);
+                GameEvents.AddCombat(new GameEvents.CombatEntry { Time = DateTime.Now, Target = "t", Damage = 1, Type = "damage" });
+            }
+            Eq("T-14 tracker 600 次不截断 = 600", trk.GetTotals(DamageStatsTracker.DamageFilter.All).TotalDamage, 600L);
+            Eq("T-14 事件流按 500 条截断 = 500", GameEvents.CountCombat(), 500);
+
+            // 击杀计数器不受截断影响 + ResetAll 三处齐清（§9.5）
+            for (int i = 0; i < 3; i++)
+                GameEvents.AddCombat(new GameEvents.CombatEntry { Time = DateTime.Now, Target = "k", Damage = 0, Type = "kill" });
+            Eq("T-14 击杀计数器 = 3", GameEvents.KillCount, 3);
+
+            GameEvents.ResetAll();
+            Eq("T-14 清空后 GetTotals(All) = 0", trk.GetTotals(DamageStatsTracker.DamageFilter.All).TotalDamage, 0L);
+            Eq("T-14 清空后榜单为空", trk.GetTopDamage().Count, 0);
+            Eq("T-14 清空后击杀归零", GameEvents.KillCount, 0);
+            Eq("T-14 清空后事件流为空", GameEvents.CountCombat(), 0);
         }
 
         Console.WriteLine();

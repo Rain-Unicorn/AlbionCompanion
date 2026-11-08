@@ -113,6 +113,11 @@ namespace AlbionCompanion.Core
         private static readonly object _incomeLock = new object();
         private static readonly object _gatheringLock = new object();
 
+        // R4/C5（设计 §6.3）：击杀/死亡计数器——不再从 500 条截断的事件流数数，
+        // AddCombat 内随写随加，长会话不丢计数
+        private static int _killCount;
+        private static int _deathCount;
+
         /// <summary>附近玩家：抓包线程写、UI 线程枚举并清理。</summary>
         public static readonly ConcurrentDictionary<long, PlayerEntry> Players = new ConcurrentDictionary<long, PlayerEntry>();
 
@@ -124,6 +129,8 @@ namespace AlbionCompanion.Core
             lock (_combatLock)
             {
                 _combat.Add(e);
+                if (e.Type == "kill") _killCount++;
+                else if (e.Type == "death") _deathCount++;
                 if (_combat.Count > MaxEntries) _combat.RemoveAt(0);
             }
             FireUpdate(); // 必须在锁外
@@ -199,29 +206,34 @@ namespace AlbionCompanion.Core
             lock (_gatheringLock) { return _gathering.Count; }
         }
 
-        public static long TotalIncome
+        // R4/C5（设计 §9.5 / §8.5）：三个 Total* 属性已删除——大数字统一改读
+        // DamageTracker.GetTotals(filter) / IncomeTracker.GetSummary().ConfirmedTotal。
+        // 删除而非「保留属性改内部实现」，让编译错误守住同源取数这条线（§9.5 L1 自检：
+        // grep TotalDamage/TotalHealing 应零命中）。
+
+        /// <summary>
+        /// R4/C5：战斗域的唯一清空入口（设计 §9.5「清空只清了一半」风险）。
+        /// 一次清三处：DamageTracker 全部玩家、事件流 _combat、击杀/死亡计数器。
+        /// 收益/采集不受影响（战斗页的清空语义只作用于战斗，§8.5）。
+        /// </summary>
+        public static void ResetAll()
         {
-            get
+            lock (_combatLock)
             {
-                lock (_incomeLock)
-                {
-                    long sum = 0;
-                    foreach (var e in _income) sum += e.Silver;
-                    return sum;
-                }
+                _combat.Clear();
+                _killCount = 0;
+                _deathCount = 0;
             }
+            DamageTracker.Clear();
         }
 
-        public static long TotalDamage
+        /// <summary>仅归零击杀/死亡计数器（evt 流不清；供需要单独重置计数的场合）。</summary>
+        public static void ResetCounters()
         {
-            get
+            lock (_combatLock)
             {
-                lock (_combatLock)
-                {
-                    long sum = 0;
-                    foreach (var e in _combat) if (e.Type == "damage") sum += e.Damage;
-                    return sum;
-                }
+                _killCount = 0;
+                _deathCount = 0;
             }
         }
 
@@ -267,29 +279,12 @@ namespace AlbionCompanion.Core
             }
         }
 
-        public static long TotalHealing
-        {
-            get
-            {
-                lock (_combatLock)
-                {
-                    long sum = 0;
-                    foreach (var e in _combat) if (e.Type == "heal") sum += e.Damage;
-                    return sum;
-                }
-            }
-        }
-
         public static int KillCount
         {
             get
             {
-                lock (_combatLock)
-                {
-                    int c = 0;
-                    foreach (var e in _combat) if (e.Type == "kill") c++;
-                    return c;
-                }
+                // R4/C5（§6.3 方案 A）：读计数器，不受事件流 500 条截断影响
+                lock (_combatLock) { return _killCount; }
             }
         }
 
@@ -297,12 +292,7 @@ namespace AlbionCompanion.Core
         {
             get
             {
-                lock (_combatLock)
-                {
-                    int c = 0;
-                    foreach (var e in _combat) if (e.Type == "death") c++;
-                    return c;
-                }
+                lock (_combatLock) { return _deathCount; }
             }
         }
 

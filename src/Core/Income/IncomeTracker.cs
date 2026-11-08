@@ -156,9 +156,9 @@ namespace AlbionCompanion.Core.Income
         }
 
         /// <summary>
-        /// C3 过渡期镜像：IncomeTab/OverviewTab/悬浮条仍读 GameEvents.TotalIncome / SnapshotIncome，
-        /// 在 UI 切到 IncomeTracker（C7）之前，正式入账同步镜像一份到旧通道，保证界面不空白。
-        /// 挂起条目不镜像（未确认的钱不应出现在任何合计里）。
+        /// C3 过渡期镜像：C5 起各 UI 已改为直读 IncomeTracker.GetSummary().ConfirmedTotal，
+        /// 此镜像仅保留给 GameEvents.AddIncome 事件流（战斗日志页）作数据源，
+        /// 待 C7 收益改造时评估是否移除。挂起条目不镜像（未确认的钱不应出现在任何合计里）。
         /// </summary>
         private static void MirrorToGameEvents(IncomeRecord r)
         {

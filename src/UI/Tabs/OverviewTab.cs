@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Windows.Forms;
 using AlbionCompanion.Core;
+using AlbionCompanion.Core.DamageMeter;
+using AlbionCompanion.Core.Income;
 
 namespace AlbionCompanion.UI.Tabs
 {
@@ -52,10 +54,11 @@ namespace AlbionCompanion.UI.Tabs
             _online.SetData("本次在线", SessionClock.Format(Rt.Elapsed),
                             "始于 " + Rt.SessionStart.ToString("HH:mm"));
 
-            // 战斗
-            long dmg = GameEvents.TotalDamage;
-            long heal = GameEvents.TotalHealing;
-            int kills = GameEvents.KillCount;
+            // 战斗（R4/C5：改读聚合器，总览固定 All 口径——设计 §9.7：仅当战斗页处于 All 时两处才要求相等）
+            var totals = GameEvents.DamageTracker.GetTotals(DamageStatsTracker.DamageFilter.All);
+            long dmg = totals.TotalDamage;
+            long heal = totals.TotalHealing;
+            int kills = GameEvents.KillCount; // 计数器口径（§6.3）
             int deaths = GameEvents.DeathCount;
             _combat.SetData("战斗统计", "伤害 " + Th.Money(dmg),
                             "治疗 " + Th.Money(heal) + "  ·  击杀 " + kills + "  ·  死亡 " + deaths);
@@ -73,9 +76,9 @@ namespace AlbionCompanion.UI.Tabs
             _gather.SetData("采集统计", Th.Money(totalAmt) + " 资源",
                             "声望 " + Th.Money(totalFame) + "  ·  " + gList.Length + " 次");
 
-            // 收益
+            // 收益（R4/C5：合计只含已确认条目，与收益页同源——设计 §9.7 统一规则）
             var income = GameEvents.SnapshotIncome();
-            long inc = GameEvents.TotalIncome;
+            long inc = IncomeTracker.GetSummary().ConfirmedTotal;
             _income.SetData("银币收益", Th.Money(inc),
                             "明细 " + income.Length + " 条");
 

@@ -43,7 +43,7 @@ namespace AlbionCompanion.UI.Tabs
             _clearBtn.Font = Th.F(8.5f);
             _clearBtn.Cursor = Cursors.Hand;
             _clearBtn.FlatAppearance.MouseOverBackColor = Th.CardHi;
-            _clearBtn.Click += delegate { GameEvents.DamageTracker.Clear(); GameEvents.FireUpdate(); Render(); };
+            _clearBtn.Click += delegate { GameEvents.ResetAll(); GameEvents.FireUpdate(); Render(); };
             Controls.Add(_clearBtn);
 
             // 筛选 pill 按钮
@@ -82,9 +82,12 @@ namespace AlbionCompanion.UI.Tabs
             int pad = 14;
 
             // ===== 顶部大数字 =====
-            long dmg = GameEvents.TotalDamage;
-            long heal = GameEvents.TotalHealing;
-            int kills = GameEvents.KillCount;
+            // R4/C5：大数字改读聚合器 GetTotals(FilterMode)——不再从 500 条截断的事件流求和
+            //（长会话大数字不再回落）；且随筛选 pill 切换（设计 §6.4：筛选同时作用于大数字与榜单）
+            var totals = GameEvents.DamageTracker.GetTotals(GameEvents.DamageTracker.FilterMode);
+            long dmg = totals.TotalDamage;
+            long heal = totals.TotalHealing;
+            int kills = GameEvents.KillCount; // R4/C5：改读计数器（§6.3），不受 500 条截断影响
 
             // 小标签
             TextRenderer.DrawText(g, "— COMBAT TELEMETRY", Th.F(7.5f),
@@ -97,6 +100,13 @@ namespace AlbionCompanion.UI.Tabs
             DrawBigStat(g, ref statX, "伤害", Th.Money(dmg), Th.Bad, 160);
             DrawBigStat(g, ref statX, "治疗", Th.Money(heal), Th.Good, 130);
             DrawBigStat(g, ref statX, "击杀", kills.ToString(), Th.Text, 90);
+            // §6.4：写清筛选语义，避免用户以为大数字与筛选无关
+            if (GameEvents.DamageTracker.FilterMode != DamageStatsTracker.DamageFilter.All)
+            {
+                string fn = GameEvents.DamageTracker.FilterMode == DamageStatsTracker.DamageFilter.Pve ? "PVE" : "PVP";
+                TextRenderer.DrawText(g, "当前为 " + fn + " 筛选（大数字与榜单同步）", Th.F(7f),
+                    new Rectangle(statX + 6, 30, 220, 14), Th.Sub, TextFormatFlags.Left);
+            }
 
             // ===== 伤害输出卡片 =====
             int cardY = 82;

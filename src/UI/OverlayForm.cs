@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 using AlbionCompanion.Core;
+using AlbionCompanion.Core.Income;
 
 namespace AlbionCompanion.UI
 {
@@ -158,7 +159,8 @@ namespace AlbionCompanion.UI
             TextRenderer.DrawText(g, "收益", _capFont, new Point(26, 16), Th.Sub,
                 TextFormatFlags.NoPrefix);
 
-            long total = GameEvents.TotalIncome;
+            // R4/C5：总收益改读 IncomeTracker（只含已确认条目），不再用 500 条截断列表求和
+            long total = IncomeTracker.GetSummary().ConfirmedTotal;
             TextRenderer.DrawText(g, Th.Money(total), _bigFont, new Point(24, 32), Th.Accent,
                 TextFormatFlags.NoPrefix);
 
@@ -174,7 +176,8 @@ namespace AlbionCompanion.UI
             TextRenderer.DrawText(g, "时长 " + SessionClock.Format(_rt.Elapsed), _lineFont,
                 new Point(204, 14), Th.Text, TextFormatFlags.NoPrefix);
 
-            double perHour = SessionClock.PerHour(GameEvents.TotalIncome, _rt.Elapsed);
+            // R4/C5：时薪入参与大数字同源（IncomeTracker 确认合计），避免两处口径分叉
+            double perHour = SessionClock.PerHour(IncomeTracker.GetSummary().ConfirmedTotal, _rt.Elapsed);
             string rateText = perHour > 0 ? "时薪 " + Th.Money((long)perHour) + "/时" : "等待收益...";
             TextRenderer.DrawText(g, rateText, _lineFont, new Point(204, 38), Th.Good,
                 TextFormatFlags.NoPrefix);

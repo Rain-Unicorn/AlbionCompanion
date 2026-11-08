@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Windows.Forms;
 using AlbionCompanion.Core;
+using AlbionCompanion.Core.Income;
 
 namespace AlbionCompanion.UI.Tabs
 {
@@ -44,7 +45,8 @@ namespace AlbionCompanion.UI.Tabs
 
         private void Render()
         {
-            _summary.Text = "总收益：" + Th.Money(GameEvents.TotalIncome) + " 银币";
+            // R4/C5：总收益只含已确认条目，与总览/悬浮条同源（§9.7）；待确认行由下方徽标区单独展示
+            _summary.Text = "总收益：" + Th.Money(IncomeTracker.GetSummary().ConfirmedTotal) + " 银币";
 
             // R1/C3：身份三态徽标（已确认=绿 / 待确认=琥珀 / 未识别=灰），只读、内部加锁，可在 UI 线程直接读
             var state = LocalPlayerIdentity.State;
