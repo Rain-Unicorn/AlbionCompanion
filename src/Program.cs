@@ -4,6 +4,7 @@ using System.Threading;
 using System.Windows.Forms;
 using AlbionCompanion.Core;
 using AlbionCompanion.Core.Party;
+using AlbionCompanion.Core.Income;
 
 namespace AlbionCompanion.UI
 {
@@ -48,6 +49,10 @@ namespace AlbionCompanion.UI
                 // R7/C6：恢复上一会话的队伍名单（§7.6）——重启后一律降级 verified=false
                 //（StaleFromPreviousSession），直到本会话收到真实队伍事件（230/234）才转正
                 PartyState.LoadOrRestore(dir);
+
+                // C7/§8.3.3：收益明细 JSONL 持久化——启动加载当天+前一天；入账由后台写线程追加
+                IncomeTracker.SetPersistDir(dir);
+                IncomeTracker.LoadRecent();
 
                 runtime.DbPath = Path.Combine(dir, "market-db.csv");
                 runtime.Db = MarketDb.Load(runtime.DbPath);

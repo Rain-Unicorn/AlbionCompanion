@@ -5,6 +5,7 @@ using System.Windows.Forms;
 using AlbionCompanion.Core;
 using AlbionCompanion.Core.DamageMeter;
 using AlbionCompanion.Core.Income;
+using AlbionCompanion.Core.Gathering;
 
 namespace AlbionCompanion.UI.Tabs
 {
@@ -63,24 +64,18 @@ namespace AlbionCompanion.UI.Tabs
             _combat.SetData("战斗统计", "伤害 " + Th.Money(dmg),
                             "治疗 " + Th.Money(heal) + "  ·  击杀 " + kills + "  ·  死亡 " + deaths);
 
-            // 采集
-            long totalAmt = 0;
-            long totalFame = 0;
-            // 快照在这里取一次，供下方三路归并复用；禁止在 Paint 内快照。
+            // 采集（C7/§8.4：卡片改读 GatheringTracker 聚合，不再遍历快照求和；
+            // 快照仅取一次供下方三路归并用；禁止在 Paint 内快照）
+            var gSum = GatheringTracker.GetSummary();
+            _gather.SetData("采集统计", Th.Money(gSum.TotalAmount) + " 资源",
+                            "声望 " + Th.Money(gSum.TotalFame) + "  ·  " + gSum.Count + " 次");
             var gList = GameEvents.SnapshotGathering();
-            for (int i = 0; i < gList.Length; i++)
-            {
-                totalAmt += gList[i].Amount;
-                totalFame += gList[i].Fame;
-            }
-            _gather.SetData("采集统计", Th.Money(totalAmt) + " 资源",
-                            "声望 " + Th.Money(totalFame) + "  ·  " + gList.Length + " 次");
 
-            // 收益（R4/C5：合计只含已确认条目，与收益页同源——设计 §9.7 统一规则）
+            // 收益（C7/§8.4：一次取齐 GetSummary——合计与明细条数均来自 summary，与收益页/悬浮条同源，§9.7）
+            var incSum = IncomeTracker.GetSummary();
+            _income.SetData("银币收益", Th.Money(incSum.ConfirmedTotal),
+                            "明细 " + incSum.ConfirmedCount + " 条");
             var income = GameEvents.SnapshotIncome();
-            long inc = IncomeTracker.GetSummary().ConfirmedTotal;
-            _income.SetData("银币收益", Th.Money(inc),
-                            "明细 " + income.Length + " 条");
 
             // 合并最近动态：三份快照在锁外归并，UI 不再持有活集合
             var rows = new List<string[]>();

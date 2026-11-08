@@ -80,7 +80,7 @@ namespace AlbionCompanion.Core
             File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
         }
 
-        private static string Quote(string value)
+        internal static string Quote(string value)  // C7：internal 供 IncomeTracker.ExportCsv 复用（§8.3.4）
         {
             if (value == null) return "";
             if (value.IndexOf(',') >= 0 || value.IndexOf('"') >= 0)

@@ -113,6 +113,15 @@ src/
 - **GameEvents 转发**: IsInParty/PartyMemberCount/PartyMemberSnapshot/IsPartyMember 全部转发 PartyState；旧 ClearParty/AddPartyName 已删除（写路径收敛）
 - **测试**: T-11（增量重建 16 断言）、T-12（pending 反查三态 5 断言）、T-13/T-13b（缓存降级与抑制 19 断言），累计 216 断言全绿
 
+## C7 收益与总览架构（§8）
+- **IncomeTracker 扩展**: GetSummary() 增加来源小计（SilverPickup/PartySilver/GatheringSale）与金额待确认计数；evt=243 记「队伍分成、金额=0、待确认」条目（AttributionNote=金额字段未确认，AmountUnconfirmed=true），金额字段位置实机确认前（V5）绝不猜测
+- **evt=61 归属裁决**: 设计内部矛盾（§8.3.2 表说采集出售无抓包事件/手工账不并入，T-15/V7 写「61 记 GatheringSale」）——按详表 §8.3.2 裁决：evt=61 只落 GatheringTracker（采集统计），不产生 GatheringSale 收益条目；手工账本（Runtime.IncomeLedger）维持现状不并入抓包合计
+- **GatheringTracker**: `src/Core/Gathering/GatheringTracker.cs`——Add/UpdateLastFame/GetSummary（总量/声望/次数/按类别小计）/Snapshot/Reset；类别复用 GatherCategories（非矿石 baseId 是「假设待确认」，1020~1024 与矿石 4 级附魔 ID 重叠，非矿石类别归属不可靠——实机校准前总览小计仅矿石可信）
+- **JSONL 持久化**: `{DefaultDir}/income/income-YYYY-MM-DD.jsonl`（本地日期切分），入账即入队、后台写线程追加（不在抓包线程 IO），挂起条目不落盘（转正时补写）；启动 LoadRecent() 只加载当天+前一天；中文不转义（UnsafeRelaxedJsonEscaping）
+- **CSV 导出**: IncomeTab「导出 CSV」按钮 → SaveFileDialog（默认名 income-YYYYMMDD-HHMM.csv）；8 列固定顺序、UTF8 BOM、\r\n、Quote 复用 IncomeLedger.Quote（已改 internal）
+- **同源取数**: 总览采集卡片/收益卡片、收益页大数字、明细表全部改读 GatheringTracker.GetSummary()/IncomeTracker.GetSummary()/Snapshot()；收益明细列改「时间/来源/银币/待确认」，pending 与金额待确认条目金额列显示「待确认」
+- **测试**: T-15（来源分流+243 形态+采集聚合+小计自洽）、T-15b（JSONL 落盘/重载/CSV BOM+表头+行数），累计 246 断言全绿；编译 0 错误/130 警告（与基线零新增）
+
 ## 调试
 - 事件日志: `bin\Debug\net8.0-windows\events.log`（记录所有游戏事件码和参数）
 - 调试时通过events.log确认新事件的真实码和参数布局

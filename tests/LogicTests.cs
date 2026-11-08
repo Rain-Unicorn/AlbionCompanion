@@ -7,6 +7,7 @@ using AlbionCompanion.Core;
 using AlbionCompanion.Core.DamageMeter;
 using AlbionCompanion.Core.Income;
 using AlbionCompanion.Core.Party;
+using AlbionCompanion.Core.Gathering;
 
 static class LogicTests
 {
@@ -911,6 +912,123 @@ static class LogicTests
             // GameEvents 转发层同步（IsInParty / IsPartyMember）
             Check("T-13b GameEvents.IsPartyMember 转发", GameEvents.IsPartyMember("NewMate1"), "false");
             PartyState.Reset();
+        }
+
+        // ---- T-15 收益来源分流（C7/§8.3.2 + §8.6）----
+        {
+            IncomeTracker.Reset();
+            LocalPlayerIdentity.Reset();
+
+            // ① 身份 Unknown：首个拾取者 → Pending（挂起，不入合计）
+            var d0 = LocalPlayerIdentity.OnTakeSilver(7777, 150000000);
+            Check("T-15 未知身份首捡裁决=Pending", d0 == TakeSilverDisposition.Pending, d0.ToString());
+            IncomeTracker.AddPending(new IncomeRecord { TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币", PickerId = 7777, SilverAfterTax = 15000, SilverBeforeTax = 15000 });
+            Eq("T-15 未知身份合计 = 0", IncomeTracker.GetSummary().ConfirmedTotal, 0L);
+
+            // ② 身份 Confirmed(9001)：他人(8888)捡 → Ignore，不入本地合计
+            LocalPlayerIdentity.OnJoinResponse(9001, "MeC7");
+            var d1 = LocalPlayerIdentity.OnTakeSilver(8888, 12345678);
+            Check("T-15 他人捡银裁决=Ignore", d1 == TakeSilverDisposition.Ignore, d1.ToString());
+
+            // ③ 本地(9001)捡 → CountAsMine，入 SilverPickup
+            var d2 = LocalPlayerIdentity.OnTakeSilver(9001, 200000000);
+            Check("T-15 本地捡银裁决=CountAsMine", d2 == TakeSilverDisposition.CountAsMine, d2.ToString());
+            IncomeTracker.AddConfirmed(new IncomeRecord { TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币", PickerId = 9001, SilverBeforeTax = 20000, TaxPaid = 3000, SilverAfterTax = 17000 });
+
+            // ④ evt=243 → PartySilver：金额=0、待确认（金额字段未实机确认，绝不猜测）
+            IncomeTracker.AddPartySilverUnconfirmed();
+
+            // ⑤ evt=61 → GatheringTracker（采集统计；§8.3.2 裁决：采集出售为手工账口径，evt=61 不产生 GatheringSale 条目）
+            GatheringTracker.Reset();
+            GatheringTracker.Add(new GatheringRecord { TimeUtc = DateTime.UtcNow, ItemId = 1000, Resource = "T4 矿石", Amount = 12 });
+            GatheringTracker.UpdateLastFame(37);
+            // ItemId=9000 未映射 → 「其他」：GatherCategories 的非矿石 baseId 是「假设，待确认」（文件内注释），
+            // 1020~1024 与矿石 4 级附魔 ID 空间重叠，类别归属不可靠——本测试只用无歧义 ID 验证小计聚合
+            GatheringTracker.Add(new GatheringRecord { TimeUtc = DateTime.UtcNow, ItemId = 9000, Resource = "未映射资源", Amount = 5 });
+            var gs = GatheringTracker.GetSummary();
+            Eq("T-15 采集总数量 = 17", gs.TotalAmount, 17L);
+            Eq("T-15 采集声望 = 37", gs.TotalFame, 37L);
+            Eq("T-15 采集次数 = 2", gs.Count, 2);
+            Check("T-15 采集类别小计·矿石 = 12", gs.ByCategory.ContainsKey("矿石") && gs.ByCategory["矿石"] == 12, string.Join(";", gs.ByCategory.Select(kv => kv.Key + "=" + kv.Value)));
+            Check("T-15 采集类别小计·其他 = 5", gs.ByCategory.ContainsKey("其他") && gs.ByCategory["其他"] == 5, string.Join(";", gs.ByCategory.Select(kv => kv.Key + "=" + kv.Value)));
+
+            // ⑥ 手工账口径 GatheringSale（不来自 evt；仅验证小计自洽）
+            IncomeTracker.AddConfirmed(new IncomeRecord { TimeUtc = DateTime.UtcNow, Source = IncomeSource.GatheringSale, SourceLabel = "采集出售", SilverAfterTax = 500, SilverBeforeTax = 500 });
+
+            var s15 = IncomeTracker.GetSummary();
+            Eq("T-15 SilverPickup 小计 = 17000", s15.SilverPickupTotal, 17000L);
+            Eq("T-15 PartySilver 小计 = 0", s15.PartySilverTotal, 0L);
+            Eq("T-15 GatheringSale 小计 = 500", s15.GatheringSaleTotal, 500L);
+            Eq("T-15 合计 = 各来源小计之和", s15.ConfirmedTotal, s15.SilverPickupTotal + s15.PartySilverTotal + s15.GatheringSaleTotal);
+
+            // ⑦ PartySilver 条目形态：金额 0 + AmountUnconfirmed + 备注
+            var snap15 = IncomeTracker.Snapshot(20);
+            var partyRec = snap15.FirstOrDefault(r => r.Source == IncomeSource.PartySilver);
+            Check("T-15 PartySilver 条目存在", partyRec != null, "未找到");
+            Check("T-15 PartySilver 金额 = 0", partyRec != null && partyRec.SilverAfterTax == 0, partyRec == null ? "-" : partyRec.SilverAfterTax.ToString());
+            Check("T-15 PartySilver 金额待确认", partyRec != null && partyRec.AmountUnconfirmed, "false");
+            Check("T-15 PartySilver 备注含金额字段未确认", partyRec != null && partyRec.AttributionNote.Contains("金额字段未确认"), partyRec == null ? "-" : partyRec.AttributionNote);
+
+            // ⑧ pending 分流自洽：确认 9001 后，7777 的挂起被丢弃、合计不变
+            IncomeTracker.ResolvePending(9001, 7777);
+            var s15b = IncomeTracker.GetSummary();
+            Eq("T-15 分流后合计不变 = 17500", s15b.ConfirmedTotal, 17500L);
+            Eq("T-15 分流后挂起 = 0", s15b.UnconfirmedRecords, 0);
+        }
+
+        // ---- T-15b JSONL 持久化 + CSV 导出（C7/§8.3.3 / §8.3.4）----
+        {
+            IncomeTracker.Reset();
+            string tdir = Path.Combine(Path.GetTempPath(), "inctest-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(tdir);
+            try
+            {
+                IncomeTracker.SetPersistDir(tdir);
+                IncomeTracker.AddConfirmed(new IncomeRecord { TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币", PickerId = 1, SilverBeforeTax = 100, TaxPaid = 10, SilverAfterTax = 90, AttributionNote = "p8=12" });
+                IncomeTracker.AddConfirmed(new IncomeRecord { TimeUtc = DateTime.UtcNow, Source = IncomeSource.PartySilver, SourceLabel = "队伍分成", AmountUnconfirmed = true, AttributionNote = "金额字段未确认" });
+                IncomeTracker.AddPending(new IncomeRecord { TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币", PickerId = 9, SilverAfterTax = 55 }); // 挂起不落盘
+                IncomeTracker.FlushPendingWrites(5000);
+
+                string file = Path.Combine(tdir, "income", "income-" + DateTime.Now.ToString("yyyy-MM-dd") + ".jsonl");
+                Check("T-15b JSONL 文件存在", File.Exists(file), file);
+                if (File.Exists(file))
+                {
+                    var jlLines = File.ReadAllLines(file).Where(l => l.Trim().Length > 0).ToArray();
+                    Eq("T-15b JSONL 行数 = 2（挂起不落盘）", jlLines.Length, 2);
+                    Check("T-15b JSONL 含待确认备注", jlLines.Any(l => l.Contains("金额字段未确认")), "missing");
+
+                    // 模拟重启：Reset 后 LoadRecent 恢复当天+前一天
+                    IncomeTracker.Reset();
+                    IncomeTracker.LoadRecent();
+                    var rs = IncomeTracker.GetSummary();
+                    Eq("T-15b 重载后条数 = 2", rs.ConfirmedCount, 2);
+                    Eq("T-15b 重载后合计 = 90", rs.ConfirmedTotal, 90L);
+                    Eq("T-15b 重载后金额待确认条数 = 1", rs.AmountUnconfirmedCount, 1);
+                }
+
+                // CSV：BOM + 8 列表头 + CRLF 行尾 + 行数
+                IncomeTracker.Reset();
+                IncomeTracker.LoadRecent();
+                string csvPath = Path.Combine(tdir, "export.csv");
+                string err;
+                Check("T-15b ExportCsv 成功", IncomeTracker.ExportCsv(csvPath, out err), err);
+                if (File.Exists(csvPath))
+                {
+                    byte[] bytes = File.ReadAllBytes(csvPath);
+                    Check("T-15b CSV 带 BOM", bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF, "no BOM");
+                    string csvText = Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+                    string[] csvRows = csvText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+                    Eq("T-15b CSV 行数 = 3（表头+2）", csvRows.Length, 3);
+                    Check("T-15b CSV 表头 8 列", csvRows.Length > 0 && csvRows[0] == "时间,来源,明细,税前,税,实收,待确认,备注", csvRows.Length > 0 ? csvRows[0] : "-");
+                    Check("T-15b CSV 含待确认行", csvText.Contains("是"), "missing");
+                }
+            }
+            finally
+            {
+                IncomeTracker.SetPersistDir(null); // 测试隔离：关闭持久化，后续测试不落盘
+                IncomeTracker.Reset();
+                try { Directory.Delete(tdir, true); } catch { }
+            }
         }
 
         Console.WriteLine("passed=" + _pass + " failed=" + _fail);

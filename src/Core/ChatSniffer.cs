@@ -8,6 +8,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using AlbionCompanion.Core.DamageMeter;
+using AlbionCompanion.Core.Gathering;
 using AlbionCompanion.Core.Income;
 using AlbionCompanion.Core.Party;
 
@@ -374,6 +375,8 @@ namespace AlbionCompanion.Core
                             {
                                 // 必须走锁内更新：evt=72 与 evt=61 可能落在不同线程
                                 GameEvents.TryUpdateLastGatheringFame((int)gained);
+                                // C7/§8.6：聚合侧同口径覆盖最近一条的 Fame
+                                GatheringTracker.UpdateLastFame((int)gained);
                             }
                         }
                         catch { }
@@ -399,6 +402,16 @@ namespace AlbionCompanion.Core
                             GameEvents.AddGathering(new GameEvents.GatheringEntry
                             {
                                 Time = DateTime.Now,
+                                Resource = resName,
+                                Amount = Convert.ToInt32(amount),
+                                Fame = 0
+                            });
+                            // C7/§8.6：采集权威源同步落账（总览采集卡片改读 GatheringTracker）
+                            // evt=61 不产生 GatheringSale 收益条目——§8.3.2：采集出售为手工账本口径，不并入抓包合计
+                            GatheringTracker.Add(new GatheringRecord
+                            {
+                                TimeUtc = DateTime.UtcNow,
+                                ItemId = id,
                                 Resource = resName,
                                 Amount = Convert.ToInt32(amount),
                                 Fame = 0
@@ -773,6 +786,9 @@ namespace AlbionCompanion.Core
                 {
                     ReportStatus("[队伍] evt=243 参数：" + DescribeParams(evt.Parameters));
                     PartyState.OnPartySilverGained(evt.Parameters.TryGetValue(0, out var p243) ? p243 : null);
+                    // C7/§8.3.2：收益侧记「队伍分成、金额=0、待确认」条目——金额字段位置未实机确认（V5），
+                    // 确认前绝不猜测字段（否则与 evt=62 重复计数产生幻觉收益）
+                    IncomeTracker.AddPartySilverUnconfirmed();
                 }
             }
         }
