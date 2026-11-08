@@ -59,7 +59,8 @@ namespace AlbionCompanion.UI.Tabs
         private void Render()
         {
             var all = Rt.Db.Rows;
-            var routes = Arbitrage.Compute(all, 0.08, 0.025, 100);
+            int droppedStale;
+            var routes = Arbitrage.Compute(all, 0.08, 0.025, 100, DateTimeOffset.UtcNow, out droppedStale);
 
             var rows = new List<string[]>();
             int shown = Math.Min(routes.Count, 50);
@@ -80,7 +81,10 @@ namespace AlbionCompanion.UI.Tabs
                 });
             }
             _table.SetRows(rows);
-            _status.Text = routes.Count + " 条路线 · 本地库 " + all.Count + " 行 · 60 秒自动刷新";
+            string staleNote = droppedStale > 0
+                ? " · 已剔除 " + droppedStale + " 条陈旧报价（>24h）"
+                : "";
+            _status.Text = routes.Count + " 条路线 · 本地库 " + all.Count + " 行" + staleNote + " · 60 秒自动刷新";
         }
 
         public override void RefreshData()
