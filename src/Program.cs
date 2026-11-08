@@ -39,6 +39,11 @@ namespace AlbionCompanion.UI
 
                 var settings = SettingsStore.Load(path);
                 var runtime = new Runtime(settings, path);
+
+                // R1/C3：播种「我的角色」手选名（弱兜底：等 evt=29 名字命中再绑定 ObjectId）
+                if (!string.IsNullOrEmpty(settings.LocalPlayerName))
+                    LocalPlayerIdentity.SetManualName(settings.LocalPlayerName);
+
                 runtime.DbPath = Path.Combine(dir, "market-db.csv");
                 runtime.Db = MarketDb.Load(runtime.DbPath);
                 runtime.Db.LoadFetchTimes(dir);

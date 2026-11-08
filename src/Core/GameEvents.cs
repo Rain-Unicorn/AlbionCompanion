@@ -17,9 +17,10 @@ namespace AlbionCompanion.Core
     /// </remarks>
     public static class GameEvents
     {
-        // 本地玩家信息（从 JoinResponse 获取）
-        public static long? LocalPlayerObjectId;
-        public static string LocalPlayerName = "";
+        // 本地玩家信息：R1/C3 起改为只读转发到 LocalPlayerIdentity（唯一写入入口是状态机），
+        // UI 与测试不得再直写这两个字段
+        public static long? LocalPlayerObjectId => LocalPlayerIdentity.ConfirmedObjectId;
+        public static string LocalPlayerName => LocalPlayerIdentity.ConfirmedName ?? "";
 
         // 队伍成员名字集合（从 PartyJoined/PartyPlayerJoined 事件解析）
         // CD 承载：抓包线程 Clear/Add 与 UI 线程 Contains/枚举并发安全。

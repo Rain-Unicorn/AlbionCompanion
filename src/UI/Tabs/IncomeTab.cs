@@ -10,6 +10,7 @@ namespace AlbionCompanion.UI.Tabs
     public class IncomeTab : TabBase
     {
         private readonly Label _summary;
+        private readonly Label _identityBadge; // R1/C3：身份三态徽标
         private readonly SimpleTable _table;
         private readonly Timer _refresh;
 
@@ -18,6 +19,7 @@ namespace AlbionCompanion.UI.Tabs
         {
             Card(0, 0, 580, 56);
             CardText("收益统计（实时抓包）", 14, 8, 300, 20, Th.Text, 11f, true);
+            _identityBadge = CardText("未识别", 300, 8, 266, 20, Th.Sub, 9f, true);
             _summary = CardText("总收益：0 银币", 14, 30, 552, 18, Th.Accent, 10f, true);
 
             Card(0, 64, 580, 0);
@@ -43,6 +45,28 @@ namespace AlbionCompanion.UI.Tabs
         private void Render()
         {
             _summary.Text = "总收益：" + Th.Money(GameEvents.TotalIncome) + " 银币";
+
+            // R1/C3：身份三态徽标（已确认=绿 / 待确认=琥珀 / 未识别=灰），只读、内部加锁，可在 UI 线程直接读
+            var state = LocalPlayerIdentity.State;
+            if (state == IdentityState.Confirmed)
+            {
+                string? name = LocalPlayerIdentity.ConfirmedName;
+                _identityBadge.Text = string.IsNullOrEmpty(name)
+                    ? "已确认（等待名字）"
+                    : "已确认: " + name;
+                _identityBadge.ForeColor = Th.Good;
+            }
+            else if (state == IdentityState.Candidate)
+            {
+                _identityBadge.Text = "待确认（候选: " + LocalPlayerIdentity.CandidateSilverHits + " 次 / "
+                                     + Th.Money(LocalPlayerIdentity.CandidateSilverTotal) + " 银币）";
+                _identityBadge.ForeColor = Th.Accent;
+            }
+            else
+            {
+                _identityBadge.Text = "未识别";
+                _identityBadge.ForeColor = Th.Sub;
+            }
 
             var rows = new List<string[]>();
             var list = GameEvents.SnapshotIncome();

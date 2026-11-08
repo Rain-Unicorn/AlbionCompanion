@@ -139,6 +139,7 @@ namespace AlbionCompanion.Core
         public string DataDir;
         public string LastItems;
         public string LastCities;
+        public string LocalPlayerName = ""; // R1/C3：设置页「我的角色」，无法自动识别身份时的兜底
 
         public AppSettings()
         {
@@ -148,6 +149,7 @@ namespace AlbionCompanion.Core
             DataDir = "";
             LastItems = "T4_BAG,T5_2H_BOW@2";
             LastCities = "Caerleon,Bridgewatch,Martlock,Thetford,Fortuna,Lymhurst";
+            LocalPlayerName = "";
         }
     }
 
@@ -178,6 +180,7 @@ namespace AlbionCompanion.Core
                 if (settings.OpacityPercent < 40 || settings.OpacityPercent > 100) settings.OpacityPercent = 92;
                 if (string.IsNullOrEmpty(settings.Hotkey)) settings.Hotkey = "Ctrl+Alt+A";
                 if (settings.LastCities == null) settings.LastCities = "Caerleon,Bridgewatch,Martlock,Thetford,Fortuna,Lymhurst";
+                if (settings.LocalPlayerName == null) settings.LocalPlayerName = "";
                 return settings;
             }
             catch

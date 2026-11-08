@@ -7,6 +7,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using AlbionCompanion.Core.Income;
 
 namespace AlbionCompanion.Core
 {
@@ -36,11 +37,13 @@ namespace AlbionCompanion.Core
         private static Thread _thread;
         private static readonly List<Socket> _sockets = new List<Socket>();
         private static readonly ConcurrentDictionary<string, bool> _seenPairs = new ConcurrentDictionary<string, bool>();
-        private static long _lastSilver = -1; // 上次银币总量，-1表示未初始化
+        // _lastSilver 已删除（R1/C3）：evt=81 余额基线由 LocalPlayerIdentity 内部维护
+        // （P2-7 指出该字段只写不读；新用途——余额严格匹配——需要原始 FixPoint 值而非 ÷10000 的显示值）
 
         static ChatSniffer()
         {
             PhotonParser.OnDebug += delegate(string s) { ReportStatus(s); };
+            LocalPlayerIdentity.OnStatus += delegate(string s) { ReportStatus(s); };
         }
 
         public static bool IsAvailable()
@@ -251,52 +254,60 @@ namespace AlbionCompanion.Core
                 catch { }
 
                 // 关键游戏事件处理
-                // 81 = UpdateMoney (本地玩家银币总量更新) - 只用于校准，不计入收益
+                // 81 = UpdateMoney (本地玩家银币总量更新) - 不直接入账；R1/C3 起：
+                // p0=ObjectId、p1=当前余额（原始 FixPoint），交给身份状态机做「余额严格匹配」晋升判定
                 if (evt.GameEventCode == 81 && evt.Parameters != null)
                 {
-                    object val;
-                    if (evt.Parameters.TryGetValue(1, out val))
+                    object idVal, silverVal;
+                    if (evt.Parameters.TryGetValue(0, out idVal) && evt.Parameters.TryGetValue(1, out silverVal))
                     {
                         try
                         {
-                            long silver = Convert.ToInt64(val) / 10000;
-                            _lastSilver = silver;
+                            long objectId = Convert.ToInt64(idVal);
+                            long silverRaw = Convert.ToInt64(silverVal);
+                            LocalPlayerIdentity.OnUpdateMoney(objectId, silverRaw);
                         }
                         catch { }
                     }
                 }
-                // 62 = TakeSilver (拾取银币) - SAT方式：只记录本地玩家自己拾取的
-                // p0=ObjectId(拾取者), p3=YieldPreTax(FixPoint), p4=ClusterTax, p5=GuildTax, p6=AlliancePenalty
+                // 62 = TakeSilver (拾取银币) - R1/C3：是否入账由 LocalPlayerIdentity 裁决
+                // （CountAsMine=正式入账 / Pending=候选挂起 / Ignore=别人的钱），不再「首个拾取者自动认定」。
+                // p0=ObjectId(拾取者), p3=YieldPreTax(FixPoint), p4=ClusterTax, p5=GuildTax, p6=AlliancePenalty, p8=倍率(原值记档不参与计算)
                 else if (evt.GameEventCode == 62 && evt.Parameters != null)
                 {
                     try
                     {
                         long pickerId = Convert.ToInt64(evt.Parameters[0]);
-                        // Fallback：如果还没获取到本地玩家ObjectId（启动晚错过JoinResponse），
-                        // 第一次捡到银币时自动识别为本地玩家
-                        if (!GameEvents.LocalPlayerObjectId.HasValue)
+                        long yieldPreTax = Convert.ToInt64(evt.Parameters[3]);
+                        long clusterTax = evt.Parameters.TryGetValue(4, out var ct) ? Convert.ToInt64(ct) : 0;
+                        long guildTax = evt.Parameters.TryGetValue(5, out var gt) ? Convert.ToInt64(gt) : 0;
+                        long alliancePenalty = evt.Parameters.TryGetValue(6, out var ap) ? Convert.ToInt64(ap) : 0;
+                        long afterTaxRaw = Math.Max(0, yieldPreTax - clusterTax - guildTax - alliancePenalty);
+
+                        // 税率/FixPoint 计算逻辑保持不变；身份裁决用原始 FixPoint 值（余额严格比对）
+                        var disposition = LocalPlayerIdentity.OnTakeSilver(pickerId, afterTaxRaw);
+                        if (disposition != TakeSilverDisposition.Ignore && afterTaxRaw > 0)
                         {
-                            GameEvents.LocalPlayerObjectId = pickerId;
-                            ReportStatus($"[收益] 自动识别本地玩家 ObjectId={pickerId}");
-                        }
-                        // 只统计本地玩家自己拾取的
-                        if (pickerId == GameEvents.LocalPlayerObjectId.Value)
-                        {
-                            long yieldPreTax = Convert.ToInt64(evt.Parameters[3]);
-                            long clusterTax = evt.Parameters.TryGetValue(4, out var ct) ? Convert.ToInt64(ct) : 0;
-                            long guildTax = evt.Parameters.TryGetValue(5, out var gt) ? Convert.ToInt64(gt) : 0;
-                            long alliancePenalty = evt.Parameters.TryGetValue(6, out var ap) ? Convert.ToInt64(ap) : 0;
-                            long afterTax = Math.Max(0, yieldPreTax - clusterTax - guildTax - alliancePenalty);
-                            long silver = afterTax / 10000;
-                            if (silver > 0)
+                            string? p8note = null;
+                            if (evt.Parameters.TryGetValue(8, out var p8))
                             {
-                                GameEvents.AddIncome(new GameEvents.IncomeEntry
-                                {
-                                    Time = DateTime.Now,
-                                    Source = "拾取银币",
-                                    Silver = silver
-                                });
+                                try { p8note = "p8=" + Convert.ToInt64(p8); } catch { }
                             }
+                            var rec = new IncomeRecord
+                            {
+                                TimeUtc = DateTime.UtcNow,
+                                Source = IncomeSource.SilverPickup,
+                                SourceLabel = "拾取银币",
+                                PickerId = pickerId,
+                                SilverBeforeTax = yieldPreTax / 10000,
+                                TaxPaid = (clusterTax + guildTax + alliancePenalty) / 10000,
+                                SilverAfterTax = afterTaxRaw / 10000,
+                                AttributionNote = p8note ?? ""
+                            };
+                            if (disposition == TakeSilverDisposition.CountAsMine)
+                                IncomeTracker.AddConfirmed(rec);
+                            else
+                                IncomeTracker.AddPending(rec);
                         }
                     }
                     catch { }
@@ -426,6 +437,10 @@ namespace AlbionCompanion.Core
                                 };
                                 GameEvents.FireUpdate();
                             }
+
+                            // R1/C3：名字字典写完之后再联动身份状态机（设计 §3.5 固定顺序，
+                            // 确保后续逻辑能读到自己）。C6 将在此追加 PartyState.OnNewCharacter。
+                            LocalPlayerIdentity.OnNewCharacter(id, charName);
                         }
                         catch { }
                     }

@@ -3,6 +3,7 @@ using System.IO;
 using System.Text;
 using System.Collections.Generic;
 using AlbionCompanion.Core;
+using AlbionCompanion.Core.Income;
 
 static class LogicTests
 {
@@ -19,6 +20,24 @@ static class LogicTests
     {
         Check(name, actual != null && actual.Equals(expected),
               "expected <" + expected + "> but got <" + actual + ">");
+    }
+
+    // 模拟 ChatSniffer 在 evt=62 的入账职责（设计 §5：状态机只裁决，入账由调用方执行）
+    static TakeSilverDisposition TakeSilver(long pickerId, long afterTaxRaw)
+    {
+        var d = LocalPlayerIdentity.OnTakeSilver(pickerId, afterTaxRaw);
+        if (d == TakeSilverDisposition.CountAsMine || d == TakeSilverDisposition.Pending)
+        {
+            var rec = new IncomeRecord
+            {
+                TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup,
+                SourceLabel = "拾取银币", PickerId = pickerId, SilverAfterTax = afterTaxRaw
+            };
+            if (d == TakeSilverDisposition.CountAsMine) IncomeTracker.AddConfirmed(rec);
+            else IncomeTracker.AddPending(rec);
+        }
+        // Ignore：别人的钱，不记录
+        return d;
     }
 
     static string SampleJson = @"[{""item_id"":""T4_BAG"",""city"":""Caerleon"",""quality"":1,""sell_price_min"":7493,""sell_price_min_date"":""2026-11-04T14:30:00"",""sell_price_max"":7495,""sell_price_max_date"":""2026-11-04T14:30:00"",""buy_price_min"":0,""buy_price_min_date"":""0001-01-01T00:00:00"",""buy_price_max"":6999,""buy_price_max_date"":""2026-11-04T13:00:00""},{""item_id"":""T4_BAG"",""city"":""Bridgewatch"",""quality"":1,""sell_price_min"":0,""sell_price_min_date"":""0001-01-01T00:00:00"",""sell_price_max"":0,""sell_price_max_date"":""0001-01-01T00:00:00"",""buy_price_min"":0,""buy_price_min_date"":""0001-01-01T00:00:00"",""buy_price_max"":0,""buy_price_max_date"":""0001-01-01T00:00:00""}]";
@@ -403,15 +422,112 @@ static class LogicTests
             catch { ok5 = false; }
             Check("T-01 ObjectId<=0 不写身份", !ok5, "ok5=true");
 
-            // 端到端：内核识别出的身份应写进 GameEvents（C2 阶段的承接方式）
-            GameEvents.LocalPlayerObjectId = null;
-            GameEvents.LocalPlayerName = "";
+            // 端到端：内核识别出的身份经 OnJoinResponse 写入状态机（C3 起 GameEvents.LocalPlayerObjectId
+            // 是只读转发，禁止直写；直接写会编译失败，这正是兼容层的意图）
+            LocalPlayerIdentity.Reset();
+            IncomeTracker.Reset();
             if (ok)
             {
-                GameEvents.LocalPlayerObjectId = parsedId;
-                GameEvents.LocalPlayerName = parsedName;
+                LocalPlayerIdentity.OnJoinResponse(parsedId, parsedName);
             }
-            Eq("T-01 身份写入 GameEvents", GameEvents.LocalPlayerObjectId, 1001L);
+            Eq("T-01 身份经状态机写入（GameEvents 只读转发）", GameEvents.LocalPlayerObjectId, 1001L);
+            Eq("T-01 身份名写入", GameEvents.LocalPlayerName, "AB");
+            Eq("T-01 确认来源 = JoinResponse", LocalPlayerIdentity.CurrentSource, ConfirmSource.JoinResponse);
+            Eq("T-01 状态 = Confirmed", LocalPlayerIdentity.State, IdentityState.Confirmed);
+
+            // ---------------------------------------------------------------
+            // T-02 未确认态收益归零（R1）：身份 Unknown，喂 3 条 evt=62；
+            // 已确认合计必须为 0，全部 3 条挂起
+            // ---------------------------------------------------------------
+            LocalPlayerIdentity.Reset();
+            IncomeTracker.Reset();
+            var d1 = TakeSilver(1001, 500);
+            var d2 = TakeSilver(1001, 500);
+            var d3 = TakeSilver(1001, 500);
+            Eq("T-02 首条拾取置候选", LocalPlayerIdentity.State, IdentityState.Candidate);
+            Check("T-02 三条全部挂起（Pending）",
+                  d1 == TakeSilverDisposition.Pending && d2 == TakeSilverDisposition.Pending
+                  && d3 == TakeSilverDisposition.Pending,
+                  d1 + "/" + d2 + "/" + d3);
+            var sum2 = IncomeTracker.GetSummary();
+            Eq("T-02 未确认合计 = 0", sum2.ConfirmedTotal, 0L);
+            Eq("T-02 未确认条数 = 3", sum2.UnconfirmedRecords, 3);
+            Eq("T-02 候选拾取次数 = 3", LocalPlayerIdentity.CandidateSilverHits, 3);
+
+            // ---------------------------------------------------------------
+            // T-03 候选 + 余额严格匹配晋升（R1 方案 4）：
+            // 先建余额基线（evt=81 无差值，只推进基线），再拾取 500，
+            // 随后 evt=81 余额 +500 与挂起严格相等 → 晋升 Confirmed（UpdateMoney），
+            // 历史记录被转正（rename）而非丢弃
+            // ---------------------------------------------------------------
+            LocalPlayerIdentity.Reset();
+            IncomeTracker.Reset();
+            LocalPlayerIdentity.OnUpdateMoney(1001, 10000); // 基线（无差值，不确认）
+            Eq("T-03 基线 evt=81 不单独确认", LocalPlayerIdentity.State, IdentityState.Unknown);
+            var dPend = TakeSilver(1001, 500);
+            Eq("T-03 拾取置候选", LocalPlayerIdentity.State, IdentityState.Candidate);
+            Check("T-03 拾取挂起", dPend == TakeSilverDisposition.Pending, dPend.ToString());
+            LocalPlayerIdentity.OnUpdateMoney(1001, 10500); // 余额差 +500 == 挂起 500
+            Eq("T-03 余额严格匹配晋升 Confirmed", LocalPlayerIdentity.State, IdentityState.Confirmed);
+            Eq("T-03 确认来源 = UpdateMoney", LocalPlayerIdentity.CurrentSource, ConfirmSource.UpdateMoney);
+            Eq("T-03 确认 ObjectId = 1001", LocalPlayerIdentity.ConfirmedObjectId, 1001L);
+            var sum3 = IncomeTracker.GetSummary();
+            Eq("T-03 挂起记录转正（合计 = 500）", sum3.ConfirmedTotal, 500L);
+            Eq("T-03 挂起清零", sum3.UnconfirmedRecords, 0);
+            var snap3 = IncomeTracker.Snapshot(10);
+            Check("T-03 历史记录被保留而非丢弃",
+                  snap3.Length == 1 && snap3[0].Pending == false && snap3[0].SilverAfterTax == 500,
+                  "len=" + snap3.Length);
+            // 晋升后同一拾取者 → CountAsMine
+            var dMine = LocalPlayerIdentity.OnTakeSilver(1001, 300);
+            Eq("T-03 确认后本人拾取直接入账", dMine, TakeSilverDisposition.CountAsMine);
+
+            // ---------------------------------------------------------------
+            // T-04 余额不匹配不晋升（R1）：拾取 500 后余额差 480（含分成干扰），
+            // 必须仍是 Candidate 且候选未被清空
+            // ---------------------------------------------------------------
+            LocalPlayerIdentity.Reset();
+            IncomeTracker.Reset();
+            LocalPlayerIdentity.OnUpdateMoney(1001, 10000); // 基线
+            TakeSilver(1001, 500);
+            LocalPlayerIdentity.OnUpdateMoney(1001, 10480); // 余额差 +480 != 500
+            Eq("T-04 余额不匹配仍为 Candidate", LocalPlayerIdentity.State, IdentityState.Candidate);
+            Eq("T-04 候选未被清空", LocalPlayerIdentity.CandidateObjectId, 1001L);
+            Eq("T-04 挂起仍在等待", IncomeTracker.GetSummary().UnconfirmedRecords, 1);
+            // 紧接着一次精确匹配仍然可以晋升（候选继续等到了下一次匹配）
+            TakeSilver(1001, 200);
+            LocalPlayerIdentity.OnUpdateMoney(1001, 10680); // +200 == 200
+            Eq("T-04 下一轮精确匹配后仍可晋升", LocalPlayerIdentity.State, IdentityState.Confirmed);
+
+            // ---------------------------------------------------------------
+            // T-05 推翻机制边界（R1 方案 4）：
+            // Confirmed(1001,"A")，路人 NewCharacter(1002,"B") 不推翻；
+            // 同 ObjectId 不同名（1001,"A2"）→ 推翻并进入 Candidate
+            // ---------------------------------------------------------------
+            LocalPlayerIdentity.Reset();
+            IncomeTracker.Reset();
+            LocalPlayerIdentity.OnJoinResponse(1001, "A");
+            Eq("T-05 初始 Confirmed", LocalPlayerIdentity.State, IdentityState.Confirmed);
+            LocalPlayerIdentity.OnNewCharacter(1002, "B");
+            Eq("T-05 路人 NewCharacter 不推翻", LocalPlayerIdentity.State, IdentityState.Confirmed);
+            Eq("T-05 身份保持 1001", LocalPlayerIdentity.ConfirmedObjectId, 1001L);
+            LocalPlayerIdentity.OnNewCharacter(1001, "A2");
+            Eq("T-05 同 ObjectId 不同名 → 推翻", LocalPlayerIdentity.State, IdentityState.Candidate);
+            Eq("T-05 推翻后候选 = 1001", LocalPlayerIdentity.CandidateObjectId, 1001L);
+            Check("T-05 推翻后不再自称已确认", LocalPlayerIdentity.ConfirmedObjectId == null,
+                  "confirmed=" + LocalPlayerIdentity.ConfirmedObjectId);
+
+            // 补充：手选名字命中 NewCharacter 的兜底路径（设计 §3.3 设置页行 / V4-B）
+            LocalPlayerIdentity.Reset();
+            IncomeTracker.Reset();
+            LocalPlayerIdentity.SetManualName("MyChar");
+            Eq("T-05 手选名不直接确认", LocalPlayerIdentity.State, IdentityState.Unknown);
+            LocalPlayerIdentity.OnNewCharacter(2001, "MyChar");
+            Eq("T-05 名字命中手选名 → 确认", LocalPlayerIdentity.State, IdentityState.Confirmed);
+            Eq("T-05 确认来源 = NewCharacterMatch", LocalPlayerIdentity.CurrentSource, ConfirmSource.NewCharacterMatch);
+            Eq("T-05 IsSelf 判定", LocalPlayerIdentity.IsSelf(2001), true);
+            Eq("T-05 IsSelf 拒绝非本人", LocalPlayerIdentity.IsSelf(2002), false);
+
         }
 
         Console.WriteLine();

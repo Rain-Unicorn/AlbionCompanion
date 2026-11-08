@@ -268,14 +268,13 @@ namespace AlbionCompanion.Core
                 try
                 {
                     var span = new ReadOnlySpan<byte>(d, off, operationLength);
-                    if (TryParseJoinResponse(span, out long localObjectId, out string localUsername))
+                    if (TryParseJoinResponse(span, out long localObjectId, out string? localUsername))
                     {
                         if (OnDebug != null)
                             OnDebug("  [JoinResponse] LocalPlayer ObjectId=" + localObjectId + " Name=" + localUsername);
 
-                        // 仅在解析出有效身份时提交（C3 起改为 LocalPlayerIdentity.OnJoinResponse）
-                        GameEvents.LocalPlayerObjectId = localObjectId;
-                        GameEvents.LocalPlayerName = localUsername ?? "";
+                        // R1/C3：身份唯一写入入口是状态机（强证据，确认或纠正）
+                        LocalPlayerIdentity.OnJoinResponse(localObjectId, localUsername);
                     }
                 }
                 catch
@@ -299,7 +298,7 @@ namespace AlbionCompanion.Core
         /// 注意：真实 Join 的 opCode 码值未经实机确认（V1），当前采用「非零即候选」的宽松判定，
         /// 实机若发现漂移应改为精确码值匹配而不是继续放宽。
         /// </summary>
-        public static bool TryParseJoinResponse(ReadOnlySpan<byte> operationBody, out long objectId, out string name)
+        public static bool TryParseJoinResponse(ReadOnlySpan<byte> operationBody, out long objectId, out string? name)
         {
             objectId = 0;
             name = null;
