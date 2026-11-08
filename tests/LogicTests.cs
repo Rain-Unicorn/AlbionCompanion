@@ -94,7 +94,27 @@ static class LogicTests
         string url = MarketClient.BuildPriceUrl(new[] { "T4_BAG", "T5_2H_BOW@2" }, new[] { "Caerleon", "Bridgewatch" });
         Check("A4 URL 含物品列表", url.Contains("T4_BAG,T5_2H_BOW@2"), url);
         Check("A4 URL 含城市参数", url.Contains("locations=Caerleon,Bridgewatch"), url);
-        Check("A4 URL 指向 AODP", url.StartsWith("https://www.albion-online-data.com/api/v2/stats/prices/"), url);
+        Check("A4 URL 指向 AODP east 基址（M1 定案：亚服）",
+            url.StartsWith(AodpServers.East + "stats/prices/"), url);
+        Eq("A4 默认基址 = east", MarketClient.ServerBaseUrl, AodpServers.East);
+
+        // M1 429 退避（RateLimitBackoff，纯函数）
+        var now = DateTimeOffset.FromUnixTimeSeconds(1_800_000_000L);
+        Eq("M1 有 Reset 头：睡到该 epoch 时刻",
+            RateLimitBackoff.ComputeDelay(0, "1800000060", now), TimeSpan.FromSeconds(60));
+        Eq("M1 Reset 头早于当前时间：clamp 下限 1s",
+            RateLimitBackoff.ComputeDelay(0, "1799999999", now), RateLimitBackoff.MinDelay);
+        Eq("M1 Reset 头超上限：clamp 15min",
+            RateLimitBackoff.ComputeDelay(0, "1800003600", now), RateLimitBackoff.MaxDelay);
+        Eq("M1 无 Reset 头：第 1 次退避 30s",
+            RateLimitBackoff.ComputeDelay(0, null, now), TimeSpan.FromSeconds(30));
+        Eq("M1 无 Reset 头：第 2 次退避 60s",
+            RateLimitBackoff.ComputeDelay(1, "", now), TimeSpan.FromSeconds(60));
+        Eq("M1 无 Reset 头：第 3 次退避 120s",
+            RateLimitBackoff.ComputeDelay(2, "not-a-number", now), TimeSpan.FromSeconds(120));
+        Eq("M1 退避次数上限 3", RateLimitBackoff.MaxRetries, 3);
+        Eq("M1 非法 Reset 头走指数退避",
+            RateLimitBackoff.ComputeDelay(0, "abc", now), TimeSpan.FromSeconds(30));
 
         var quotes = MarketClient.Parse(SampleJson);
         Eq("A4 解析条数 = 1（全零行被剔除）", quotes.Count, 1);
