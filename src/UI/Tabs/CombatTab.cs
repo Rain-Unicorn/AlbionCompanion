@@ -5,6 +5,7 @@ using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 using AlbionCompanion.Core;
 using AlbionCompanion.Core.DamageMeter;
+using AlbionCompanion.Core.Party;
 
 namespace AlbionCompanion.UI.Tabs
 {
@@ -23,6 +24,7 @@ namespace AlbionCompanion.UI.Tabs
     public class CombatTab : TabBase
     {
         private readonly Button _clearBtn;
+        private readonly Button _suppressBtn;
         private readonly PillButton _btnAll, _btnPve, _btnPvp;
         private readonly DoubleBufferedPanel _panel;
         private readonly Timer _refresh;
@@ -45,6 +47,24 @@ namespace AlbionCompanion.UI.Tabs
             _clearBtn.FlatAppearance.MouseOverBackColor = Th.CardHi;
             _clearBtn.Click += delegate { GameEvents.ResetAll(); GameEvents.FireUpdate(); Render(); };
             Controls.Add(_clearBtn);
+
+            // R7/C6：「本次不使用旧名单」按钮（§9.8 L1 最大风险项的缓解）——仅在
+            // 「有旧名单缓存但未验证」时可见；点击后本次会话忽略旧名单，直到真实队伍事件到来
+            _suppressBtn = new Button();
+            _suppressBtn.Text = "本次不使用旧名单";
+            _suppressBtn.Location = new Point(360, 12);
+            _suppressBtn.Size = new Size(140, 24);
+            _suppressBtn.FlatStyle = FlatStyle.Flat;
+            _suppressBtn.FlatAppearance.BorderColor = Th.Accent;
+            _suppressBtn.FlatAppearance.BorderSize = 1;
+            _suppressBtn.BackColor = Th.Card;
+            _suppressBtn.ForeColor = Th.Accent;
+            _suppressBtn.Font = Th.F(7.5f);
+            _suppressBtn.Cursor = Cursors.Hand;
+            _suppressBtn.FlatAppearance.MouseOverBackColor = Th.CardHi;
+            _suppressBtn.Visible = false;
+            _suppressBtn.Click += delegate { PartyState.SuppressStaleCache(); GameEvents.FireUpdate(); Render(); };
+            Controls.Add(_suppressBtn);
 
             // 筛选 pill 按钮
             _btnAll = new PillButton("全部", 14, 56);
@@ -72,6 +92,38 @@ namespace AlbionCompanion.UI.Tabs
             Render();
         }
 
+
+        /// <summary>
+        /// R7/C6：队伍状态横幅（§7.6）。
+        /// verified=true：绿色小点 + 「队伍 N 人」；
+        /// verified=false 且有旧名单：琥珀徽标「缓存未验证」+ 说明文案（仍过滤，但必须标注）；
+        /// 无名单：灰色「未组建队伍 / 未识别」（不过滤，显示全部玩家）。
+        /// </summary>
+        private void DrawPartyBanner(Graphics g, int w, int pad, bool verified, bool hasMembers)
+        {
+            int bx = w - pad - 190;
+            int by = 6;
+            if (verified && hasMembers)
+            {
+                using (var dot = new SolidBrush(Th.Good))
+                    g.FillEllipse(dot, bx, by + 4, 8, 8);
+                TextRenderer.DrawText(g, "队伍 " + PartyState.MemberCount + " 人", Th.F(8f),
+                    new Rectangle(bx + 14, by, 176, 16), Th.Good, TextFormatFlags.Left);
+            }
+            else if (!verified && hasMembers && !PartyState.Suppressed)
+            {
+                TextRenderer.DrawText(g, "缓存未验证", Th.FB(7.5f),
+                    new Rectangle(bx, by, 70, 16), Th.Accent, TextFormatFlags.Left);
+                TextRenderer.DrawText(g, "上次会话的队伍名单，进队后退队后自动刷新", Th.F(6.5f),
+                    new Rectangle(bx - 160, by + 14, 350, 12), Th.Sub, TextFormatFlags.Right);
+            }
+            else
+            {
+                TextRenderer.DrawText(g, "未组建队伍 / 未识别", Th.F(8f),
+                    new Rectangle(bx, by, 190, 16), Th.Sub, TextFormatFlags.Left);
+            }
+        }
+
         private void Panel_Paint(object sender, PaintEventArgs e)
         {
             var g = e.Graphics;
@@ -92,6 +144,13 @@ namespace AlbionCompanion.UI.Tabs
             // 小标签
             TextRenderer.DrawText(g, "— COMBAT TELEMETRY", Th.F(7.5f),
                 new Rectangle(pad, 4, 300, 14), Th.Accent, TextFormatFlags.Left);
+
+            // R7/C6：队伍状态横幅（设计 §7.6 三态）——数据诚实性核心：
+            // verified=false 时绝不能让用户误以为名单是实时的
+            bool partyVerified = PartyState.Verified;
+            bool partyHasMembers = PartyState.MemberCount > 0;
+            bool staleFiltering = !partyVerified && partyHasMembers && !PartyState.Suppressed;
+            DrawPartyBanner(g, w, pad, partyVerified, partyHasMembers);
             TextRenderer.DrawText(g, "战斗统计", Th.FB(16f),
                 new Rectangle(pad, 18, 300, 26), Th.Text, TextFormatFlags.Left);
 
@@ -118,6 +177,12 @@ namespace AlbionCompanion.UI.Tabs
                 new Rectangle(pad + 32, cardY + 8, 200, 18), Th.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
             TextRenderer.DrawText(g, "DAMAGE OUT", Th.F(7f),
                 new Rectangle(pad + 110, cardY + 10, 200, 14), Th.Sub, TextFormatFlags.Left);
+            if (staleFiltering)
+                TextRenderer.DrawText(g, "（名单未验证）", Th.F(7f),
+                    new Rectangle(pad + 180, cardY + 10, 120, 14), Th.Accent, TextFormatFlags.Left);
+            else if (PartyState.HasPendingMembers)
+                TextRenderer.DrawText(g, "（" + PartyState.MemberCount + " 名队员待识别）", Th.F(7f),
+                    new Rectangle(pad + 180, cardY + 10, 160, 14), Th.Accent, TextFormatFlags.Left);
 
             var allDamage = GameEvents.DamageTracker.GetTopDamage();
             var topDamage = GameEvents.IsInParty
@@ -180,6 +245,9 @@ namespace AlbionCompanion.UI.Tabs
                 new Rectangle(pad + 32, healY + 8, 200, 18), Th.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
             TextRenderer.DrawText(g, "HEALING OUT", Th.F(7f),
                 new Rectangle(pad + 110, healY + 10, 200, 14), Th.Sub, TextFormatFlags.Left);
+            if (staleFiltering)
+                TextRenderer.DrawText(g, "（名单未验证）", Th.F(7f),
+                    new Rectangle(pad + 180, healY + 10, 120, 14), Th.Accent, TextFormatFlags.Left);
 
             var allHeal = GameEvents.DamageTracker.GetTopHealing();
             var topHeal = GameEvents.IsInParty
@@ -248,6 +316,8 @@ namespace AlbionCompanion.UI.Tabs
 
         private void Render()
         {
+            // R7/C6：仅在「有旧名单但未验证且未抑制」时显示「本次不使用旧名单」（§9.8 L1）
+            _suppressBtn.Visible = !PartyState.Verified && PartyState.MemberCount > 0 && !PartyState.Suppressed;
             UpdateFilterButtons();
             _panel.Invalidate();
         }

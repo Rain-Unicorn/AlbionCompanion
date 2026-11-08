@@ -1,10 +1,12 @@
 using System;
 using System.IO;
 using System.Text;
+using System.Linq;
 using System.Collections.Generic;
 using AlbionCompanion.Core;
 using AlbionCompanion.Core.DamageMeter;
 using AlbionCompanion.Core.Income;
+using AlbionCompanion.Core.Party;
 
 static class LogicTests
 {
@@ -738,6 +740,179 @@ static class LogicTests
         }
 
         Console.WriteLine();
+        // ---------------------------------------------------------------
+        // T-11 R7 队伍增量重建：230(GUID+2名) → 234(新成员) → 29(名字反查) →
+        // 239(保守更新) → 241(换队长)；断言 MemberCount、角色、id 稳定、队长唯一
+        // ---------------------------------------------------------------
+        {
+            PartyState.Reset();
+            LocalPlayerIdentity.Reset();
+            var g1 = Guid.NewGuid(); var g2 = Guid.NewGuid(); var g3 = Guid.NewGuid();
+            byte[] p8 = g1.ToByteArray().Concat(g2.ToByteArray()).ToArray(); // 2 个 GUID
+            string[] p9 = { "laowang0729", "aYi777" };
+            PartyState.OnPartyJoined(p8, p9);
+            Eq("T-11 230 全量重建成员数 = 2", PartyState.MemberCount, 2);
+            Check("T-11 230 后 Verified = true", PartyState.Verified, "verified=false");
+            var mems = PartyState.GetMembers();
+            Check("T-11 230 初始态均为 pendingObjectId",
+                mems.All(m => m.Confidence == PartyConfidence.PendingObjectId),
+                "有成员不是 pendingObjectId");
+
+            // 234：g1（laowang0729）进战斗，GUID 匹配 → 补 ObjectId
+            PartyState.OnPartyPlayerJoined(5001L, g1.ToByteArray());
+            var lw = PartyState.GetMembers().Find(m => m.Name == "laowang0729");
+            Eq("T-11 234 GUID 匹配后 ObjectId = 5001", lw.ObjectId, 5001L);
+            Check("T-11 234 GUID 匹配后 confirmed", lw.Confidence == PartyConfidence.Confirmed,
+                "confidence=" + lw.Confidence);
+
+            // 234：全新成员（未知 GUID）→ pendingName 等反查
+            PartyState.OnPartyPlayerJoined(5002L, g3.ToByteArray());
+            Eq("T-11 234 新成员后成员数 = 3", PartyState.MemberCount, 3);
+            var newGuy = PartyState.GetMembers().Find(m => m.ObjectId == 5002L);
+            Check("T-11 234 新成员 pendingName", newGuy.Confidence == PartyConfidence.PendingName,
+                "confidence=" + newGuy.Confidence);
+
+            // 29：名字反查 → pendingName 补名（id 不变，仍是 5002）
+            PartyState.OnNewCharacter(5002L, "BossKiller99");
+            var named = PartyState.GetMembers().Find(m => m.ObjectId == 5002L);
+            Eq("T-11 反查补名后仍同一 ObjectId = 5002", named.ObjectId, 5002L);
+            Eq("T-11 反查补名 = BossKiller99", named.Name, "BossKiller99");
+            Check("T-11 反查后 confirmed", named.Confidence == PartyConfidence.Confirmed,
+                "confidence=" + named.Confidence);
+
+            // 239：保守处理——已知名刷新 lastSeen，不新增
+            DateTime before = PartyState.GetMembers().Find(m => m.Name == "aYi777").LastSeenUtc;
+            System.Threading.Thread.Sleep(20);
+            PartyState.OnPartyPlayerUpdated("aYi777");
+            var ayi = PartyState.GetMembers().Find(m => m.Name == "aYi777");
+            Eq("T-11 239 已知名刷新 lastSeen 成员数仍 3", PartyState.MemberCount, 3);
+            Check("T-11 239 lastSeen 已刷新", ayi.LastSeenUtc > before, "lastSeen 未变");
+            // 未知名不入名单
+            PartyState.OnPartyPlayerUpdated("完全路过的陌生人");
+            Eq("T-11 239 未知名不入名单成员数仍 3", PartyState.MemberCount, 3);
+
+            // 241：换队长——ObjectId 双路兜底
+            PartyState.OnPartyLeaderChanged(5001L);
+            Eq("T-11 241 LeaderObjectId = 5001", PartyState.LeaderObjectId, 5001L);
+            var leaders = PartyState.GetMembers().FindAll(m => m.Role == "leader");
+            Eq("T-11 241 队长唯一 = 1", leaders.Count, 1);
+            Eq("T-11 241 队长是 laowang0729", leaders[0].Name, "laowang0729");
+        }
+
+        // ---------------------------------------------------------------
+        // T-12 R7 pending 反查三态（§9.8 L1）：唯一候选→提交；多候选→保持
+        // pending；零候选→忽略不崩
+        // ---------------------------------------------------------------
+        {
+            PartyState.Reset();
+            LocalPlayerIdentity.Reset();
+            var gA = Guid.NewGuid();
+            byte[] p8 = gA.ToByteArray();
+            // 唯一候选：一个 pendingObjectId 成员 "Solo"
+            PartyState.OnPartyJoined(p8, new[] { "Solo" });
+            PartyState.OnNewCharacter(7001L, "Solo");
+            var solo = PartyState.GetMembers().Find(m => m.Name == "Solo");
+            Eq("T-12 唯一候选提交 ObjectId = 7001", solo.ObjectId, 7001L);
+            Check("T-12 唯一候选 confirmed", solo.Confidence == PartyConfidence.Confirmed,
+                "confidence=" + solo.Confidence);
+
+            // 多候选：两个同名 pendingObjectId 成员 "Dup"（同名入队属异常，但代码必须防错认）
+            PartyState.Reset();
+            PartyState.OnPartyJoined(null, new[] { "Dup", "Dup" });
+            PartyState.OnNewCharacter(7002L, "Dup");
+            var dups = PartyState.GetMembers().FindAll(m => m.Name == "Dup");
+            Check("T-12 多候选保持 pendingObjectId",
+                dups.All(m => m.Confidence == PartyConfidence.PendingObjectId),
+                "有候选被错误提交");
+            Check("T-12 多候选 HasPendingMembers = true", PartyState.HasPendingMembers, "false");
+
+            // 零候选：路人名字 → 不新增不崩
+            int before = PartyState.MemberCount;
+            PartyState.OnNewCharacter(7003L, "纯路人");
+            Eq("T-12 零候选不新增成员数不变", PartyState.MemberCount, before);
+        }
+
+        // ---------------------------------------------------------------
+        // T-13 R7 缓存降级（§7.6/§7.2）：截断 JSON / schemaVersion=2 / 空文件
+        // → 一律降级空名单 + Verified==false，不抛异常；正常文件 → 载入但
+        // Verified==false（StaleFromPreviousSession）
+        // ---------------------------------------------------------------
+        {
+            string tmp = Path.Combine(Path.GetTempPath(), "ac6-test-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(tmp);
+            try
+            {
+                string partyCachePath = Path.Combine(tmp, "party-cache.json");
+
+                // 正常文件：先真实走一遍落盘 → 重载
+                PartyState.Reset();
+                LocalPlayerIdentity.Reset();
+                PartyState.SetCacheDir(tmp);
+                PartyState.OnPartyJoined(Guid.NewGuid().ToByteArray(), new[] { "Alpha", "Beta" });
+                PartyState.FlushCache();
+                Check("T-13 前置 正常落盘文件存在", File.Exists(partyCachePath), "文件未生成");
+                PartyState.LoadOrRestore(tmp);
+                Eq("T-13 重载后成员数 = 2", PartyState.MemberCount, 2);
+                Check("T-13 重载后 Verified = false（重启降级）", !PartyState.Verified, "verified=true");
+                Eq("T-13 重载后 reason = StaleFromPreviousSession", PartyState.VerifiedReason, "StaleFromPreviousSession");
+
+                // 半截 JSON
+                PartyState.Reset();
+                File.WriteAllText(partyCachePath, "{ \"schemaVersion\": 1, \"members\": [ { \"nam");
+                PartyState.LoadOrRestore(tmp);
+                Eq("T-13 半截 JSON 降级空名单", PartyState.MemberCount, 0);
+                Check("T-13 半截 JSON Verified = false", !PartyState.Verified, "verified=true");
+
+                // schemaVersion=2 → 忽略整个缓存
+                PartyState.Reset();
+                File.WriteAllText(partyCachePath, "{ \"schemaVersion\": 2, \"members\": [ { \"name\": \"X\", \"confidence\": \"confirmed\" } ] }");
+                PartyState.LoadOrRestore(tmp);
+                Eq("T-13 schemaVersion=2 降级空名单", PartyState.MemberCount, 0);
+                Check("T-13 schemaVersion=2 Verified = false", !PartyState.Verified, "verified=true");
+
+                // 空文件
+                PartyState.Reset();
+                File.WriteAllText(partyCachePath, "");
+                PartyState.LoadOrRestore(tmp);
+                Eq("T-13 空文件降级空名单", PartyState.MemberCount, 0);
+                Check("T-13 空文件 Verified = false", !PartyState.Verified, "verified=true");
+
+                // 文件不存在
+                PartyState.Reset();
+                File.Delete(partyCachePath);
+                PartyState.LoadOrRestore(tmp);
+                Eq("T-13 无文件空名单", PartyState.MemberCount, 0);
+                Eq("T-13 无文件 reason = ProcessStartNoPartyEvent", PartyState.VerifiedReason, "ProcessStartNoPartyEvent");
+            }
+            finally
+            {
+                try { Directory.Delete(tmp, true); } catch { }
+            }
+            PartyState.Reset();
+        }
+
+        // ---------------------------------------------------------------
+        // T-13b R7 未验证抑制：SuppressStaleCache 后 IsInParty=false（§9.8 L1），
+        // 真实队伍事件（230）解除抑制
+        // ---------------------------------------------------------------
+        {
+            PartyState.Reset();
+            LocalPlayerIdentity.Reset();
+            PartyState.OnPartyJoined(null, new[] { "OldMate" }); // 无 GUID 版
+            Check("T-13b 前置 IsInParty = true", PartyState.IsInParty, "false");
+            PartyState.SuppressStaleCache();
+            Check("T-13b 抑制后 IsInParty = false", !PartyState.IsInParty, "true");
+            Check("T-13b 抑制后 Suppressed = true", PartyState.Suppressed, "false");
+            Eq("T-13b 抑制后原始成员数保留 = 1", PartyState.MemberCount, 1);
+            // 真实事件覆盖旧缓存 → 解除抑制
+            PartyState.OnPartyJoined(null, new[] { "NewMate1", "NewMate2" });
+            Check("T-13b 真实 230 后 IsInParty 恢复 = true", PartyState.IsInParty, "false");
+            Eq("T-13b 真实 230 后成员数 = 2", PartyState.MemberCount, 2);
+            // GameEvents 转发层同步（IsInParty / IsPartyMember）
+            Check("T-13b GameEvents.IsPartyMember 转发", GameEvents.IsPartyMember("NewMate1"), "false");
+            PartyState.Reset();
+        }
+
         Console.WriteLine("passed=" + _pass + " failed=" + _fail);
         return _fail == 0 ? 0 : 1;
     }

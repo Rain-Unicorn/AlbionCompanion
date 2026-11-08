@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using AlbionCompanion.Core.DamageMeter;
 using AlbionCompanion.Core.Income;
+using AlbionCompanion.Core.Party;
 
 namespace AlbionCompanion.Core
 {
@@ -83,6 +84,9 @@ namespace AlbionCompanion.Core
         {
             PhotonParser.OnDebug += delegate(string s) { ReportStatus(s); };
             LocalPlayerIdentity.OnStatus += delegate(string s) { ReportStatus(s); };
+            // R7/C6：PartyState / PartyCacheStore 的状态行转发到事件日志（与抓包状态同一出口）
+            PartyState.OnStatus += ReportStatus;
+            PartyCacheStore.OnStatus += ReportStatus;
         }
 
         public static bool IsAvailable()
@@ -488,6 +492,10 @@ namespace AlbionCompanion.Core
                             // ③ 此 id 此前不在 _playerNames（真正的新面孔）。三者同时成立才把 -1 的累计
                             // 并入该角色；否则 -1 以「未知玩家」常驻（宁可未知，不可错挂队友头上）。
                             TryAttributeUnknownPlayer(id, charName, wasKnownPlayer);
+
+                            // R7/C6：队伍 pending ObjectId 反查入口（设计 §7.4——evt=234 给 id 不给名，
+                            // 用 evt=29 的名字补齐；只有唯一候选才提交）
+                            PartyState.OnNewCharacter(id, charName);
                         }
                         catch { }
                     }
@@ -709,39 +717,62 @@ namespace AlbionCompanion.Core
                     });
                 }
                 // 230 = PartyJoined (加入队伍，收到完整队伍名单)
-                // 实际抓包确认：p8=GUID字节数组(32b=2个GUID)，p9=名字数组 ["laowang0729","aYi777"]
+                // 实际抓包确认：p8=GUID字节数组(16B/成员)，p9=名字数组 ["laowang0729","aYi777"]
+                // R7/C6：整段迁入 PartyState.OnPartyJoined（全量重建 + GUID 绑定 + 落盘，§7.3）
                 else if (evt.GameEventCode == 230 && evt.Parameters != null)
                 {
                     try
                     {
-                        GameEvents.ClearParty();
-                        // SAT: 参数9 = 名字数组，参数8 = GUID字节数组
-                        if (evt.Parameters.TryGetValue(9, out var namesObj) && namesObj != null)
-                        {
-                            AddNamesFromArray(namesObj);
-                        }
-                        ReportStatus($"[队伍] 已加入队伍，成员 {GameEvents.PartyMemberCount} 人: {string.Join(", ", GameEvents.PartyMemberSnapshot())}");
+                        evt.Parameters.TryGetValue(8, out var guidObj);
+                        evt.Parameters.TryGetValue(9, out var namesObj);
+                        PartyState.OnPartyJoined(guidObj, namesObj);
+                        ReportStatus($"[队伍] evt=230 参数：p8={(guidObj is byte[] gb ? gb.Length + "B" : "无")} p9={namesObj}");
                         GameEvents.FireUpdate();
                     }
                     catch { }
                 }
-                // 234 = PartyPlayerJoined (队伍成员加入) - 实际抓包确认
-                // p0=ObjectId, p1=GUID字节
+                // 234 = PartyPlayerJoined (队伍成员加入) - 实际抓包确认：p0=ObjectId, p1=GUID字节
                 else if (evt.GameEventCode == 234 && evt.Parameters != null)
                 {
                     try
                     {
-                        // 暂时只记录，名字需要从后续事件获取
-                        ReportStatus($"[队伍] 新成员加入 (ObjectId={evt.Parameters[0]})");
+                        evt.Parameters.TryGetValue(0, out var idObj);
+                        evt.Parameters.TryGetValue(1, out var guidObj);
+                        ReportStatus($"[队伍] evt=234 参数：p0={idObj} p1={(guidObj is byte[] gb ? gb.Length + "B" : guidObj)}");
+                        PartyState.OnPartyPlayerJoined(idObj, guidObj);
+                        GameEvents.FireUpdate();
                     }
                     catch { }
                 }
-                // 237 = PartyDisbanded (队伍解散) - 预估
+                // 237 = PartyDisbanded (队伍解散) - 预估事件码，未实机验证
+                // R7/C6：状态迁入 PartyState；参数布局必须打印原始值以便实机确认（§7.3）
                 else if (evt.GameEventCode == 237)
                 {
-                    GameEvents.ClearParty();
-                    ReportStatus("[队伍] 队伍已解散");
+                    ReportStatus("[队伍] evt=237 参数：" + DescribeParams(evt.Parameters));
+                    PartyState.OnPartyDisbanded();
                     GameEvents.FireUpdate();
+                }
+                // 239 = PartyPlayerUpdated - 参数语义未完全确认（HANDOFF：p0=名字, p1=True, p3=5）
+                // 保守处理：不新增成员不改 id，仅刷新 lastSeen（§7.3）
+                else if (evt.GameEventCode == 239 && evt.Parameters != null)
+                {
+                    ReportStatus("[队伍] evt=239 参数：" + DescribeParams(evt.Parameters));
+                    PartyState.OnPartyPlayerUpdated(evt.Parameters.TryGetValue(0, out var n239) ? n239 : null);
+                }
+                // 241 = PartyLeaderChanged - 参数布局未实机验证
+                // 只更新队长，不影响成员集合（§7.3）
+                else if (evt.GameEventCode == 241 && evt.Parameters != null)
+                {
+                    ReportStatus("[队伍] evt=241 参数：" + DescribeParams(evt.Parameters));
+                    PartyState.OnPartyLeaderChanged(evt.Parameters.TryGetValue(0, out var p241) ? p241 : null);
+                    GameEvents.FireUpdate();
+                }
+                // 243 = PartySilverGained - 参数布局未实机验证
+                // 队伍侧只刷成员活跃度；银币金额归收益模块（§8.3，C7 处理），PartyState 不碰钱
+                else if (evt.GameEventCode == 243 && evt.Parameters != null)
+                {
+                    ReportStatus("[队伍] evt=243 参数：" + DescribeParams(evt.Parameters));
+                    PartyState.OnPartySilverGained(evt.Parameters.TryGetValue(0, out var p243) ? p243 : null);
                 }
             }
         }
@@ -751,24 +782,20 @@ namespace AlbionCompanion.Core
             if (OnStatus != null) try { OnStatus(s); } catch { }
         }
 
-        /// <summary>从 Photon 数组参数中提取玩家名字，加入队伍集合</summary>
-        private static void AddNamesFromArray(object namesObj)
+        /// <summary>R7/C6：打印事件原始参数（237/239/241/243 参数布局未实机验证，必须留原始证据）</summary>
+        private static string DescribeParams(Dictionary<byte, object>? parameters)
         {
-            if (namesObj is string[] strNames)
+            if (parameters == null || parameters.Count == 0) return "(无)";
+            var parts = new List<string>();
+            foreach (var kv in parameters)
             {
-                foreach (var n in strNames)
-                {
-                    if (!string.IsNullOrEmpty(n)) GameEvents.AddPartyName(n);
-                }
+                string v = kv.Value is byte[] b ? b.Length + "B[" + Convert.ToHexString(b, 0, Math.Min(b.Length, 16)) + (b.Length > 16 ? "…" : "") + "]"
+                          : kv.Value?.ToString() ?? "null";
+                parts.Add("p" + kv.Key + "=" + v);
             }
-            else if (namesObj is object[] objNames)
-            {
-                foreach (var o in objNames)
-                {
-                    var n = o?.ToString();
-                    if (!string.IsNullOrEmpty(n)) GameEvents.AddPartyName(n);
-                }
-            }
+            return string.Join(" ", parts);
         }
+
+
     }
 }

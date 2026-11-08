@@ -98,12 +98,20 @@ src/
 - **UI配色**: Bg(15,17,21), Card(23,26,32), Accent金(216,169,74), Good绿(94,200,148), Bad红(226,108,108)
 
 ## 已知问题 / TODO
-1. **队伍状态重启丢失**: 中途启动抓包错过evt=230，需要退组重进触发。可考虑定期重查队伍状态或缓存队伍信息
-2. **PartyDisbanded事件码(预估237)未验证**
-3. **evt=234(PartyPlayerJoined)只打日志**，没有解析名字加入集合
+1. **队伍状态重启丢失**（R7/C6 已解决）: party-cache.json 持久化跨会话名单，启动时 LoadOrRestore 载入并降级 verified=false（StaleFromPreviousSession），战斗页显示「缓存未验证」横幅 + 「本次不使用旧名单」按钮；进队（evt=230/234）自动转正
+2. **PartyDisbanded事件码(预估237)未验证**（C6: OnPartyDisbanded 已实现，evt=237 分支打印原始参数待实机确认；若实机发现 237 不是解散，改为只打日志）
+3. **evt=234(PartyPlayerJoined)只打日志**（C6 已解决）: GUID 匹配补 ObjectId；未命中新增 pendingName 成员，evt=29 OnNewCharacter 反查补名（唯一候选才提交，10 分钟超时降级 UnresolvedMember）
 4. **LocalPlayerObjectId fallback局限**: 只在第一次捡钱时触发，启动后一直没捡钱则LocalPlayerObjectId为null
 5. **收益模块**: evt=71(UpdateMoney)在旧版注释里，实际是evt=81，已改用TakeSilver方式
 6. **数据目录**: data/目录（items.json/mobs.json等）已在.gitignore中，需要从SAT项目或Albion Data Project获取
+7. **evt=239/241/243 参数布局未实机验证**（C6）: 每个分支 ReportStatus 打印完整原始参数（DescribeParams），实机确认前按保守语义处理（239 不加人、241 只换队长、243 只刷活跃度不碰金额——金额归 C7 收益模块）
+
+## C6 队伍状态架构（R7）
+- **唯一来源**: `src/Core/Party/PartyState.cs`——五事件增量重建（230 全量重建/GUID 绑定、234 GUID 精确匹配或 pendingName 入队、239 保守刷新、241 双路兜底换队长、243 只刷活跃度）+ evt=29 pending 反查
+- **落盘**: `src/Core/Party/PartyCacheStore.cs`——party-cache.json（与 settings.json 同目录），schemaVersion=1，原子写（.tmp+File.Replace），2 秒防抖，解析失败/schemaVersion>1 降级空名单
+- **数据诚实性**: verified=false 时战斗页横幅「缓存未验证」+ 卡片标题「（名单未验证）」+「本次不使用旧名单」按钮；仍按旧名单过滤（比不过滤更接近预期）但必须显式标注为推断
+- **GameEvents 转发**: IsInParty/PartyMemberCount/PartyMemberSnapshot/IsPartyMember 全部转发 PartyState；旧 ClearParty/AddPartyName 已删除（写路径收敛）
+- **测试**: T-11（增量重建 16 断言）、T-12（pending 反查三态 5 断言）、T-13/T-13b（缓存降级与抑制 19 断言），累计 216 断言全绿
 
 ## 调试
 - 事件日志: `bin\Debug\net8.0-windows\events.log`（记录所有游戏事件码和参数）

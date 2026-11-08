@@ -3,6 +3,7 @@ using System.IO;
 using System.Threading;
 using System.Windows.Forms;
 using AlbionCompanion.Core;
+using AlbionCompanion.Core.Party;
 
 namespace AlbionCompanion.UI
 {
@@ -43,6 +44,10 @@ namespace AlbionCompanion.UI
                 // R1/C3：播种「我的角色」手选名（弱兜底：等 evt=29 名字命中再绑定 ObjectId）
                 if (!string.IsNullOrEmpty(settings.LocalPlayerName))
                     LocalPlayerIdentity.SetManualName(settings.LocalPlayerName);
+
+                // R7/C6：恢复上一会话的队伍名单（§7.6）——重启后一律降级 verified=false
+                //（StaleFromPreviousSession），直到本会话收到真实队伍事件（230/234）才转正
+                PartyState.LoadOrRestore(dir);
 
                 runtime.DbPath = Path.Combine(dir, "market-db.csv");
                 runtime.Db = MarketDb.Load(runtime.DbPath);

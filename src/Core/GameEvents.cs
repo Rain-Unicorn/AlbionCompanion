@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text;
+using AlbionCompanion.Core.Party;
 
 namespace AlbionCompanion.Core
 {
@@ -22,40 +23,24 @@ namespace AlbionCompanion.Core
         public static long? LocalPlayerObjectId => LocalPlayerIdentity.ConfirmedObjectId;
         public static string LocalPlayerName => LocalPlayerIdentity.ConfirmedName ?? "";
 
-        // 队伍成员名字集合（从 PartyJoined/PartyPlayerJoined 事件解析）
-        // CD 承载：抓包线程 Clear/Add 与 UI 线程 Contains/枚举并发安全。
-        private static readonly ConcurrentDictionary<string, byte> _partyMembers =
-            new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+        // R7/C6：队伍名集合迁入 PartyState（唯一来源，含 party-cache.json 落盘与未验证标注态），
+        // 本类只保留只读转发（设计 §6 迁移表：PartyMemberNames → PartyState）。
+        // 旧的 ClearParty/AddPartyName/AddPartyNames 已删除——§7.7 自检要求
+        // 队伍名集合的写路径全部收敛到 PartyState。
 
         // SAT 核心伤害统计追踪器（照搬 SAT 逻辑）
         public static DamageMeter.DamageStatsTracker DamageTracker = new DamageMeter.DamageStatsTracker();
 
-        /// <summary>当前是否在队伍中</summary>
-        public static bool IsInParty => _partyMembers.Count > 0;
+        /// <summary>当前是否在队伍中（R7/C6 转发：含「本次不使用旧名单」抑制语义）</summary>
+        public static bool IsInParty => PartyState.IsInParty;
 
-        /// <summary>队伍成员数</summary>
-        public static int PartyMemberCount => _partyMembers.Count;
+        /// <summary>队伍成员数（转发 PartyState）</summary>
+        public static int PartyMemberCount => PartyState.MemberCount;
 
-        /// <summary>队伍成员快照（UI 只读，避免枚举活集合）</summary>
-        public static string[] PartyMemberSnapshot() => _partyMembers.Keys.ToArray();
+        /// <summary>队伍成员快照（UI 只读，转发 PartyState）</summary>
+        public static string[] PartyMemberSnapshot() => PartyState.GetMemberNames();
 
-        /// <summary>清空队伍名单（抓包线程调用）</summary>
-        public static void ClearParty() => _partyMembers.Clear();
-
-        /// <summary>加入单个队伍成员</summary>
-        public static void AddPartyName(string name)
-        {
-            if (!string.IsNullOrEmpty(name)) _partyMembers[name] = 0;
-        }
-
-        /// <summary>批量加入队伍成员（重复名天然幂等）</summary>
-        public static void AddPartyNames(IEnumerable<string> names)
-        {
-            if (names == null) return;
-            foreach (var n in names) AddPartyName(n);
-        }
-
-        /// <summary>判断某个玩家是否是队伍成员（含本地玩家自己）</summary>
+        /// <summary>判断某个玩家是否是队伍成员（含本地玩家自己；名单来源 PartyState）</summary>
         public static bool IsPartyMember(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
@@ -63,7 +48,7 @@ namespace AlbionCompanion.Core
             // 确认后=确认名），废弃旧的硬编码自称字面量（设计 §4.7 自检项）。
             if (!string.IsNullOrEmpty(LocalPlayerIdentity.DisplaySelfName) && name == LocalPlayerIdentity.DisplaySelfName) return true;
             if (!string.IsNullOrEmpty(LocalPlayerName) && name == LocalPlayerName) return true;
-            return _partyMembers.ContainsKey(name);
+            return PartyState.ContainsName(name);
         }
 
         // 战斗
