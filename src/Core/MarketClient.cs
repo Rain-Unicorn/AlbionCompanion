@@ -122,6 +122,22 @@ namespace AlbionCompanion.Core
             return client;
         }
 
+        /// <summary>
+        /// 单个 URL 段（物品名 / 城市名）的编码。AODP 的 item_id 与 city 都在 URL 段里，
+        /// 必须按 RFC 3986 完整转义：空格 → %20、'+' → %2B、'&amp;' → %26、'%' → %25、'\'' → %27、别名词里的 '@' → %40。
+        /// 旧实现只 Replace(" ", "%20")，物品名里出现上面任一字符时拼出的 URL 会与
+        /// PriceBatcher.EstimateUrlLength 的估算不一致 → 估算偏小 → 切出实际超长的批次（AODP 4096 上限）。
+        /// 把编码收敛到这一个函数，BuildPriceUrl 与切批估算同源，估算 = 实际。
+        /// （实测：east 端点对 T4_BAG@1 与 T4_BAG%401 都返回 200，编码与非编码等价，故统一走转义更稳。）
+        /// </summary>
+        public static string EncodeSegment(string raw)
+        {
+            if (raw == null) return "";
+            string trimmed = raw.Trim();
+            if (trimmed.Length == 0) return "";
+            return Uri.EscapeDataString(trimmed);
+        }
+
         public static string BuildPriceUrl(string[] items, string[] locations)
         {
             var cleanItems = new List<string>();
@@ -129,9 +145,8 @@ namespace AlbionCompanion.Core
             {
                 foreach (var raw in items)
                 {
-                    if (raw == null) continue;
-                    string trimmed = raw.Trim().Replace(" ", "%20");
-                    if (trimmed.Length > 0) cleanItems.Add(trimmed);
+                    string encoded = EncodeSegment(raw);
+                    if (encoded.Length > 0) cleanItems.Add(encoded);
                 }
             }
             var cleanCities = new List<string>();
@@ -139,9 +154,8 @@ namespace AlbionCompanion.Core
             {
                 foreach (var raw in locations)
                 {
-                    if (raw == null) continue;
-                    string trimmed = raw.Trim().Replace(" ", "%20");
-                    if (trimmed.Length > 0) cleanCities.Add(trimmed);
+                    string encoded = EncodeSegment(raw);
+                    if (encoded.Length > 0) cleanCities.Add(encoded);
                 }
             }
             return ServerBaseUrl + PricesPath + string.Join(",", cleanItems)
@@ -258,10 +272,23 @@ namespace AlbionCompanion.Core
                 {
                     var content = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
                     throw new HttpRequestException("AODP HTTP " + (int)resp.StatusCode + "：" + url +
-                                                   (content.Length > 200 ? "" : " " + content));
+                                                   ErrorContext(content));
                 }
                 return await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             }
+        }
+
+        /// <summary>
+        /// 非 2xx 响应体的上下文片段。旧写法 <c>content.Length &gt; 200 ? "" : " " + content</c> 把判断写反了：
+        /// 响应体一长反而整段丢掉，而 AODP 的 429 说明（"Throttled, be nice to the server… Throttle resets at …"）
+        /// 正是排查限流唯一的信息来源。这里改为：有内容就带上，超过 200 字符截断并标出截断，永不静默丢弃。
+        /// </summary>
+        public static string ErrorContext(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return "";
+            const int keep = 200;
+            if (content.Length <= keep) return " " + content;
+            return " " + content.Substring(0, keep) + "…(响应体共 " + content.Length + " 字符，已截断)";
         }
 
         private static long ReadLongElem(JsonElement elem, string key)

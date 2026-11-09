@@ -36,15 +36,26 @@ namespace AlbionCompanion.Core
     public class MarketCacheEntry
     {
         public MarketQuote Quote;
-        /// <summary>该缓存项的 TTL（写入时的查询用途定档；读取方按自己的用途档判定新鲜度）。</summary>
+        /// <summary>
+        /// 写入时按查询用途定档的 TTL（30 分钟手动 / 4 小时估值），是这条数据**声明有效**的上限。
+        /// 读取时必须参与判定（见 <see cref="IsFresh"/>）：只写不读会让下一个读代码的人以为 TTL 可配。
+        /// </summary>
         public TimeSpan Ttl;
         public DateTimeOffset FetchedAt;
         /// <summary>false = 该键 AODP 无上报行（合成"暂无上报数据"条目，避免每轮都重打）。</summary>
         public bool HasResponse;
 
+        /// <summary>
+        /// 新鲜度 = 年龄 &lt; min(写入档 TTL, 读取方要求的 TTL)。
+        /// 取 min 的理由：写入时那次拉取只承诺了「我这数据在 30 分钟内可信」，读取方再宽容（估值 4 小时档）
+        /// 也不得把别人 30 分钟前拉到的价当成 4 小时有效的价——否则跑商估值会拿旧价算净利。
+        /// 代价是估值侧会多一些重拉，但重拉走批量 + 限流器，成本可控；把旧价当新价的代价不可控。
+        /// </summary>
         public bool IsFresh(DateTimeOffset now, TimeSpan readerTtl)
         {
-            return (now - FetchedAt) < readerTtl;
+            var bound = readerTtl;
+            if (Ttl > TimeSpan.Zero && Ttl < bound) bound = Ttl;
+            return (now - FetchedAt) < bound;
         }
     }
 
@@ -105,7 +116,11 @@ namespace AlbionCompanion.Core
             return url.Length;
         }
 
-        /// <summary>按 URL 长度切批：逐物品累积，超限即切；单个超长物品独占一批（物品名不可再分）。</summary>
+        /// <summary>
+        /// 按 URL 长度切批：逐物品累积，超限即切；单个超长物品独占一批（物品名不可再分）。
+        /// 长度按**编码后**的段计（与 BuildPriceUrl 同源），否则带 '@' / '+' / '&amp;' / '%' 的物品名会被算短，
+        /// 切出实际超出 urlLimit 的批次。
+        /// </summary>
         public static List<List<string>> CreatePriceBatches(IReadOnlyList<string> items,
             IReadOnlyCollection<string> cities, int urlLimit = DefaultUrlLimit)
         {
@@ -116,20 +131,20 @@ namespace AlbionCompanion.Core
             string sampleUrl = MarketClient.BuildPriceUrl(new[] { "X" }, cities != null ? cities.ToArray() : new string[0]);
             int overhead = sampleUrl.Length - 1; // 去掉占位的 "X"
             var current = new List<string>();
-            int used = 0; // 当前批物品部分长度（含逗号）
+            int used = 0; // 当前批物品部分长度（编码后，含逗号）
 
             foreach (var raw in items)
             {
                 if (string.IsNullOrEmpty(raw)) continue;
                 string id = raw.Trim();
                 if (id.Length == 0) continue;
-                int cost = id.Length + (current.Count > 0 ? 1 : 0); // 非首批物品多一个逗号
+                int cost = MarketClient.EncodeSegment(id).Length + (current.Count > 0 ? 1 : 0); // 非首批物品多一个逗号
                 if (current.Count > 0 && overhead + used + cost > urlLimit)
                 {
                     batches.Add(current);
                     current = new List<string>();
                     used = 0;
-                    cost = id.Length;
+                    cost = MarketClient.EncodeSegment(id).Length;
                 }
                 current.Add(id);
                 used += cost;
@@ -255,7 +270,20 @@ namespace AlbionCompanion.Core
 
         // single-flight：URL → 在途请求（同一批并发去重为一个）
         private readonly object _inFlightSync = new object();
-        private readonly Dictionary<string, Task<string>> _inFlight = new Dictionary<string, Task<string>>();
+        private readonly Dictionary<string, InFlightRequest> _inFlight = new Dictionary<string, InFlightRequest>();
+
+        /// <summary>
+        /// 一个在途请求 + 引用计数。**谁都不能在自己完成后就把在途项删掉**（旧实现每个 awaiter 都在
+        /// 自己的 finally 里 RemoveInFlight，第一个完成的就把共享项删了，后来者只能另开一次请求，
+        /// 去重形同虚设）。规则：最后一个引用者释放时才移除，且移除时校验仍是同一个项。
+        /// </summary>
+        private sealed class InFlightRequest
+        {
+            public Task<string> Task;
+            public int Refs;
+            /// <summary>这次在途请求自己的超时 + 创建者 ct 链接源；最后一个引用者离开时释放/取消。</summary>
+            public CancellationTokenSource Cts;
+        }
 
         /// <summary>fetchUrl / clock / limiter 可注入以便单测；默认走 MarketClient（带 429 退避）。</summary>
         public MarketDataService(
@@ -286,6 +314,7 @@ namespace AlbionCompanion.Core
             IReadOnlyCollection<int> qualities = null,
             CancellationToken ct = default)
         {
+            ct.ThrowIfCancellationRequested();
             var itemList = NormalizeItems(items);
             var cityList = NormalizeCities(cities);
             var qualityList = NormalizeQualities(qualities);
@@ -302,7 +331,7 @@ namespace AlbionCompanion.Core
                 foreach (var batch in batches)
                 {
                     string url = MarketClient.BuildPriceUrl(batch.ToArray(), cityList.ToArray());
-                    fetches.Add(FetchBatchIntoCacheAsync(url, batch, cityList, qualityList, purpose));
+                    fetches.Add(FetchBatchIntoCacheAsync(url, batch, cityList, qualityList, purpose, ct));
                 }
                 await Task.WhenAll(fetches.ToArray()).ConfigureAwait(false);
             }
@@ -370,80 +399,159 @@ namespace AlbionCompanion.Core
 
         /// <summary>single-flight 拉一批物品并写入缓存；同一 URL 的并发调用共享一个在途请求。</summary>
         private async Task FetchBatchIntoCacheAsync(string url, List<string> batch,
-            List<string> cities, List<int> qualities, MarketQueryPurpose purpose)
+            List<string> cities, List<int> qualities, MarketQueryPurpose purpose, CancellationToken ct)
         {
             // 限流优先级由在途请求的创建者决定：手动查询创建的批次按高优先级入队；
             // 后台刷新先建、手动后到的共享同一在途请求（等待 ≤ 一次请求时长，可接受）。
-            var shared = GetOrCreateInFlight(url, priority: purpose == MarketQueryPurpose.ManualQuery);
-            string body;
+            //
+            // 引用（lease）一直持有到**缓存写完**才释放——若在「HTTP 完成」就释放，
+            // 中间那段解析 + 写缓存的窗口里来的第三个调用会看不到在途项、另发一次同 URL 请求，
+            // 去重就只在毫秒级偶然生效。释放点落在写缓存之后，后来者一定命中新鲜缓存。
+            var lease = AcquireInFlight(url, purpose == MarketQueryPurpose.ManualQuery, ct);
             try
             {
-                body = await shared.ConfigureAwait(false);
-            }
-            finally
-            {
-                RemoveInFlight(url);
-            }
+                string body = await AwaitLeaseAsync(lease, ct).ConfigureAwait(false);
 
-            var now = _clock();
-            var ttl = MarketCacheTtl.For(purpose);
-            var parsed = MarketClient.Parse(body, now);
-            var byKey = new Dictionary<string, MarketQuote>();
-            foreach (var q in parsed) byKey[MarketDataCache.Key(q.ItemId, q.City, q.Quality)] = q;
+                var now = _clock();
+                var ttl = MarketCacheTtl.For(purpose);
+                var parsed = MarketClient.Parse(body, now);
+                var byKey = new Dictionary<string, MarketQuote>();
+                foreach (var q in parsed) byKey[MarketDataCache.Key(q.ItemId, q.City, q.Quality)] = q;
 
-            foreach (var item in batch)
-            {
-                foreach (var city in cities)
+                foreach (var item in batch)
                 {
-                    foreach (var q in qualities)
+                    foreach (var city in cities)
                     {
-                        MarketQuote quote;
-                        if (!byKey.TryGetValue(MarketDataCache.Key(item, city, q), out quote))
+                        foreach (var q in qualities)
                         {
-                            // AODP 无该键上报行：合成"暂无上报数据"条目（短 TTL 同档），避免反复重打
-                            quote = new MarketQuote
+                            MarketQuote quote;
+                            if (!byKey.TryGetValue(MarketDataCache.Key(item, city, q), out quote))
                             {
-                                ItemId = item, City = city, Quality = q,
-                                SellMin = 0, SellMinDate = "", BuyMax = 0, BuyMaxDate = "",
-                                SellHasData = false, SellStale = false
-                            };
+                                // AODP 无该键上报行：合成"暂无上报数据"条目（短 TTL 同档），避免反复重打
+                                quote = new MarketQuote
+                                {
+                                    ItemId = item, City = city, Quality = q,
+                                    SellMin = 0, SellMinDate = "", BuyMax = 0, BuyMaxDate = "",
+                                    SellHasData = false, SellStale = false
+                                };
+                            }
+                            _cache.Put(new MarketCacheEntry
+                            {
+                                Quote = quote.Clone(), Ttl = ttl, FetchedAt = now, HasResponse = true
+                            });
                         }
-                        _cache.Put(new MarketCacheEntry
-                        {
-                            Quote = quote.Clone(), Ttl = ttl, FetchedAt = now, HasResponse = true
-                        });
                     }
                 }
             }
-        }
-
-        private Task<string> GetOrCreateInFlight(string url, bool priority)
-        {
-            lock (_inFlightSync)
+            finally
             {
-                Task<string> t;
-                if (!_inFlight.TryGetValue(url, out t))
-                {
-                    t = FetchWithLimiterAsync(url, priority);
-                    _inFlight[url] = t;
-                }
-                return t;
+                ReleaseInFlight(url, lease);
             }
         }
 
-        private void RemoveInFlight(string url)
+        /// <summary>一次在途请求的引用凭证：同一个 URL 的并发调用共享同一个 <see cref="InFlightRequest"/>。</summary>
+        private sealed class InFlightLease
         {
-            lock (_inFlightSync) { _inFlight.Remove(url); }
+            public InFlightRequest Owner;
         }
 
-        /// <summary>限流器管住每次实际 HTTP 请求；失败向上抛（由调用方决定停止本轮）。</summary>
-        private async Task<string> FetchWithLimiterAsync(string url, bool priority)
+        /// <summary>
+        /// 取（或创建）同一 URL 的在途请求的引用。引用计数保证「第一个完成者不会把在途项删掉」：
+        /// 只有最后一个引用者释放时才移除，且移除前校验字典里仍是同一个实例（防误删后来者新建的项）。
+        /// 取消语义：在途请求的令牌 = <c>CreateLinkedTokenSource(创建者 ct)</c>（P1-2 修正），
+        /// 所以创建者取消会真的中断那次 HTTP；后到的 awaiter 各自取消只放弃等待，不牵连别人。
+        /// </summary>
+        private InFlightLease AcquireInFlight(string url, bool priority, CancellationToken ct)
         {
+            lock (_inFlightSync)
+            {
+                InFlightRequest req;
+                if (!_inFlight.TryGetValue(url, out req))
+                {
+                    req = new InFlightRequest { Refs = 0 };
+                    // 在途请求自己的超时 + 创建者 ct 的链接（不再自建一个无视调用方 ct 的源）
+                    req.Cts = CancelAfterLinked(ct, TimeSpan.FromSeconds(_timeoutSeconds));
+                    req.Task = FetchWithLimiterAsync(url, priority, req.Cts.Token);
+                    _inFlight[url] = req;
+                }
+                req.Refs++;
+                return new InFlightLease { Owner = req };
+            }
+        }
+
+        private static async Task<string> AwaitLeaseAsync(InFlightLease lease, CancellationToken ct)
+        {
+            var task = lease.Owner.Task;
+            if (!ct.CanBeCanceled) return await task.ConfigureAwait(false);
+
+            // 自己和别人共享的那次请求并存：自己取消只是不再等，不把全体 awaiter 拉下水
+            var cancelTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using (ct.Register(delegate { cancelTcs.TrySetResult(true); }))
+            {
+                var completed = await Task.WhenAny(task, cancelTcs.Task).ConfigureAwait(false);
+                if (completed != task) ct.ThrowIfCancellationRequested();
+            }
+            return await task.ConfigureAwait(false);
+        }
+
+        /// <summary>CreateLinkedTokenSource + 超时（无传入 ct 时等价于纯超时）。</summary>
+        internal static CancellationTokenSource CancelAfterLinked(CancellationToken ct, TimeSpan timeout)
+        {
+            var cts = ct.CanBeCanceled
+                ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+                : new CancellationTokenSource();
+            cts.CancelAfter(timeout);
+            return cts;
+        }
+
+        private void ReleaseInFlight(string url, InFlightLease lease)
+        {
+            var req = lease == null ? null : lease.Owner;
+            if (req == null) return;
+            bool last;
+            lock (_inFlightSync)
+            {
+                req.Refs--;
+                last = req.Refs <= 0;
+                if (last)
+                {
+                    InFlightRequest current;
+                    if (_inFlight.TryGetValue(url, out current) && ReferenceEquals(current, req))
+                        _inFlight.Remove(url);
+                }
+            }
+            if (!last) return; // 还有别的 awaiter 在用，保留在途项供其共享同一结果
+            // 最后一个引用者走了：没人要结果了，未完成就中断那次 HTTP（不让它在后台空转到超时）
+            var cts = req.Cts;
+            if (cts == null) return;
+            if (!req.Task.IsCompleted)
+            {
+                try { cts.Cancel(); } catch (ObjectDisposedException) { }
+                req.Task.ContinueWith(delegate { cts.Dispose(); }, TaskScheduler.Default);
+            }
+            else
+            {
+                cts.Dispose();
+            }
+        }
+
+        /// <summary>当前在途请求数（诊断 / 单测用：证明去重不是被第一个完成者删掉的假去重）。</summary>
+        public int InFlightCount
+        {
+            get { lock (_inFlightSync) { return _inFlight.Count; } }
+        }
+
+        /// <summary>限流器管住每次实际 HTTP 请求；失败向上抛（由调用方决定停止本轮）。
+        /// ct 必须接进来（旧实现自建 CancellationTokenSource 把调用方 ct 丢了，取消按钮无效）。</summary>
+        private async Task<string> FetchWithLimiterAsync(string url, bool priority, CancellationToken ct)
+        {
+            // 先判取消再抢名额：已取消的调用不该白占一个限流名额（名额是 60rpm 的稀缺资源）
+            ct.ThrowIfCancellationRequested();
             await _limiter.AcquireAsync(priority).ConfigureAwait(false);
             try
             {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_timeoutSeconds));
-                return await _fetchUrl(url, cts.Token).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+                return await _fetchUrl(url, ct).ConfigureAwait(false);
             }
             finally
             {

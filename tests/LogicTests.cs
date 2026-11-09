@@ -584,7 +584,8 @@ static class LogicTests
 
         // A4 市场
         string url = MarketClient.BuildPriceUrl(new[] { "T4_BAG", "T5_2H_BOW@2" }, new[] { "Caerleon", "Bridgewatch" });
-        Check("A4 URL 含物品列表", url.Contains("T4_BAG,T5_2H_BOW@2"), url);
+        // P2-6：物品名按 RFC 3986 完整转义（'@' → %40），估算与实际同源
+        Check("A4 URL 含物品列表", url.Contains("T4_BAG,T5_2H_BOW%402"), url);
         Check("A4 URL 含城市参数", url.Contains("locations=Caerleon,Bridgewatch"), url);
         Check("A4 URL 指向 AODP east 基址（M1 定案：亚服）",
             url.StartsWith(AodpServers.East + "stats/prices/"), url);
@@ -1754,10 +1755,20 @@ static class LogicTests
                 entry.IsFresh(baseTime.AddMinutes(29), MarketCacheTtl.ManualQuery), "应新鲜");
             Check("M2 30 分钟档：+31 分钟已过期",
                 !entry.IsFresh(baseTime.AddMinutes(31), MarketCacheTtl.ManualQuery), "应过期");
+            // P2-5：写入档 TTL 参与判定（min(写入档, 读取方档)）——
+            // 30 分钟档写入的数据，估值读者（4 小时档）也不能当成 4 小时内有效。
+            Check("M2 写入 30 分钟档：估值读者 +3 小时已过期（旧价不得进估值）",
+                !entry.IsFresh(baseTime.AddHours(3), MarketCacheTtl.Valuation), "应过期");
+            var valEntry = new MarketCacheEntry
+            {
+                Quote = new MarketQuote { ItemId = "T4_BAG", City = "Caerleon", Quality = 1 },
+                Ttl = MarketCacheTtl.For(MarketQueryPurpose.Valuation),
+                FetchedAt = baseTime
+            };
             Check("M2 4 小时档：+3 小时仍新鲜",
-                entry.IsFresh(baseTime.AddHours(3), MarketCacheTtl.Valuation), "应新鲜");
+                valEntry.IsFresh(baseTime.AddHours(3), MarketCacheTtl.Valuation), "应新鲜");
             Check("M2 4 小时档：+4 小时 1 分已过期",
-                !entry.IsFresh(baseTime.AddHours(4).AddMinutes(1), MarketCacheTtl.Valuation), "应过期");
+                !valEntry.IsFresh(baseTime.AddHours(4).AddMinutes(1), MarketCacheTtl.Valuation), "应过期");
             Eq("M2 缓存键三元组", MarketDataCache.Key("T4_BAG", "Caerleon", 3), "T4_BAG|Caerleon|3");
 
             // M2-2 0 价过滤 / 陈旧标记（Parse 层）
@@ -1902,6 +1913,119 @@ static class LogicTests
             catch (MarketRateLimitedException) { threw = true; }
             Check("M2 限流异常上抛（不裸重试）", threw, "应抛 MarketRateLimitedException");
             Eq("M2 失败不写入缓存", failing.CachedEntryCount, 0);
+
+            // ───── P1-1 single-flight 引用计数：第一个完成者不得删掉在途项 ─────
+            // 造一个「两个 awaiter 都还没返回」的窗口：fetch 一次性放行，两个调用都进入等待，
+            // 第一个 awaiter 的 finally 若把 _inFlight 删掉，第二个 awaiter 就会另发一次请求。
+            {
+                int calls2 = 0;
+                var gate = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var svc2 = new MarketDataService(
+                    delegate (string u, CancellationToken tk) { calls2++; return gate.Task; },
+                    () => svcClockTime,
+                    new MarketRateLimiter(600));
+                var c1 = svc2.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" }, MarketQueryPurpose.ManualQuery);
+                var c2 = svc2.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" }, MarketQueryPurpose.ManualQuery);
+                var c3 = svc2.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" }, MarketQueryPurpose.ManualQuery);
+                Check("M2 单飞：三个并发只建 1 个在途请求", calls2 == 1, "实际请求数=" + calls2);
+                Eq("M2 单飞：在途请求数 = 1", svc2.InFlightCount, 1);
+                gate.SetResult(m2Body);
+                Task.WhenAll(c1, c2, c3).GetAwaiter().GetResult();
+                Eq("M2 单飞：三个并发调用仍只有 1 次真实请求（不是被第一个完成者删掉的假去重）", calls2, 1);
+                Check("M2 单飞：三个调用都拿到结果", c1.Result.Count > 0 && c2.Result.Count > 0 && c3.Result.Count > 0,
+                    "c1=" + c1.Result.Count + " c2=" + c2.Result.Count + " c3=" + c3.Result.Count);
+                Eq("M2 单飞：全部完成后在途项清空", svc2.InFlightCount, 0);
+            }
+
+            // ───── P1-2 调用方 ct 不得被丢弃 ─────
+            {
+                var svc3 = new MarketDataService(
+                    delegate (string u, CancellationToken tk) { return Task.FromResult(m2Body); },
+                    () => svcClockTime,
+                    new MarketRateLimiter(600));
+                var pre = new CancellationTokenSource();
+                pre.Cancel();
+                bool cancelThrew = false;
+                try
+                {
+                    svc3.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" },
+                        MarketQueryPurpose.ManualQuery, null, pre.Token).GetAwaiter().GetResult();
+                }
+                catch (OperationCanceledException) { cancelThrew = true; }
+                Check("M2 ct：已取消的 ct 直接抛 OperationCanceledException", cancelThrew, "应抛取消异常");
+
+                // 在途期间的取消：fetch 挂住，取消 ct 后调用方立刻返回（不把全体 awaiter 拉下水）
+                int calls3 = 0;
+                var hang = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var svc4 = new MarketDataService(
+                    delegate (string u, CancellationToken tk) { calls3++; return hang.Task; },
+                    () => svcClockTime,
+                    new MarketRateLimiter(600));
+                var live = new CancellationTokenSource();
+                var pending = svc4.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Lymhurst" },
+                    MarketQueryPurpose.ManualQuery, null, live.Token);
+                live.Cancel();
+                bool midCancel = false;
+                try { pending.GetAwaiter().GetResult(); }
+                catch (OperationCanceledException) { midCancel = true; }
+                Check("M2 ct：在途中取消，调用方即时抛取消异常", midCancel && calls3 == 1, "应即时取消");
+                hang.SetResult(m2Body); // 收尾，避免悬空任务
+            }
+
+            // ───── P2-6 转义：估算 = 实际，且切批不越界 ─────
+            {
+                var nasty = new[] { "T4_BAG'X", "T4_BAG&Y", "T4_BAG+Z", "T4_BAG%W", "T5_2H_BOW@2", "T4_AXE" };
+                var nastyCities = new[] { "Fort Sterling", "Thetford" };
+                foreach (var id in nasty)
+                {
+                    string one = MarketClient.BuildPriceUrl(new[] { id }, nastyCities);
+                    Eq("P2-6 编码长度与实际一致（" + id + "）",
+                        PriceBatcher.EstimateUrlLength(new[] { id }, nastyCities), one.Length);
+                }
+                Check("P2-6 '&' 必须转义为 %26（否则 URL 会被截断）",
+                    MarketClient.EncodeSegment("A&B") == "A%26B", MarketClient.EncodeSegment("A&B"));
+                Check("P2-6 ''' 必须转义为 %27", MarketClient.EncodeSegment("A'B") == "A%27B",
+                    MarketClient.EncodeSegment("A'B"));
+                Check("P2-6 '+' 必须转义为 %2B（否则被当成空格）",
+                    MarketClient.EncodeSegment("A+B") == "A%2BB", MarketClient.EncodeSegment("A+B"));
+                Check("P2-6 '%' 必须转义为 %25", MarketClient.EncodeSegment("A%B") == "A%25B",
+                    MarketClient.EncodeSegment("A%B"));
+
+                // 大批含特殊字符物品：每批实际 URL 必须 ≤ 3000（不是估算 ≤ 3000）
+                var nastyMany = new List<string>();
+                for (int i = 0; i < 200; i++) nastyMany.Add("T8_MAIN_FIRESTAFF_&+'%@2_" + i.ToString("0000"));
+                var nastyBatches = PriceBatcher.CreatePriceBatches(nastyMany, batchCities);
+                bool actualOk = true;
+                string worst = "";
+                foreach (var b in nastyBatches)
+                {
+                    int actual = MarketClient.BuildPriceUrl(b.ToArray(), batchCities).Length;
+                    if (actual > PriceBatcher.DefaultUrlLimit) { actualOk = false; worst = actual + " 字符"; }
+                }
+                Check("P2-6 含特殊字符时每批实际 URL ≤ 3000", actualOk && nastyBatches.Count >= 2,
+                    "批数=" + nastyBatches.Count + " " + worst);
+
+                // 城市名带空格（Fort Sterling）也必须编码
+                Check("P2-6 城市名空格编码为 %20",
+                    MarketClient.BuildPriceUrl(new[] { "T4_BAG" }, new[] { "Fort Sterling" })
+                        .Contains("Fort%20Sterling"), MarketClient.EncodeSegment("Fort Sterling"));
+            }
+
+            // ───── P2-7 非 2xx 响应体上下文：宁可截断不可丢弃 ─────
+            {
+                string shortBody = "Throttled, be nice to the server!";
+                Check("P2-7 短响应体原样带上",
+                    MarketClient.ErrorContext(shortBody).Contains(shortBody), MarketClient.ErrorContext(shortBody));
+                var longBody = new StringBuilder();
+                for (int i = 0; i < 400; i++) longBody.Append('x');
+                string ctx = MarketClient.ErrorContext(longBody.ToString());
+                Check("P2-7 长响应体不再被整段丢弃（截断并标注）",
+                    ctx.Length > 0 && ctx.Contains("已截断") && ctx.Contains("400"), ctx);
+                Check("P2-7 长响应体保留开头 200 字符",
+                    ctx.Contains(new string('x', 200)), "应保留前 200 字符");
+                Check("P2-7 空响应体不产生多余空白", MarketClient.ErrorContext("") == "" &&
+                    MarketClient.ErrorContext(null) == "", "应为空串");
+            }
         }
 
         // ───────────────── C8/Bug A：未解析目标不得显示裸 ObjectId ─────────────────
