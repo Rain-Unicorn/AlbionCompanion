@@ -33,6 +33,14 @@ namespace AlbionCompanion.Core.Income
     public sealed class IncomeSummary
     {
         public long ConfirmedTotal;       // 已确认合计（银币）
+        /// <summary>
+        /// 本次会话已确认合计：**不含**启动时从 JSONL 恢复的历史记录。
+        /// 悬浮条「本次收益/时薪」、总览卡片必须用它；收益页「总收益」才用 <see cref="ConfirmedTotal"/>。
+        /// （实机 bug：旧实现把历史恢复直接并进 _confirmed，新会话一启动就显示 4.3K 收益、
+        ///  时薪 = 历史收益/会话时长，数字每秒剧烈变化，看起来像「收益自己加」。）
+        /// </summary>
+        public long SessionTotal;
+        public int SessionCount;          // 本次会话已确认条数（不含历史恢复）
         public long SelfTotal;            // 本地玩家已确认合计（确认入口只有「是我」一条路径，恒等于 ConfirmedTotal）
         public long SilverPickupTotal;    // 来源小计：拾取银币（已确认，§8.3.2）
         public long PartySilverTotal;     // 来源小计：队伍分成（金额未确认前恒为 0）
@@ -58,6 +66,11 @@ namespace AlbionCompanion.Core.Income
         private static readonly object _lock = new object();
         private static readonly List<IncomeRecord> _confirmed = new List<IncomeRecord>();
         private static readonly List<IncomeRecord> _pending = new List<IncomeRecord>();
+
+        // 本次会话起点：LoadRecent 恢复的历史记录只用于「总收益/CSV/持久化」，不得计入「本次收益/时薪」。
+        // 存 sum+count 而不是下标：_confirmed 超过 MaxConfirmed 时会 RemoveRange(0,n)，下标会失效。
+        private static long _sessionBaselineSum;
+        private static int _sessionBaselineCount;
 
         // ---- JSONL 持久化（§8.3.3）：入账即追加，单独写线程消费队列，按日切分 ----
         private static readonly ConcurrentQueue<string> _jsonlQueue = new ConcurrentQueue<string>();
@@ -164,6 +177,10 @@ namespace AlbionCompanion.Core.Income
                 var s = new IncomeSummary();
                 s.ConfirmedTotal = SumLocked(_confirmed);
                 s.SelfTotal = s.ConfirmedTotal; // 确认入口只有「是我」一条路径，二者恒等（§8.3.1）
+                s.SessionTotal = s.ConfirmedTotal - _sessionBaselineSum;
+                if (s.SessionTotal < 0) s.SessionTotal = 0;
+                s.SessionCount = _confirmed.Count - _sessionBaselineCount;
+                if (s.SessionCount < 0) s.SessionCount = 0;
                 s.SilverPickupTotal = SumSourceLocked(_confirmed, IncomeSource.SilverPickup);
                 s.PartySilverTotal = SumSourceLocked(_confirmed, IncomeSource.PartySilver);
                 s.GatheringSaleTotal = SumSourceLocked(_confirmed, IncomeSource.GatheringSale);
@@ -193,7 +210,7 @@ namespace AlbionCompanion.Core.Income
 
         public static void Reset()
         {
-            lock (_lock) { _confirmed.Clear(); _pending.Clear(); }
+            lock (_lock) { _confirmed.Clear(); _pending.Clear(); _sessionBaselineSum = 0; _sessionBaselineCount = 0; }
         }
 
         // ---- CSV 导出（§8.3.4）：8 列固定顺序、UTF8 BOM、\r\n、Quote 复用 IncomeLedger ----
@@ -290,6 +307,9 @@ namespace AlbionCompanion.Core.Income
             {
                 foreach (var r in loaded) { r.Pending = false; _confirmed.Add(r); }
                 if (_confirmed.Count > MaxConfirmed) _confirmed.RemoveRange(0, _confirmed.Count - MaxConfirmed);
+                // 历史恢复到此为止：之后入账的才算「本次会话」
+                _sessionBaselineSum = SumLocked(_confirmed);
+                _sessionBaselineCount = _confirmed.Count;
             }
         }
 

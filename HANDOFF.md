@@ -128,6 +128,9 @@ src/
   **完全不确认身份**（有意保守：不再「非零即接受」，避免无关响应把用户累计伤害清零）。
 - **取证**：实机启动游戏并登录一次；`events.log` 会出现 `[OpResp] opCode=.. ret=.. keys=[..]` 行
   （复核前该行只进 UI、不落盘，取证链路是断的，现已修复为同时写 events.log）。
+  同时 `[OpRespBytes] len=.. hex=..` 记录原始字节（前 30 条）：实机首跑发现 9 条不同 keys 的响应
+  **opCode 全为 1**，说明 opCode 读取位置/协议布局与实现不符 —— 在字节布局确认前，**禁止**把 1 填进白名单
+  （那会让任意带 p0/p2 的响应确认身份，正是 P0-1 要封的洞）。
 - **收口**：取 `ret=0` 且 `keys` 含 0（UserObjectId）、2（Username）的那条稳定 `opCode`，填进
   `%AppData%\AlbionCompanion\settings.json` 的 `JoinResponseOperationCode`（0=禁用），重启即启用。
   码值越界/负值会回落 0，绝不把脏配置当白名单。

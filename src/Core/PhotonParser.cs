@@ -44,8 +44,13 @@ namespace AlbionCompanion.Core
         /// </remarks>
         public static byte? JoinResponseOperationCode = null;
 
-        /// <summary>最近一次观测到的非零 OperationCode 与其参数键（实机 V1 取证用，不做判定）。</summary>
+        // 最近一次观测到的非零 OperationCode 与其参数键（实机 V1 取证用，不做判定）。
         public static string LastOperationCodeSample = "";
+
+        // 复核 P0：OperationResponse 原始字节留存计数。实机日志出现「9 条不同 keys 的响应 opCode 全为 1」
+        // —— 说明 opCode 读到的不是真实操作码（或协议布局与实现不符）。留原始字节才能定位真实布局；
+        // 只留前 30 条，避免日志膨胀。
+        private static int _opRespDumpCount;
 
         private static int _udpCount;
         private static int _evtCount;
@@ -289,6 +294,7 @@ namespace AlbionCompanion.Core
                 try
                 {
                     var span = new ReadOnlySpan<byte>(d, off, operationLength);
+                    RecordOperationBytes(span);
                     Protocol18.Photon.OperationResponse? opData;
                     try
                     {
@@ -399,6 +405,29 @@ namespace AlbionCompanion.Core
 
             objectId = parsedId;
             return true;
+        }
+
+        /// <summary>
+        /// 复核 P0 取证：把 OperationResponse 的**原始字节**（前 40 字节）落盘，用于判定真实
+        /// operationCode 位置/协议布局。只在启动后前 30 条响应时记录，不影响解析、不参与身份判定。
+        /// </summary>
+        private static void RecordOperationBytes(ReadOnlySpan<byte> body)
+        {
+            if (System.Threading.Interlocked.Increment(ref _opRespDumpCount) > 30) return;
+            var sb = new StringBuilder();
+            sb.Append("[OpRespBytes] len=").Append(body.Length).Append(" hex=");
+            int n = Math.Min(body.Length, 40);
+            for (int i = 0; i < n; i++) sb.Append(body[i].ToString("X2")).Append(' ');
+            string line = sb.ToString().TrimEnd();
+
+            if (OnDebug != null) try { OnDebug("  " + line); } catch { }
+            try
+            {
+                string logPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "events.log");
+                System.IO.File.AppendAllText(logPath,
+                    DateTime.Now.ToString("HH:mm:ss.fff") + " " + line + Environment.NewLine);
+            }
+            catch { /* 取证日志写失败不影响解析 */ }
         }
 
         /// <summary>

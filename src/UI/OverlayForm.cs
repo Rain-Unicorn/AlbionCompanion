@@ -160,7 +160,10 @@ namespace AlbionCompanion.UI
                 TextFormatFlags.NoPrefix);
 
             // R4/C5：总收益改读 IncomeTracker（只含已确认条目），不再用 500 条截断列表求和
-            long total = IncomeTracker.GetSummary().ConfirmedTotal;
+            // 复核修复：悬浮条是「本次会话」口径 —— 必须用 SessionTotal（排除启动时从 JSONL 恢复的历史，
+            // 否则新会话一启动就显示历史累计，时薪= 历史收益/会话时长，数字每秒剧烈变化）
+            var inc = IncomeTracker.GetSummary();
+            long total = inc.SessionTotal;
             TextRenderer.DrawText(g, Th.Money(total), _bigFont, new Point(24, 32), Th.Accent,
                 TextFormatFlags.NoPrefix);
 
@@ -176,8 +179,8 @@ namespace AlbionCompanion.UI
             TextRenderer.DrawText(g, "时长 " + SessionClock.Format(_rt.Elapsed), _lineFont,
                 new Point(204, 14), Th.Text, TextFormatFlags.NoPrefix);
 
-            // R4/C5：时薪入参与大数字同源（IncomeTracker 确认合计），避免两处口径分叉
-            double perHour = SessionClock.PerHour(IncomeTracker.GetSummary().ConfirmedTotal, _rt.Elapsed);
+            // R4/C5：时薪入参与大数字同源（IncomeTracker 本次会话合计），避免两处口径分叉
+            double perHour = SessionClock.PerHour(inc.SessionTotal, _rt.Elapsed);
             string rateText = perHour > 0 ? "时薪 " + Th.Money((long)perHour) + "/时" : "等待收益...";
             TextRenderer.DrawText(g, rateText, _lineFont, new Point(204, 38), Th.Good,
                 TextFormatFlags.NoPrefix);

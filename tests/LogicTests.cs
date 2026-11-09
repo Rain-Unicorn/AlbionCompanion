@@ -2070,6 +2070,9 @@ static class LogicTests
         // ───────────────── 复核 P0：限流器窗口滚动必须自动唤醒排队者（不依赖外部 Release） ─────────────────
         RunRateLimiterWakeTests();
 
+        // ───────────────── 复核：本次会话收益不得混入 JSONL 历史恢复 ─────────────────
+        RunSessionIncomeTests();
+
         // ───────────────── 复核 P0：JoinResponse 码值可配置（0=禁用，越界回落 0） ─────────────────
         RunJoinResponseConfigTests();
 
@@ -2146,5 +2149,54 @@ static class LogicTests
 
         // 4) 队列清空后不得再安排新的唤醒
         Eq("P0 限流器：队列清空后不再重复安排唤醒", wakes.Count, 1);
+    }
+
+    // ───────────────── 复核：本次会话收益不得混入 JSONL 历史恢复 ─────────────────
+    // 实机 bug：新会话启动时 LoadRecent 把历史 JSONL 全量并入 _confirmed，悬浮条「本次收益」
+    // 直接显示历史累计（实机 4.3K），时薪 = 历史收益/会话时长 → 60s 显示 256K、5min 显示 50.6K，
+    // 数字每秒剧烈变化（用户报「收益/时薪一直在自己加」）。
+    // 修法：LoadRecent 记下基线，SessionTotal/SessionCount 只算会话开始后的入账。
+    static void RunSessionIncomeTests()
+    {
+        IncomeTracker.Reset();
+        string dir = Path.Combine(Path.GetTempPath(), "sesstest-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        Directory.CreateDirectory(dir);
+        // 写线程只在自己观察到「日期切换」时建 income/ 子目录；测试里直接建好，避免跨用例目录切换导致的假失败
+        Directory.CreateDirectory(Path.Combine(dir, "income"));
+        try
+        {
+            IncomeTracker.SetPersistDir(dir);
+            IncomeTracker.AddConfirmed(new IncomeRecord
+            {
+                TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币",
+                PickerId = 1, SilverBeforeTax = 100, TaxPaid = 10, SilverAfterTax = 90
+            });
+            IncomeTracker.FlushPendingWrites(5000);
+
+            // 模拟重启：历史恢复
+            IncomeTracker.Reset();
+            IncomeTracker.LoadRecent();
+            var afterLoad = IncomeTracker.GetSummary();
+            Eq("会话收益：历史恢复仍计入总收益", afterLoad.ConfirmedTotal, 90L);
+            Eq("会话收益：历史恢复不计入本次收益（悬浮条/时薪）", afterLoad.SessionTotal, 0L);
+            Eq("会话收益：历史恢复不计入本次条数", afterLoad.SessionCount, 0);
+
+            // 本次会话入账
+            IncomeTracker.AddConfirmed(new IncomeRecord
+            {
+                TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币",
+                PickerId = 1, SilverBeforeTax = 50, TaxPaid = 0, SilverAfterTax = 50
+            });
+            var live = IncomeTracker.GetSummary();
+            Eq("会话收益：本次入账累加到 SessionTotal", live.SessionTotal, 50L);
+            Eq("会话收益：总收益 = 历史 + 本次", live.ConfirmedTotal, 140L);
+            Eq("会话收益：本次条数只算会话内", live.SessionCount, 1);
+        }
+        finally
+        {
+            IncomeTracker.SetPersistDir(null);
+            IncomeTracker.Reset();
+            try { Directory.Delete(dir, true); } catch { }
+        }
     }
 }

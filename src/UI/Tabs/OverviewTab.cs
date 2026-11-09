@@ -72,9 +72,10 @@ namespace AlbionCompanion.UI.Tabs
             var gList = GameEvents.SnapshotGathering();
 
             // 收益（C7/§8.4：一次取齐 GetSummary——合计与明细条数均来自 summary，与收益页/悬浮条同源，§9.7）
+            // 复核修复：总览的「银币收益」是本次会话口径 → SessionTotal/SessionCount（排除 JSONL 历史恢复）
             var incSum = IncomeTracker.GetSummary();
-            _income.SetData("银币收益", Th.Money(incSum.ConfirmedTotal),
-                            "明细 " + incSum.ConfirmedCount + " 条");
+            _income.SetData("银币收益", Th.Money(incSum.SessionTotal),
+                            "本次明细 " + incSum.SessionCount + " 条");
             var income = GameEvents.SnapshotIncome();
 
             // 合并最近动态：三份快照在锁外归并，UI 不再持有活集合
