@@ -366,7 +366,7 @@ namespace AlbionCompanion.Core
                 }
                 // 278 = 本人银币入袋（复核实机发现）：p0=ObjectId、p2=角色名、p3=True、p5=税后原始值。
                 // 实机证据：p5 与 evt=62「p3-税」、evt=81 余额差逐位相等；同一时刻 62/81/278 只有本地玩家一个 id；
-                // 换图/换实例后 ObjectId 会变（114600→115931→115995→187752），故身份按角色名锚定、随本事件重绑。
+                // 换图/换实例后 ObjectId 会变（实测每次换图都不同），故身份按角色名锚定、随本事件重绑。
                 // 只做身份识别，**不入账**（收益仍由 evt=62 记，避免双记）。
                 else if (evt.GameEventCode == 278 && evt.Parameters != null)
                 {
@@ -775,7 +775,7 @@ namespace AlbionCompanion.Core
                     });
                 }
                 // 230 = PartyJoined (加入队伍，收到完整队伍名单)
-                // 实际抓包确认：p8=GUID字节数组(16B/成员)，p9=名字数组 ["laowang0729","aYi777"]
+                // 实际抓包确认：p8=GUID字节数组(16B/成员)，p9=名字数组 ["角色A","角色B"]
                 // R7/C6：整段迁入 PartyState.OnPartyJoined（全量重建 + GUID 绑定 + 落盘，§7.3）
                 else if (evt.GameEventCode == 230 && evt.Parameters != null)
                 {

@@ -1457,7 +1457,7 @@ static class LogicTests
             LocalPlayerIdentity.Reset();
             var g1 = Guid.NewGuid(); var g2 = Guid.NewGuid(); var g3 = Guid.NewGuid();
             byte[] p8 = g1.ToByteArray().Concat(g2.ToByteArray()).ToArray(); // 2 个 GUID
-            string[] p9 = { "laowang0729", "aYi777" };
+            string[] p9 = { "TestChar", "TestChar3" };
             PartyState.OnPartyJoined(p8, p9);
             Eq("T-11 230 全量重建成员数 = 2", PartyState.MemberCount, 2);
             Check("T-11 230 后 Verified = true", PartyState.Verified, "verified=false");
@@ -1466,9 +1466,9 @@ static class LogicTests
                 mems.All(m => m.Confidence == PartyConfidence.PendingObjectId),
                 "有成员不是 pendingObjectId");
 
-            // 234：g1（laowang0729）进战斗，GUID 匹配 → 补 ObjectId
+            // 234：g1（TestChar）进战斗，GUID 匹配 → 补 ObjectId
             PartyState.OnPartyPlayerJoined(5001L, g1.ToByteArray());
-            var lw = PartyState.GetMembers().Find(m => m.Name == "laowang0729");
+            var lw = PartyState.GetMembers().Find(m => m.Name == "TestChar");
             Eq("T-11 234 GUID 匹配后 ObjectId = 5001", lw.ObjectId, 5001L);
             Check("T-11 234 GUID 匹配后 confirmed", lw.Confidence == PartyConfidence.Confirmed,
                 "confidence=" + lw.Confidence);
@@ -1489,10 +1489,10 @@ static class LogicTests
                 "confidence=" + named.Confidence);
 
             // 239：保守处理——已知名刷新 lastSeen，不新增
-            DateTime before = PartyState.GetMembers().Find(m => m.Name == "aYi777").LastSeenUtc;
+            DateTime before = PartyState.GetMembers().Find(m => m.Name == "TestChar3").LastSeenUtc;
             System.Threading.Thread.Sleep(20);
-            PartyState.OnPartyPlayerUpdated("aYi777");
-            var ayi = PartyState.GetMembers().Find(m => m.Name == "aYi777");
+            PartyState.OnPartyPlayerUpdated("TestChar3");
+            var ayi = PartyState.GetMembers().Find(m => m.Name == "TestChar3");
             Eq("T-11 239 已知名刷新 lastSeen 成员数仍 3", PartyState.MemberCount, 3);
             Check("T-11 239 lastSeen 已刷新", ayi.LastSeenUtc > before, "lastSeen 未变");
             // 未知名不入名单
@@ -1504,7 +1504,7 @@ static class LogicTests
             Eq("T-11 241 LeaderObjectId = 5001", PartyState.LeaderObjectId, 5001L);
             var leaders = PartyState.GetMembers().FindAll(m => m.Role == "leader");
             Eq("T-11 241 队长唯一 = 1", leaders.Count, 1);
-            Eq("T-11 241 队长是 laowang0729", leaders[0].Name, "laowang0729");
+            Eq("T-11 241 队长是 TestChar", leaders[0].Name, "TestChar");
         }
 
         // ---------------------------------------------------------------
@@ -2214,15 +2214,15 @@ static class LogicTests
         LocalPlayerIdentity.Reset();
 
         // 1) 手选名命中 → 直接确认
-        LocalPlayerIdentity.SetManualName("laowang0729");
-        LocalPlayerIdentity.OnSelfSilverGained(100, "laowang0729");
+        LocalPlayerIdentity.SetManualName("TestChar");
+        LocalPlayerIdentity.OnSelfSilverGained(100, "TestChar");
         Eq("P0 身份：evt=278 手选名命中直接确认 id", LocalPlayerIdentity.ConfirmedObjectId, 100L);
         Check("P0 身份：确认来源 = SilverGained",
             LocalPlayerIdentity.CurrentSource == ConfirmSource.SilverGained,
             "source=" + LocalPlayerIdentity.CurrentSource);
 
         // 2) 换图换 id：同名重新绑定（不做身份降级、不清战绩）
-        LocalPlayerIdentity.OnSelfSilverGained(200, "laowang0729");
+        LocalPlayerIdentity.OnSelfSilverGained(200, "TestChar");
         Eq("P0 身份：换图后同名 ObjectId 重新绑定", LocalPlayerIdentity.ConfirmedObjectId, 200L);
 
         // 3) 不同名：只记冲突，绝不覆盖
@@ -2235,12 +2235,12 @@ static class LogicTests
         Eq("P0 身份：重置后回到未识别", LocalPlayerIdentity.State, IdentityState.Unknown);
         LocalPlayerIdentity.OnTakeSilver(300, 500);
         Eq("P0 身份：拾取后进入候选", LocalPlayerIdentity.State, IdentityState.Candidate);
-        LocalPlayerIdentity.OnSelfSilverGained(300, "laowang0729");
+        LocalPlayerIdentity.OnSelfSilverGained(300, "TestChar");
         Eq("P0 身份：evt=278 与候选 id 相同 → 晋升为已确认", LocalPlayerIdentity.ConfirmedObjectId, 300L);
 
         // 5) 未识别且无手选名：只记名字，不擅自确认（宁可未知不可错挂）
         LocalPlayerIdentity.Reset();
-        LocalPlayerIdentity.OnSelfSilverGained(400, "laowang0729");
+        LocalPlayerIdentity.OnSelfSilverGained(400, "TestChar");
         Eq("P0 身份：无手选名时 evt=278 不擅自确认", LocalPlayerIdentity.State, IdentityState.Unknown);
 
         LocalPlayerIdentity.Reset();
@@ -2249,9 +2249,10 @@ static class LogicTests
 
     // ───────────────── 复核：真实会话序列回放（2026-11-09 实机抓包） ─────────────────
     // 语义回放：不构造字节，按 ChatSniffer 的调用顺序把日志里的真实参数喂给 Core。
-    // 序列 1（23:49:16，laowang0729 / ObjectId=187752）：
-    //   evt=278 p0=187752 p2=laowang0729 p5=891000 → evt=81 p0=187752 p1=362286928034
-    //   → evt=62 p0=187752 p3=891000 p4 缺省 p8=40500  ⇒ 税后 891000（89 银币）
+    // 注意：角色名与 ObjectId 已匿名化（TestChar/1001），金额与税费保留实机原值。
+    // 序列 1（23:49:16，TestChar / ObjectId=1001）：
+    //   evt=278 p0=1001 p2=TestChar p5=891000 → evt=81 p0=1001 p1=362286928034
+    //   → evt=62 p0=1001 p3=891000 p4 缺省 p8=40500  ⇒ 税后 891000（89 银币）
     // 旧逻辑：81 与 62 同毫秒，余额基线 Δ=null，候选永远不晋升 → 89 银币永久挂起。
     static void RunRealSessionReplayTests()
     {
@@ -2259,43 +2260,43 @@ static class LogicTests
         IncomeTracker.Reset();
         LocalPlayerIdentity.Reset();
 
-        // —— 序列 1：laowang0729 / 187752 ——
-        var d1 = LocalPlayerIdentity.OnTakeSilver(187752, 891000);
+        // —— 序列 1：TestChar / 1001 ——
+        var d1 = LocalPlayerIdentity.OnTakeSilver(1001, 891000);
         Eq("回放：62 首次拾取 → 候选挂起", d1, TakeSilverDisposition.Pending);
         IncomeTracker.AddPending(new IncomeRecord
         {
             TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币",
-            PickerId = 187752, SilverBeforeTax = 89, TaxPaid = 0, SilverAfterTax = 89
+            PickerId = 1001, SilverBeforeTax = 89, TaxPaid = 0, SilverAfterTax = 89
         });
         Eq("回放：挂起期总收益 = 0", IncomeTracker.GetSummary().ConfirmedTotal, 0L);
 
-        LocalPlayerIdentity.OnSelfSilverGained(187752, "laowang0729");
+        LocalPlayerIdentity.OnSelfSilverGained(1001, "TestChar");
         var s1 = IncomeTracker.GetSummary();
-        Eq("回放：evt=278 确认本人 ObjectId", LocalPlayerIdentity.ConfirmedObjectId, 187752L);
+        Eq("回放：evt=278 确认本人 ObjectId", LocalPlayerIdentity.ConfirmedObjectId, 1001L);
         Eq("回放：挂起收益转正 = 89 银币", s1.ConfirmedTotal, 89L);
         Eq("回放：待确认条数清零", s1.UnconfirmedRecords, 0);
         Eq("回放：本次会话收益 = 89（不含历史）", s1.SessionTotal, 89L);
 
         // —— 换图：ObjectId 变、角色名不变 → 重绑，旧 id 不再是本人 ——
-        LocalPlayerIdentity.OnSelfSilverGained(200001, "laowang0729");
-        Eq("回放：换图后 ObjectId 重新绑定", LocalPlayerIdentity.ConfirmedObjectId, 200001L);
-        Check("回放：换图后新 id 算本人", LocalPlayerIdentity.IsSelf(200001), "new id not self");
-        Check("回放：换图后旧 id 不再算本人", !LocalPlayerIdentity.IsSelf(187752), "old id still self");
+        LocalPlayerIdentity.OnSelfSilverGained(1003, "TestChar");
+        Eq("回放：换图后 ObjectId 重新绑定", LocalPlayerIdentity.ConfirmedObjectId, 1003L);
+        Check("回放：换图后新 id 算本人", LocalPlayerIdentity.IsSelf(1003), "new id not self");
+        Check("回放：换图后旧 id 不再算本人", !LocalPlayerIdentity.IsSelf(1001), "old id still self");
 
-        // —— 序列 2（23:45:29，Sht666 / ObjectId=115995）：62 pre=2,612,250 tax=130,612 ——
+        // —— 序列 2（23:45:29，TestChar2 / ObjectId=1002）：62 pre=2,612,250 tax=130,612 ——
         LocalPlayerIdentity.Reset();
         IncomeTracker.Reset();
-        Eq("回放：Sht666 税后额 = 2,481,638（与日志 p5 一致）", 2612250L - 130612L, 2481638L);
-        var d2 = LocalPlayerIdentity.OnTakeSilver(115995, 2481638);
-        Eq("回放：Sht666 首次拾取 → 候选", d2, TakeSilverDisposition.Pending);
+        Eq("回放：TestChar2 税后额 = 2,481,638（与日志 p5 一致）", 2612250L - 130612L, 2481638L);
+        var d2 = LocalPlayerIdentity.OnTakeSilver(1002, 2481638);
+        Eq("回放：TestChar2 首次拾取 → 候选", d2, TakeSilverDisposition.Pending);
         IncomeTracker.AddPending(new IncomeRecord
         {
             TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币",
-            PickerId = 115995, SilverBeforeTax = 261, TaxPaid = 13, SilverAfterTax = 248
+            PickerId = 1002, SilverBeforeTax = 261, TaxPaid = 13, SilverAfterTax = 248
         });
-        LocalPlayerIdentity.OnSelfSilverGained(115995, "Sht666");
-        Eq("回放：Sht666 身份确认", LocalPlayerIdentity.ConfirmedObjectId, 115995L);
-        Eq("回放：Sht666 收益转正 = 248 银币", IncomeTracker.GetSummary().ConfirmedTotal, 248L);
+        LocalPlayerIdentity.OnSelfSilverGained(1002, "TestChar2");
+        Eq("回放：TestChar2 身份确认", LocalPlayerIdentity.ConfirmedObjectId, 1002L);
+        Eq("回放：TestChar2 收益转正 = 248 银币", IncomeTracker.GetSummary().ConfirmedTotal, 248L);
 
         LocalPlayerIdentity.Reset();
         IncomeTracker.Reset();
