@@ -2225,9 +2225,17 @@ static class LogicTests
         LocalPlayerIdentity.OnSelfSilverGained(200, "TestChar");
         Eq("P0 身份：换图后同名 ObjectId 重新绑定", LocalPlayerIdentity.ConfirmedObjectId, 200L);
 
-        // 3) 不同名：只记冲突，绝不覆盖
-        LocalPlayerIdentity.OnSelfSilverGained(300, "SomeoneElse");
-        Eq("P0 身份：不同名不得覆盖已确认身份", LocalPlayerIdentity.ConfirmedObjectId, 200L);
+        // 3) 角色切换：已确认状态下出现不同角色名 → 自动重绑（用户确认的语义），本次收益不清零
+        IncomeTracker.AddConfirmed(new IncomeRecord
+        {
+            TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币",
+            PickerId = 200, SilverBeforeTax = 89, TaxPaid = 0, SilverAfterTax = 89
+        });
+        LocalPlayerIdentity.OnSelfSilverGained(300, "OtherChar");
+        Eq("P0 身份：角色切换后重绑到新 ObjectId", LocalPlayerIdentity.ConfirmedObjectId, 300L);
+        Eq("P0 身份：角色切换后名字更新", LocalPlayerIdentity.ConfirmedName, "OtherChar");
+        Eq("P0 身份：角色切换不清本次收益", IncomeTracker.GetSummary().SessionTotal, 89L);
+        Check("P0 身份：角色切换后旧 id 不再算本人", !LocalPlayerIdentity.IsSelf(200), "old char still self");
 
         // 4) 候选态：278 与候选 id 相同 → 晋升（evt=81 余额严格匹配太脆，实机常匹配不上）
         LocalPlayerIdentity.Reset();
@@ -2238,7 +2246,21 @@ static class LogicTests
         LocalPlayerIdentity.OnSelfSilverGained(300, "TestChar");
         Eq("P0 身份：evt=278 与候选 id 相同 → 晋升为已确认", LocalPlayerIdentity.ConfirmedObjectId, 300L);
 
-        // 5) 未识别且无手选名：只记名字，不擅自确认（宁可未知不可错挂）
+        // 5) 候选期换角色：候选 id 与本人事件不符 → 候选作废，按本次事件确认
+        LocalPlayerIdentity.Reset();
+        IncomeTracker.Reset();
+        LocalPlayerIdentity.OnTakeSilver(500, 400);
+        IncomeTracker.AddPending(new IncomeRecord
+        {
+            TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币",
+            PickerId = 500, SilverBeforeTax = 4, TaxPaid = 0, SilverAfterTax = 4
+        });
+        Eq("P0 身份：换角色前处于候选", LocalPlayerIdentity.State, IdentityState.Candidate);
+        LocalPlayerIdentity.OnSelfSilverGained(600, "NewChar");
+        Eq("P0 身份：候选与本人事件不符 → 确认新角色", LocalPlayerIdentity.ConfirmedObjectId, 600L);
+        Eq("P0 身份：旧候选的挂起收益按 id 分流丢弃", IncomeTracker.GetSummary().ConfirmedTotal, 0L);
+
+        // 6) 未识别且无手选名：只记名字，不擅自确认（宁可未知不可错挂）
         LocalPlayerIdentity.Reset();
         LocalPlayerIdentity.OnSelfSilverGained(400, "TestChar");
         Eq("P0 身份：无手选名时 evt=278 不擅自确认", LocalPlayerIdentity.State, IdentityState.Unknown);

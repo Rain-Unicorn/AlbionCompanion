@@ -180,7 +180,9 @@ namespace AlbionCompanion.Core
         /// 用途只有两件事，**不产生收益**（收益仍由 evt=62 入账，避免双记）：
         ///   - 换图/换实例后 ObjectId 会变（实测每次换图都不同），按同名重新绑定；
         ///   - 候选期给出「角色名 + id」的服务器侧证据，补齐候选晋升（evt=81 余额严格匹配太脆，常匹配不上）。
-        /// 保守规则：名字与已确认名不符时只记冲突、绝不覆盖（与 L1 一致）。
+        /// 角色切换（用户确认的语义）：evt=278 是本人事件，已确认状态下出现**不同角色名** = 换了角色，
+        /// 自动重新绑定到新角色（旧角色的已确认收益保留在本次会话账本里，不清零）；
+        /// 候选期若候选 id 与本人事件不符，则候选作废、按本次事件确认（未被确认的挂起记录按 id 分流丢弃）。
         /// </remarks>
         public static void OnSelfSilverGained(long objectId, string? name)
         {
@@ -191,26 +193,35 @@ namespace AlbionCompanion.Core
                 {
                     if (_state == IdentityState.Confirmed)
                     {
-                        if (!string.IsNullOrEmpty(_confirmedName))
+                        if (string.IsNullOrEmpty(_confirmedName))
                         {
-                            if (name == _confirmedName)
-                            {
-                                if (_confirmedId != objectId)
-                                {
-                                    long? old = _confirmedId;
-                                    _confirmedId = objectId;
-                                    _lastSelfName = name;
-                                    Log("[身份] 换图/换实例：角色名 " + name + " 的 ObjectId " + old + " → " + objectId + "，已重新绑定");
-                                }
-                                return;
-                            }
-                            Log("[身份冲突] evt=278 名字「" + name + "」与已确认「" + _confirmedName + "」不符，不改变身份");
+                            // 有 id 无名：补名
+                            _confirmedName = name;
+                            _lastSelfName = name;
+                            Log("[身份] evt=278 补充已确认身份的名字：" + name);
                             return;
                         }
-                        // 有 id 无名：补名
+                        if (name == _confirmedName)
+                        {
+                            if (_confirmedId != objectId)
+                            {
+                                long? old = _confirmedId;
+                                _confirmedId = objectId;
+                                _lastSelfName = name;
+                                Log("[身份] 换图/换实例：角色名 " + name + " 的 ObjectId " + old + " → " + objectId + "，已重新绑定");
+                            }
+                            return;
+                        }
+
+                        // 角色切换：evt=278 只报本人银币，名字变了就是换角色 → 重绑（收益账本不清零）
+                        long? switchedFrom = _confirmedId;
+                        string? oldName = _confirmedName;
+                        _confirmedId = objectId;
                         _confirmedName = name;
                         _lastSelfName = name;
-                        Log("[身份] evt=278 补充已确认身份的名字：" + name);
+                        _source = ConfirmSource.SilverGained;
+                        Log("[身份] 检测到角色切换：" + (oldName ?? "(无名)") + "(" + switchedFrom + ") → "
+                            + name + "(" + objectId + ")，已重新绑定（本次收益保留）");
                         return;
                     }
 
@@ -221,6 +232,17 @@ namespace AlbionCompanion.Core
                     {
                         ConfirmCore(objectId, name, ConfirmSource.SilverGained, resolvePending: true);
                         Log("[身份] evt=278（" + name + "）确认本人 ObjectId=" + objectId + "，挂起收益已裁决");
+                        return;
+                    }
+
+                    // 候选 id 与本人事件不符 → 候选已失效（换角色/换图/早前错挂）：
+                    // 丢弃候选后按本次事件确认；未被确认的挂起记录由 ResolvePending 按 id 分流丢弃。
+                    if (_state == IdentityState.Candidate)
+                    {
+                        long? staleCandidate = _candidateId;
+                        ConfirmCore(objectId, name, ConfirmSource.SilverGained, resolvePending: true);
+                        Log("[身份] 候选 ObjectId=" + staleCandidate + " 与本人事件 " + objectId
+                            + " 不符，已丢弃候选并确认「" + name + "」");
                         return;
                     }
 
