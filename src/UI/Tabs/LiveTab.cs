@@ -16,6 +16,13 @@ namespace AlbionCompanion.UI.Tabs
         private Button _startBtn;
         private Button _stopBtn;
 
+        // P2 并发修复：抓包线程在窗口句柄尚未创建时**不得**直接改 ListBox（跨线程/句柄异常）。
+        // 句柄未就绪时先入队（_preHandleLock 保护），OnHandleCreated 后在 UI 线程一次性 flush。
+        private readonly object _preHandleLock = new object();
+        private readonly Queue<(string Text, bool CountPacket)> _preHandleLines
+            = new Queue<(string, bool)>();
+        private const int MaxPreHandleLines = 1000; // 句柄迟迟建不出来时防止无界增长
+
         public LiveTab(Runtime runtime)
             : base(runtime)
         {
@@ -83,26 +90,88 @@ namespace AlbionCompanion.UI.Tabs
             ChatSniffer.OnStatus += delegate(string s)
             {
                 if (IsDisposed) return;
-                try
-                {
-                    if (IsHandleCreated) BeginInvoke(new MethodInvoker(delegate { AddChatLine("[状态] " + s); }));
-                    else AddChatLine("[状态] " + s);
-                }
-                catch { }
+                PostChatLine("[状态] " + s, false);
             };
             ChatSniffer.OnChatLine += delegate(string line)
             {
                 if (IsDisposed) return;
-                try
-                {
-                    if (IsHandleCreated)
-                        BeginInvoke(new MethodInvoker(delegate { _packetCount++; AddChatLine(line); }));
-                }
-                catch { }
+                PostChatLine(line, true);
             };
 
             // 启动时自动开始抓包
             StartCapture();
+        }
+
+        /// <summary>
+        /// P2：抓包线程 → UI 的唯一入口。句柄已创建时 BeginInvoke 回 UI 线程；
+        /// 句柄未创建（窗口还没 Show）时先入队，等 OnHandleCreated 后一次性 flush。
+        /// 绝不在抓包线程直接碰 ListBox。
+        /// </summary>
+        private void PostChatLine(string text, bool countPacket)
+        {
+            if (IsDisposed) return;
+            bool queued = false;
+            lock (_preHandleLock)
+            {
+                if (!IsHandleCreated)
+                {
+                    EnqueuePreHandleLineLocked(text, countPacket);
+                    queued = true;
+                }
+            }
+            if (queued)
+            {
+                // 极端竞态：入队瞬间句柄恰好创建完成，OnHandleCreated 可能已经跑过。
+                // 再确认一次并主动要求 UI 线程 flush，避免这一行永久滞留在队列里。
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    try { BeginInvoke(new MethodInvoker(FlushPreHandleLines)); } catch { }
+                }
+                return;
+            }
+            try
+            {
+                BeginInvoke(new MethodInvoker(delegate
+                {
+                    if (countPacket) _packetCount++;
+                    AddChatLine(text);
+                }));
+            }
+            catch
+            {
+                // 句柄在检查与 BeginInvoke 之间失效：退回队列，等下一次句柄创建 flush
+                lock (_preHandleLock) { EnqueuePreHandleLineLocked(text, countPacket); }
+            }
+        }
+
+        /// <summary>调用方必须持有 _preHandleLock。</summary>
+        private void EnqueuePreHandleLineLocked(string text, bool countPacket)
+        {
+            if (_preHandleLines.Count >= MaxPreHandleLines) _preHandleLines.Dequeue();
+            _preHandleLines.Enqueue((text, countPacket));
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            FlushPreHandleLines();
+        }
+
+        /// <summary>UI 线程：把句柄创建前排队的日志一次性写入 ListBox。</summary>
+        private void FlushPreHandleLines()
+        {
+            List<(string Text, bool CountPacket)> batch;
+            lock (_preHandleLock)
+            {
+                if (_preHandleLines.Count == 0) return;
+                batch = new List<(string, bool)>(_preHandleLines);
+                _preHandleLines.Clear();
+            }
+            foreach (var item in batch)
+            {
+                if (item.CountPacket) _packetCount++;
+                AddChatLine(item.Text);
+            }
         }
 
         private void StartCapture()

@@ -36,51 +36,76 @@ namespace AlbionCompanion.Core
         private const int MaxPendingTargets = 512;                     // 防无界增长（未知目标长期不出现时裁掉最旧的）
         private static readonly TimeSpan PendingTargetTtl = TimeSpan.FromMinutes(10); // 与 C6 队伍 pending 同一超时口径
 
-        // R2/C4：-1「未知玩家」后补认领（设计 §4.6）——10 秒窗口内的唯一新角色才有资格认领
-        private static readonly object _attrGate = new object();
-        private static DateTime _lastUnknownHitUtc = DateTime.MinValue;                       // -1 最近一次命中的 UtcNow
-        private static readonly List<(long Id, string Name, DateTime Utc)> _recentNewChars = new List<(long, string, DateTime)>(); // 窗口内新见到的角色
+        // R2/C4：-1「未知玩家」后补认领（设计 §4.6）——改为「窗口结算」。
+        // 旧实现是逐事件判定：同帧多条 evt=29 时，第一个新角色在第二条到达前就立刻吞掉整桶 -1，
+        // 而真正打伤害的可能是第二个角色 → 错挂。现在收集期只登记候选，窗口到期（或下一次事件超窗）才结算：
+        // 仅当窗口内**恰好一个**新角色（且该角色出现前 10 秒内有 -1 命中）才合并，否则保持未知并计数。
+        private static readonly UnknownAttributionWindow _unknownAttribution = new UnknownAttributionWindow();
 
         private static void UpdatePlayerLastSeen(long objectId)
         {
-            if (GameEvents.Players.TryGetValue(objectId, out var player))
-            {
-                player.LastSeen = DateTime.Now;
-            }
+            // R2 并发：PlayerEntry 不可变，刷新一律走 GameEvents 的整体替换入口
+            if (objectId > 0) GameEvents.TouchPlayerLastSeen(objectId);
         }
 
-        // R2/C4（设计 §4.6）：evt=29 新角色出现时尝试把 -1「未知玩家」的累计并入该角色。
-        // 保守三条件（任一不满足即放弃归因，-1 以「未知玩家」常驻——宁可未知，不可错挂）：
-        //   ① -1 在最近 10 秒内有伤害命中；② 该 10 秒窗口内只出现了这一个新角色（唯一候选）；
-        //   ③ 该 id 此前不在 _playerNames（真正的新面孔，由调用方在写字典前取快照传入）。
-        private static void TryAttributeUnknownPlayer(long id, string name, bool wasKnownPlayer)
+        /// <summary>
+        /// R2/C4：把窗口结算结果落到 DamageTracker：唯一候选才把 -1 的累计并入其真实 id，
+        /// 其余情况保持「未知玩家」并输出可观测的放弃计数（宁可未知，不可错挂）。
+        /// </summary>
+        private static void ApplyUnknownAttribution(UnknownAttributionWindow.Settlement? settled)
         {
-            DateTime nowUtc = DateTime.UtcNow;
-            lock (_attrGate)
+            if (!settled.HasValue) return;
+            var r = settled.Value;
+            if (r.Merged)
             {
-                // 记录本次新面孔，并把 10 秒窗口外的旧记录裁掉
-                if (!wasKnownPlayer)
-                    _recentNewChars.Add((id, name, nowUtc));
-                _recentNewChars.RemoveAll(x => (nowUtc - x.Utc).TotalSeconds > 10);
-
-                if (wasKnownPlayer) return;                    // 条件③：旧面孔不参与归因
-                if (_lastUnknownHitUtc == DateTime.MinValue) return; // 从未出现过 -1 命中
-                if ((nowUtc - _lastUnknownHitUtc).TotalSeconds > 10) return; // 条件①
-
-                var inWindow = _recentNewChars;                 // 已裁剪，剩窗口内新面孔
-                if (inWindow.Count != 1 || inWindow[0].Id != id) return; // 条件②：唯一候选且就是本人
-
-                // 三条件全满足 → 把 -1 的累计并入该角色（数值相加，见 DamageStatsTracker.RenameKey）
-                bool merged = GameEvents.DamageTracker.RenameKey(-1, id, string.IsNullOrEmpty(name) ? null : name);
+                // 数值相加，见 DamageStatsTracker.RenameKey（不是覆盖）
+                bool merged = GameEvents.DamageTracker.RenameKey(-1, r.CandidateId,
+                    string.IsNullOrEmpty(r.CandidateName) ? null : r.CandidateName);
+                string who = r.CandidateName ?? ("#" + r.CandidateId);
                 if (merged)
-                {
-                    // 归因后清窗口，避免同一次 -1 份额被第二个新角色再认领
-                    _recentNewChars.Clear();
-                    _lastUnknownHitUtc = DateTime.MinValue;
-                    ReportStatus($"[归因] 未知玩家的战绩已并入 {name}");
-                }
+                    ReportStatus("[归因] 未知玩家的战绩已并入 " + who);
+                else
+                    ReportStatus("[归因] 窗口唯一候选为 " + who + "，但未知玩家累计已不存在（可能已被清空），未合并");
+                return;
             }
+            if (r.CandidateCount > 1)
+                ReportStatus("[归因] 10 秒窗口内出现 " + r.CandidateCount
+                    + " 个新角色，无法唯一归因：未知玩家战绩保持未归属（放弃计数="
+                    + _unknownAttribution.GaveUpWindowCount + "）");
         }
+
+        /// <summary>
+        /// R2/C4（设计 §4.6）条件③：只有真正的新面孔参与归因；登记候选，等窗口结算。
+        /// </summary>
+        internal static void TryAttributeUnknownPlayer(long id, string name, bool wasKnownPlayer, DateTime nowUtc)
+        {
+            if (wasKnownPlayer) return;                    // 条件③：旧面孔不参与归因
+            ApplyUnknownAttribution(_unknownAttribution.RecordNewCharacter(id, name, nowUtc));
+        }
+
+        /// <summary>R2/C4：-1 命中登记（窗口到期时会先结算上一窗口）。</summary>
+        internal static void NotifyUnknownPlayerHit(DateTime nowUtc)
+        {
+            ApplyUnknownAttribution(_unknownAttribution.RecordUnknownHit(nowUtc));
+        }
+
+        /// <summary>R2/C4：窗口时间推进——抓包线程每条事件调用一次，窗口到期即使没有新事件也能结算。</summary>
+        internal static void TickUnknownAttribution(DateTime nowUtc)
+        {
+            ApplyUnknownAttribution(_unknownAttribution.Tick(nowUtc));
+        }
+
+        /// <summary>测试钩子：窗口状态复位（测试之间隔离用）。</summary>
+        internal static void ResetUnknownAttributionForTests()
+        {
+            _unknownAttribution.Reset();
+        }
+
+        /// <summary>测试钩子：成功归因的窗口次数。</summary>
+        internal static int UnknownAttributionMergedCountForTests { get { return _unknownAttribution.MergedWindowCount; } }
+
+        /// <summary>测试钩子：窗口到期但无法唯一归因（-1 保持未知）的次数。</summary>
+        internal static int UnknownAttributionGaveUpCountForTests { get { return _unknownAttribution.GaveUpWindowCount; } }
 
         private static bool _running;
         private static Thread _thread;
@@ -276,6 +301,9 @@ namespace AlbionCompanion.Core
             var events = PhotonParser.ParseUdpPayload(payload);
             foreach (var evt in events)
             {
+                // R2/C4：窗口时间推进（任何 Photon 事件都推进；窗口到期即结算，不必等下一个候选/命中）
+                TickUnknownAttribution(DateTime.UtcNow);
+
                 if (evt.GameEventCode == -1) continue; // 过滤掉无游戏事件码的普通 Photon 事件
 
                 string desc = "[gameEvt " + evt.GameEventCode + "]";
@@ -503,33 +531,18 @@ namespace AlbionCompanion.Core
                             if (evt.Parameters.TryGetValue(8, out guildObj))
                                 guild = guildObj?.ToString() ?? "";
 
-                            if (GameEvents.Players.TryGetValue(id, out var existing))
-                            {
-                                existing.LastSeen = DateTime.Now;
-                                if (!string.IsNullOrEmpty(guild)) existing.Guild = guild;
-                            }
-                            else
-                            {
-                                GameEvents.Players[id] = new GameEvents.PlayerEntry
-                                {
-                                    ObjectId = id,
-                                    Name = charName,
-                                    FirstSeen = DateTime.Now,
-                                    LastSeen = DateTime.Now,
-                                    Guild = guild
-                                };
-                                GameEvents.FireUpdate();
-                            }
+                            // R2 并发修复：PlayerEntry 不可变，新增/刷新一律整体替换
+                            //（旧代码原地写 existing.LastSeen/Guild，抓包多线程下会撕裂/不可见）
+                            GameEvents.UpsertSeenPlayer(id, charName, guild);
 
                             // R1/C3：名字字典写完之后再联动身份状态机（设计 §3.5 固定顺序，
                             // 确保后续逻辑能读到自己）。C6 将在此追加 PartyState.OnNewCharacter。
                             LocalPlayerIdentity.OnNewCharacter(id, charName);
 
-                            // R2/C4：-1 未知玩家的后补认领（设计 §4.6，保守规则）——
-                            // 仅当 ① -1 在最近 10 秒内有命中；② 该窗口内只新增了这一个角色（唯一候选）；
-                            // ③ 此 id 此前不在 _playerNames（真正的新面孔）。三者同时成立才把 -1 的累计
-                            // 并入该角色；否则 -1 以「未知玩家」常驻（宁可未知，不可错挂队友头上）。
-                            TryAttributeUnknownPlayer(id, charName, wasKnownPlayer);
+                            // R2/C4：-1 未知玩家的后补认领（设计 §4.6，窗口结算）——
+                            // 收集期只登记候选；只有窗口内恰好一个候选且满足条件①时才合并，
+                            // 否则保持「未知玩家」并计数（旧实现同帧多角色会错挂给第一个）。
+                            TryAttributeUnknownPlayer(id, charName, wasKnownPlayer, DateTime.UtcNow);
 
                             // R7/C6：队伍 pending ObjectId 反查入口（设计 §7.4——evt=234 给 id 不给名，
                             // 用 evt=29 的名字补齐；只有唯一候选才提交）
@@ -604,8 +617,8 @@ namespace AlbionCompanion.Core
                             {
                                 if (ci.TrackerKey == -1)
                                 {
-                                    // 未知玩家命中时间戳，供 evt=29 后补认领的 10 秒窗口判定（设计 §4.6）
-                                    lock (_attrGate) { _lastUnknownHitUtc = DateTime.UtcNow; }
+                                    // 未知玩家命中登记，供 evt=29 后补认领的窗口结算（设计 §4.6）
+                                    NotifyUnknownPlayerHit(DateTime.UtcNow);
                                 }
 
                                 string targetName = TargetDisplayName(target);
@@ -1011,12 +1024,145 @@ namespace AlbionCompanion.Core
             if (mobNames != null && mobNames.ContainsKey(targetId))
                 return new TargetDisplay(ChatSnifferNames.UnknownUnit, TargetKind.Unit, false);
 
-            // ③ 玩家侧（本地玩家 / evt=29 已建档玩家）：名字还没落到字典 → 未知玩家 + 挂 pending 等补名
-            if (isSelf || (targetId > 0 && playerNames != null && playerNames.ContainsKey(targetId)))
+            // ③ 玩家侧（本地玩家 / evt=29 已建档玩家）：名字还没落到字典 → 挂 pending 等补名。
+            //    本地玩家不能显示成「未知玩家」——那会和「路人不明」混为一谈，
+            //    统一走身份状态机的展示名（确认前「我（识别中）」，确认后真名）。
+            if (isSelf)
+                return new TargetDisplay(LocalPlayerIdentity.DisplaySelfName, TargetKind.Player, true);
+            if (targetId > 0 && playerNames != null && playerNames.ContainsKey(targetId))
                 return new TargetDisplay(ChatSnifferNames.UnknownPlayer, TargetKind.Player, true);
 
             // ④ 非正数 id 或三份字典都判不出来：保守按非玩家
             return new TargetDisplay(ChatSnifferNames.UnknownUnit, TargetKind.Unit, false);
+        }
+    }
+
+    /// <summary>
+    /// R2/C4（设计 §4.6）「-1 未知玩家」后补认领的窗口结算器（纯状态机，可脱离抓包直接单测）。
+    ///
+    /// 旧实现（逐事件判定）的缺陷：同帧多条 evt=29 时，第一个新角色在第二条到达前就立刻吞掉整桶 -1，
+    /// 而真正打伤害的可能是第二个角色 → 错挂。改为收集期只记录，窗口到期再判定：
+    ///   · 窗口 = 首个 -1 命中（或首个新角色）起的 10 秒；
+    ///   · 合并条件 = 窗口内**恰好 1 个**新角色，且该角色出现前 10 秒内有 -1 命中（条件①③不变）；
+    ///   · 不满足 → 保持「未知玩家」，累加放弃计数（绝不把整桶 -1 挂给多个候选中的某一个）。
+    /// 线程安全：抓包线程可能有多条接收线程并发调用，内部统一加锁；结算结果由调用方在锁外落地。
+    /// </summary>
+    internal sealed class UnknownAttributionWindow
+    {
+        internal static readonly TimeSpan WindowSpan = TimeSpan.FromSeconds(10);
+
+        /// <summary>一次窗口结算的结果。</summary>
+        internal readonly struct Settlement
+        {
+            /// <summary>true = 唯一候选满足归因条件，调用方应把 -1 的累计合并进 CandidateId。</summary>
+            internal readonly bool Merged;
+            internal readonly long CandidateId;
+            internal readonly string? CandidateName;
+            /// <summary>本窗口内出现的新角色个数。</summary>
+            internal readonly int CandidateCount;
+
+            internal Settlement(bool merged, long candidateId, string? candidateName, int candidateCount)
+            {
+                Merged = merged;
+                CandidateId = candidateId;
+                CandidateName = candidateName;
+                CandidateCount = candidateCount;
+            }
+        }
+
+        private readonly object _gate = new object();
+        private readonly List<(long Id, string Name, bool HadRecentUnknownHit)> _candidates
+            = new List<(long, string, bool)>();
+        private DateTime _windowStartUtc = DateTime.MinValue;   // MinValue = 无活动窗口
+        private DateTime _lastUnknownHitUtc = DateTime.MinValue;
+
+        /// <summary>成功归因（合并）的窗口次数。</summary>
+        internal int MergedWindowCount { get; private set; }
+
+        /// <summary>窗口到期但无法唯一归因、-1 保持未知的窗口次数。</summary>
+        internal int GaveUpWindowCount { get; private set; }
+
+        /// <summary>最近一次放弃归因时窗口内的候选数。</summary>
+        internal int LastGaveUpCandidateCount { get; private set; }
+
+        internal bool IsWindowOpen { get { lock (_gate) { return _windowStartUtc != DateTime.MinValue; } } }
+
+        internal int PendingCandidateCount { get { lock (_gate) { return _candidates.Count; } } }
+
+        /// <summary>记录一次 -1 命中；若上一窗口已到期则先返回其结算结果。</summary>
+        internal Settlement? RecordUnknownHit(DateTime nowUtc)
+        {
+            lock (_gate)
+            {
+                var settled = SettleExpiredLocked(nowUtc);
+                _lastUnknownHitUtc = nowUtc;
+                if (_windowStartUtc == DateTime.MinValue) _windowStartUtc = nowUtc;
+                return settled;
+            }
+        }
+
+        /// <summary>记录一个「新面孔」角色；若上一窗口已到期则先返回其结算结果。</summary>
+        internal Settlement? RecordNewCharacter(long id, string name, DateTime nowUtc)
+        {
+            lock (_gate)
+            {
+                var settled = SettleExpiredLocked(nowUtc);
+                bool hadRecentHit = _lastUnknownHitUtc != DateTime.MinValue
+                    && (nowUtc - _lastUnknownHitUtc) <= WindowSpan;
+                _candidates.Add((id, name ?? "", hadRecentHit));
+                if (_windowStartUtc == DateTime.MinValue) _windowStartUtc = nowUtc;
+                return settled;
+            }
+        }
+
+        /// <summary>时间推进（没有新事件时也按真实时间结算到期窗口）。</summary>
+        internal Settlement? Tick(DateTime nowUtc)
+        {
+            lock (_gate) { return SettleExpiredLocked(nowUtc); }
+        }
+
+        internal void Reset()
+        {
+            lock (_gate)
+            {
+                _candidates.Clear();
+                _windowStartUtc = DateTime.MinValue;
+                _lastUnknownHitUtc = DateTime.MinValue;
+                MergedWindowCount = 0;
+                GaveUpWindowCount = 0;
+                LastGaveUpCandidateCount = 0;
+            }
+        }
+
+        private Settlement? SettleExpiredLocked(DateTime nowUtc)
+        {
+            if (_windowStartUtc == DateTime.MinValue) return null;
+            if (nowUtc - _windowStartUtc < WindowSpan) return null;
+            return SettleLocked();
+        }
+
+        private Settlement? SettleLocked()
+        {
+            Settlement? result = null;
+            if (_candidates.Count == 1 && _candidates[0].HadRecentUnknownHit)
+            {
+                var only = _candidates[0];
+                MergedWindowCount++;
+                result = new Settlement(true, only.Id,
+                    string.IsNullOrEmpty(only.Name) ? null : only.Name, 1);
+                // -1 桶只能被认领一次：结算后清掉命中基准，避免同一桶被后续候选再认领
+                _lastUnknownHitUtc = DateTime.MinValue;
+            }
+            else if (_candidates.Count > 1 && _lastUnknownHitUtc != DateTime.MinValue)
+            {
+                // 多候选：宁可未知，不可错挂（旧实现会在这里把整桶给第一个角色）
+                GaveUpWindowCount++;
+                LastGaveUpCandidateCount = _candidates.Count;
+                result = new Settlement(false, 0, null, _candidates.Count);
+            }
+            _candidates.Clear();
+            _windowStartUtc = DateTime.MinValue;
+            return result;
         }
     }
 

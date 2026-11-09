@@ -14,7 +14,8 @@ namespace AlbionCompanion.Core
     /// 2) <c>FireUpdate()</c> 必须在锁外触发——订阅者是 UI，可能同步重入。
     /// 3) 加入集合后的 <see cref="CombatEntry"/>/<see cref="IncomeEntry"/> 不再修改任何字段（不可变约定）；
     ///    唯一例外是 <see cref="GatheringEntry.Fame"/>，写入必须走 <c>TryUpdateLastGatheringFame</c>。
-    /// 4) <c>Players</c> 与队伍名集合使用并发容器，支持抓包线程写、UI 线程枚举。
+    /// 4) <c>Players</c> 与队伍名集合使用并发容器，支持抓包线程写、UI 线程枚举；
+    ///    <see cref="PlayerEntry"/> 不可变，更新必须走 <c>UpsertSeenPlayer</c> / <c>TouchPlayerLastSeen</c> 整体替换。
     /// </remarks>
     public static class GameEvents
     {
@@ -79,13 +80,41 @@ namespace AlbionCompanion.Core
         }
 
         // 附近玩家
-        public class PlayerEntry
+        //
+        // R2 并发修复：PlayerEntry 改为**不可变**值对象——所有字段只读，任何更新（LastSeen/Guild）
+        // 都必须整体替换（ConcurrentDictionary[id] = newEntry），不得原地写字段。
+        // 原因：抓包线程（可能多条接收线程）写 LastSeen/Guild 的同时，UI 线程在枚举/读取，
+        // 原地写会产生「读了 Name 却读到半更新 Guild」这类撕裂 + 内存可见性问题。
+        // 唯一写入口：GameEvents.UpsertSeenPlayer / GameEvents.TouchPlayerLastSeen。
+        public sealed class PlayerEntry
         {
-            public long ObjectId;
-            public string Name;
-            public DateTime FirstSeen;
-            public DateTime LastSeen;
-            public string Guild; // 公会名（如果能拿到）
+            public readonly long ObjectId;
+            public readonly string Name;
+            public readonly DateTime FirstSeen;
+            public readonly DateTime LastSeen;
+            public readonly string Guild; // 公会名（如果能拿到）
+
+            public PlayerEntry(long objectId, string name, DateTime firstSeen, DateTime lastSeen, string guild)
+            {
+                ObjectId = objectId;
+                Name = name ?? "";
+                FirstSeen = firstSeen;
+                LastSeen = lastSeen;
+                Guild = guild ?? "";
+            }
+
+            /// <summary>整体替换式的 LastSeen 刷新（原实例不变，返回新实例）。</summary>
+            public PlayerEntry WithLastSeen(DateTime lastSeen)
+            {
+                return new PlayerEntry(ObjectId, Name, FirstSeen, lastSeen, Guild);
+            }
+
+            /// <summary>整体替换式的 Guild 更新：空串表示本次没拿到，保留旧值。</summary>
+            public PlayerEntry WithGuild(string guild)
+            {
+                return new PlayerEntry(ObjectId, Name, FirstSeen, LastSeen,
+                    string.IsNullOrEmpty(guild) ? Guild : guild);
+            }
         }
 
         private const int MaxEntries = 500;
@@ -103,8 +132,41 @@ namespace AlbionCompanion.Core
         private static int _killCount;
         private static int _deathCount;
 
-        /// <summary>附近玩家：抓包线程写、UI 线程枚举并清理。</summary>
+        /// <summary>附近玩家：抓包线程写、UI 线程枚举并清理。条目不可变，更新一律整体替换。</summary>
         public static readonly ConcurrentDictionary<long, PlayerEntry> Players = new ConcurrentDictionary<long, PlayerEntry>();
+
+        /// <summary>
+        /// R2：附近玩家唯一写入口（新增或刷新）。PlayerEntry 不可变，刷新走「整体替换」，
+        /// 抓包线程与 UI 线程并发时不会读到半更新的条目。返回 true = 首次出现（已 FireUpdate）。
+        /// </summary>
+        public static bool UpsertSeenPlayer(long objectId, string name, string guild)
+        {
+            if (objectId <= 0) return false;
+            DateTime now = DateTime.Now;
+            if (Players.TryAdd(objectId, new PlayerEntry(objectId, name, now, now, guild)))
+            {
+                FireUpdate();
+                return true;
+            }
+            // 已存在：CAS 循环整体替换（Name/FirstSeen 保持首次出现时的值）
+            while (Players.TryGetValue(objectId, out var existing))
+            {
+                var updated = existing.WithLastSeen(now).WithGuild(guild);
+                if (Players.TryUpdate(objectId, updated, existing)) return false;
+            }
+            return false;
+        }
+
+        /// <summary>R2：刷新附近玩家 LastSeen（整体替换；条目不存在则什么都不做）。</summary>
+        public static void TouchPlayerLastSeen(long objectId)
+        {
+            if (objectId <= 0) return;
+            DateTime now = DateTime.Now;
+            while (Players.TryGetValue(objectId, out var existing))
+            {
+                if (Players.TryUpdate(objectId, existing.WithLastSeen(now), existing)) return;
+            }
+        }
 
         public static event Action OnUpdate;
 

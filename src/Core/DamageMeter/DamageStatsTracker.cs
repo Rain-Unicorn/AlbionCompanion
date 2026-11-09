@@ -81,14 +81,19 @@ namespace AlbionCompanion.Core.DamageMeter
             }
         }
 
-        /// <summary>获取所有玩家的总伤害列表（按伤害降序，受筛选影响）。-9（怪物）不进主榜。</summary>
-        public List<(string PlayerName, long TotalDamage, long BiggestHit, long CurrentDps5s, long PeakBurst5s)> GetTopDamage()
+        /// <summary>
+        /// 获取所有玩家的总伤害列表（按伤害降序，受筛选影响）。-9（怪物）不进主榜。
+        /// R2：返回归档键 Key（0=我 / 正数=玩家 / 负数=未知来源），让 UI 能把「未知玩家」行
+        /// 与 self 行分开处理（组队过滤时未知行不得被当成队友一起隐藏，也不得冒充 self）。
+        /// </summary>
+        public List<(long Key, string PlayerName, long TotalDamage, long BiggestHit, long CurrentDps5s, long PeakBurst5s)> GetTopDamage()
         {
             lock (_syncLock)
             {
                 return _players.Values
                     .Where(x => x.ObjectId != -9)
                     .Select(x => new {
+                        Key = x.ObjectId,
                         x.PlayerName,
                         Damage = _filterMode switch {
                             DamageFilter.Pve => x.PveDamage,
@@ -101,20 +106,21 @@ namespace AlbionCompanion.Core.DamageMeter
                     })
                     .Where(x => x.Damage > 0)
                     .OrderByDescending(x => x.Damage)
-                    .Select(x => (x.PlayerName, x.Damage, x.BiggestHit, x.Dps, x.Peak))
+                    .Select(x => (Key: x.Key, x.PlayerName, TotalDamage: x.Damage, x.BiggestHit,
+                                  CurrentDps5s: x.Dps, PeakBurst5s: x.Peak))
                     .ToList();
             }
         }
 
-        /// <summary>获取所有玩家的治疗列表（按治疗降序）。-9（怪物）不进主榜。</summary>
-        public List<(string PlayerName, long TotalHeal, long BiggestHeal)> GetTopHealing()
+        /// <summary>获取所有玩家的治疗列表（按治疗降序）。-9（怪物）不进主榜。R2：带归档键 Key。</summary>
+        public List<(long Key, string PlayerName, long TotalHeal, long BiggestHeal)> GetTopHealing()
         {
             lock (_syncLock)
             {
                 return _players.Values
                     .Where(x => x.EffectiveHealing > 0 && x.ObjectId != -9)
                     .OrderByDescending(x => x.EffectiveHealing)
-                    .Select(x => (x.PlayerName, x.EffectiveHealing, x.BiggestHeal))
+                    .Select(x => (Key: x.ObjectId, x.PlayerName, TotalHeal: x.EffectiveHealing, x.BiggestHeal))
                     .ToList();
             }
         }

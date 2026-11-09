@@ -33,6 +33,8 @@ namespace AlbionCompanion.UI.Tabs
             : base(runtime)
         {
             // 清空统计按钮
+            // 清空语义 = 只清战斗（GameEvents.ResetAll 一次清三处：DamageTracker 全部玩家、
+            // 战斗事件流 _combat、击杀/死亡计数器）；收益/采集/队伍状态都不受影响（§8.5）。
             _clearBtn = new Button();
             _clearBtn.Text = "清空";
             _clearBtn.Location = new Point(510, 12);
@@ -185,8 +187,11 @@ namespace AlbionCompanion.UI.Tabs
                     new Rectangle(pad + 180, cardY + 10, 160, 14), Th.Accent, TextFormatFlags.Left);
 
             var allDamage = GameEvents.DamageTracker.GetTopDamage();
+            // R2：负键（-1 未知玩家 / -3 未知来源）不是队伍成员，但它们的伤害已计入上方大数字
+            //（GetTotals 含全部键）。组队过滤时若把未知行一起隐藏，就会出现「大数字有、榜单没有」
+            // 的不自洽；因此未知行始终保留，且 Key<0 保证它不会被当成 self（Key=0）显示。
             var topDamage = GameEvents.IsInParty
-                ? allDamage.FindAll(d => GameEvents.IsPartyMember(d.PlayerName))
+                ? allDamage.FindAll(d => d.Key < 0 || GameEvents.IsPartyMember(d.PlayerName))
                 : allDamage;
 
             int listY = cardY + 36;
@@ -250,8 +255,9 @@ namespace AlbionCompanion.UI.Tabs
                     new Rectangle(pad + 180, healY + 10, 120, 14), Th.Accent, TextFormatFlags.Left);
 
             var allHeal = GameEvents.DamageTracker.GetTopHealing();
+            // R2：同伤害榜——未知来源的治疗行不得随组队过滤一起消失（大数字已含该部分）
             var topHeal = GameEvents.IsInParty
-                ? allHeal.FindAll(h => GameEvents.IsPartyMember(h.PlayerName))
+                ? allHeal.FindAll(h => h.Key < 0 || GameEvents.IsPartyMember(h.PlayerName))
                 : allHeal;
 
             if (topHeal.Count == 0)
