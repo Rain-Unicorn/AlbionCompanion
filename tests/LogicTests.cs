@@ -2076,6 +2076,9 @@ static class LogicTests
         // ───────────────── 复核：evt=278 本人银币入袋 → 身份确认 / 换图重绑 ─────────────────
         RunSilverGainedIdentityTests();
 
+        // ───────────────── 复核：真实会话序列回放（2026-11-09 23:44 / 23:49 实机抓包） ─────────────────
+        RunRealSessionReplayTests();
+
         // ───────────────── 复核 P0：JoinResponse 码值可配置（0=禁用，越界回落 0） ─────────────────
         RunJoinResponseConfigTests();
 
@@ -2239,6 +2242,60 @@ static class LogicTests
         LocalPlayerIdentity.Reset();
         LocalPlayerIdentity.OnSelfSilverGained(400, "laowang0729");
         Eq("P0 身份：无手选名时 evt=278 不擅自确认", LocalPlayerIdentity.State, IdentityState.Unknown);
+
+        LocalPlayerIdentity.Reset();
+        IncomeTracker.Reset();
+    }
+
+    // ───────────────── 复核：真实会话序列回放（2026-11-09 实机抓包） ─────────────────
+    // 语义回放：不构造字节，按 ChatSniffer 的调用顺序把日志里的真实参数喂给 Core。
+    // 序列 1（23:49:16，laowang0729 / ObjectId=187752）：
+    //   evt=278 p0=187752 p2=laowang0729 p5=891000 → evt=81 p0=187752 p1=362286928034
+    //   → evt=62 p0=187752 p3=891000 p4 缺省 p8=40500  ⇒ 税后 891000（89 银币）
+    // 旧逻辑：81 与 62 同毫秒，余额基线 Δ=null，候选永远不晋升 → 89 银币永久挂起。
+    static void RunRealSessionReplayTests()
+    {
+        IncomeTracker.SetPersistDir(null);
+        IncomeTracker.Reset();
+        LocalPlayerIdentity.Reset();
+
+        // —— 序列 1：laowang0729 / 187752 ——
+        var d1 = LocalPlayerIdentity.OnTakeSilver(187752, 891000);
+        Eq("回放：62 首次拾取 → 候选挂起", d1, TakeSilverDisposition.Pending);
+        IncomeTracker.AddPending(new IncomeRecord
+        {
+            TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币",
+            PickerId = 187752, SilverBeforeTax = 89, TaxPaid = 0, SilverAfterTax = 89
+        });
+        Eq("回放：挂起期总收益 = 0", IncomeTracker.GetSummary().ConfirmedTotal, 0L);
+
+        LocalPlayerIdentity.OnSelfSilverGained(187752, "laowang0729");
+        var s1 = IncomeTracker.GetSummary();
+        Eq("回放：evt=278 确认本人 ObjectId", LocalPlayerIdentity.ConfirmedObjectId, 187752L);
+        Eq("回放：挂起收益转正 = 89 银币", s1.ConfirmedTotal, 89L);
+        Eq("回放：待确认条数清零", s1.UnconfirmedRecords, 0);
+        Eq("回放：本次会话收益 = 89（不含历史）", s1.SessionTotal, 89L);
+
+        // —— 换图：ObjectId 变、角色名不变 → 重绑，旧 id 不再是本人 ——
+        LocalPlayerIdentity.OnSelfSilverGained(200001, "laowang0729");
+        Eq("回放：换图后 ObjectId 重新绑定", LocalPlayerIdentity.ConfirmedObjectId, 200001L);
+        Check("回放：换图后新 id 算本人", LocalPlayerIdentity.IsSelf(200001), "new id not self");
+        Check("回放：换图后旧 id 不再算本人", !LocalPlayerIdentity.IsSelf(187752), "old id still self");
+
+        // —— 序列 2（23:45:29，Sht666 / ObjectId=115995）：62 pre=2,612,250 tax=130,612 ——
+        LocalPlayerIdentity.Reset();
+        IncomeTracker.Reset();
+        Eq("回放：Sht666 税后额 = 2,481,638（与日志 p5 一致）", 2612250L - 130612L, 2481638L);
+        var d2 = LocalPlayerIdentity.OnTakeSilver(115995, 2481638);
+        Eq("回放：Sht666 首次拾取 → 候选", d2, TakeSilverDisposition.Pending);
+        IncomeTracker.AddPending(new IncomeRecord
+        {
+            TimeUtc = DateTime.UtcNow, Source = IncomeSource.SilverPickup, SourceLabel = "拾取银币",
+            PickerId = 115995, SilverBeforeTax = 261, TaxPaid = 13, SilverAfterTax = 248
+        });
+        LocalPlayerIdentity.OnSelfSilverGained(115995, "Sht666");
+        Eq("回放：Sht666 身份确认", LocalPlayerIdentity.ConfirmedObjectId, 115995L);
+        Eq("回放：Sht666 收益转正 = 248 银币", IncomeTracker.GetSummary().ConfirmedTotal, 248L);
 
         LocalPlayerIdentity.Reset();
         IncomeTracker.Reset();
