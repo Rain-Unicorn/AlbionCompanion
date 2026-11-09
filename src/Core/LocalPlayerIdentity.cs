@@ -7,7 +7,7 @@ namespace AlbionCompanion.Core
     public enum IdentityState { Unknown, Candidate, Confirmed }
 
     /// <summary>把身份推进到 Confirmed 的最后一条证据来源。</summary>
-    public enum ConfirmSource { JoinResponse, UpdateMoney, ManualName, NewCharacterMatch }
+    public enum ConfirmSource { JoinResponse, UpdateMoney, ManualName, NewCharacterMatch, SilverGained }
 
     /// <summary>evt=62 拾取银币的入账裁决（设计 §3.5）。</summary>
     public enum TakeSilverDisposition
@@ -166,6 +166,75 @@ namespace AlbionCompanion.Core
                 _accSinceMoney = 0;
                 if (promoted)
                     Log("[身份] 候选经 evt=81 余额严格匹配晋升为 Confirmed（ObjectId=" + objectId + "）");
+            }
+        }
+
+        /// <summary>
+        /// evt=278「本人银币入袋」：p0=ObjectId、p2=角色名、p3=True、p5=税后原始值。
+        /// </summary>
+        /// <remarks>
+        /// 实机证据（2026-11-09 两次会话、13 次拾取）：
+        /// ① p5 与 evt=62 的「p3-p4 税后额」、evt=81 的余额差**逐位相等**；
+        /// ② 每条 278 的 p0 与同秒 evt=62/81 的 p0 相同，且整段日志里 62/81/278 每时刻只有本地玩家一个 id；
+        /// ③ 名字就是游戏内角色名（laowang0729 / Sht666），换角色后跟着变。
+        /// 用途只有两件事，**不产生收益**（收益仍由 evt=62 入账，避免双记）：
+        ///   - 换图/换实例后 ObjectId 会变（实测 114600→115931→115995→187752），按同名重新绑定；
+        ///   - 候选期给出「角色名 + id」的服务器侧证据，补齐候选晋升（evt=81 余额严格匹配太脆，常匹配不上）。
+        /// 保守规则：名字与已确认名不符时只记冲突、绝不覆盖（与 L1 一致）。
+        /// </remarks>
+        public static void OnSelfSilverGained(long objectId, string? name)
+        {
+            if (objectId <= 0) return;
+            lock (_gate)
+            {
+                if (!string.IsNullOrEmpty(name))
+                {
+                    if (_state == IdentityState.Confirmed)
+                    {
+                        if (!string.IsNullOrEmpty(_confirmedName))
+                        {
+                            if (name == _confirmedName)
+                            {
+                                if (_confirmedId != objectId)
+                                {
+                                    long? old = _confirmedId;
+                                    _confirmedId = objectId;
+                                    _lastSelfName = name;
+                                    Log("[身份] 换图/换实例：角色名 " + name + " 的 ObjectId " + old + " → " + objectId + "，已重新绑定");
+                                }
+                                return;
+                            }
+                            Log("[身份冲突] evt=278 名字「" + name + "」与已确认「" + _confirmedName + "」不符，不改变身份");
+                            return;
+                        }
+                        // 有 id 无名：补名
+                        _confirmedName = name;
+                        _lastSelfName = name;
+                        Log("[身份] evt=278 补充已确认身份的名字：" + name);
+                        return;
+                    }
+
+                    // 候选态：名字命中手选名/已知自身名，或候选 id 就是本次 id → 晋升
+                    bool nameMatches = (!string.IsNullOrEmpty(_manualName) && name == _manualName)
+                                       || (!string.IsNullOrEmpty(_lastSelfName) && name == _lastSelfName);
+                    if (nameMatches || (_state == IdentityState.Candidate && _candidateId == objectId))
+                    {
+                        ConfirmCore(objectId, name, ConfirmSource.SilverGained, resolvePending: true);
+                        Log("[身份] evt=278（" + name + "）确认本人 ObjectId=" + objectId + "，挂起收益已裁决");
+                        return;
+                    }
+
+                    // 未识别：手选名命中才直接确认；否则只记名字等其它证据，不擅自确认
+                    if (!string.IsNullOrEmpty(_manualName) && name == _manualName)
+                    {
+                        ConfirmCore(objectId, name, ConfirmSource.SilverGained, resolvePending: false);
+                        Log("[身份] evt=278（" + name + "）命中「我的角色」，确认 ObjectId=" + objectId);
+                    }
+                    else
+                    {
+                        _lastSelfName = name;
+                    }
+                }
             }
         }
 

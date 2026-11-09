@@ -364,6 +364,23 @@ namespace AlbionCompanion.Core
                     }
                     catch { }
                 }
+                // 278 = 本人银币入袋（复核实机发现）：p0=ObjectId、p2=角色名、p3=True、p5=税后原始值。
+                // 实机证据：p5 与 evt=62「p3-税」、evt=81 余额差逐位相等；同一时刻 62/81/278 只有本地玩家一个 id；
+                // 换图/换实例后 ObjectId 会变（114600→115931→115995→187752），故身份按角色名锚定、随本事件重绑。
+                // 只做身份识别，**不入账**（收益仍由 evt=62 记，避免双记）。
+                else if (evt.GameEventCode == 278 && evt.Parameters != null)
+                {
+                    try
+                    {
+                        long selfId = Convert.ToInt64(evt.Parameters[0]);
+                        string? selfName = evt.Parameters.TryGetValue(2, out var nm278) ? nm278 as string : null;
+                        bool wasConfirmed = LocalPlayerIdentity.State == IdentityState.Confirmed;
+                        LocalPlayerIdentity.OnSelfSilverGained(selfId, selfName);
+                        if (!wasConfirmed && LocalPlayerIdentity.State == IdentityState.Confirmed)
+                            ReportStatus("[身份] evt=278 已确认本人：" + (selfName ?? "") + "（ObjectId=" + selfId + "）");
+                    }
+                    catch { }
+                }
                 // 72 = UpdateFame (声望更新)
                 // 1:TotalFame, 2:FameWithZoneMultiplier, 3:ZoneFame, 4:Multiplier, 5:IsPremiumBonus
                 else if (evt.GameEventCode == 72 && evt.Parameters != null)

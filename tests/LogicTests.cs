@@ -2073,6 +2073,9 @@ static class LogicTests
         // ───────────────── 复核：本次会话收益不得混入 JSONL 历史恢复 ─────────────────
         RunSessionIncomeTests();
 
+        // ───────────────── 复核：evt=278 本人银币入袋 → 身份确认 / 换图重绑 ─────────────────
+        RunSilverGainedIdentityTests();
+
         // ───────────────── 复核 P0：JoinResponse 码值可配置（0=禁用，越界回落 0） ─────────────────
         RunJoinResponseConfigTests();
 
@@ -2198,5 +2201,46 @@ static class LogicTests
             IncomeTracker.Reset();
             try { Directory.Delete(dir, true); } catch { }
         }
+    }
+
+    // ───────────────── 复核：evt=278 本人银币入袋 → 身份确认 / 换图重绑 ─────────────────
+    // 实机证据：p0=ObjectId、p2=角色名、p5=税后额（与 62/81 逐位吻合）；ObjectId 换图会变。
+    static void RunSilverGainedIdentityTests()
+    {
+        IncomeTracker.Reset();
+        LocalPlayerIdentity.Reset();
+
+        // 1) 手选名命中 → 直接确认
+        LocalPlayerIdentity.SetManualName("laowang0729");
+        LocalPlayerIdentity.OnSelfSilverGained(100, "laowang0729");
+        Eq("P0 身份：evt=278 手选名命中直接确认 id", LocalPlayerIdentity.ConfirmedObjectId, 100L);
+        Check("P0 身份：确认来源 = SilverGained",
+            LocalPlayerIdentity.CurrentSource == ConfirmSource.SilverGained,
+            "source=" + LocalPlayerIdentity.CurrentSource);
+
+        // 2) 换图换 id：同名重新绑定（不做身份降级、不清战绩）
+        LocalPlayerIdentity.OnSelfSilverGained(200, "laowang0729");
+        Eq("P0 身份：换图后同名 ObjectId 重新绑定", LocalPlayerIdentity.ConfirmedObjectId, 200L);
+
+        // 3) 不同名：只记冲突，绝不覆盖
+        LocalPlayerIdentity.OnSelfSilverGained(300, "SomeoneElse");
+        Eq("P0 身份：不同名不得覆盖已确认身份", LocalPlayerIdentity.ConfirmedObjectId, 200L);
+
+        // 4) 候选态：278 与候选 id 相同 → 晋升（evt=81 余额严格匹配太脆，实机常匹配不上）
+        LocalPlayerIdentity.Reset();
+        LocalPlayerIdentity.SetManualName("");
+        Eq("P0 身份：重置后回到未识别", LocalPlayerIdentity.State, IdentityState.Unknown);
+        LocalPlayerIdentity.OnTakeSilver(300, 500);
+        Eq("P0 身份：拾取后进入候选", LocalPlayerIdentity.State, IdentityState.Candidate);
+        LocalPlayerIdentity.OnSelfSilverGained(300, "laowang0729");
+        Eq("P0 身份：evt=278 与候选 id 相同 → 晋升为已确认", LocalPlayerIdentity.ConfirmedObjectId, 300L);
+
+        // 5) 未识别且无手选名：只记名字，不擅自确认（宁可未知不可错挂）
+        LocalPlayerIdentity.Reset();
+        LocalPlayerIdentity.OnSelfSilverGained(400, "laowang0729");
+        Eq("P0 身份：无手选名时 evt=278 不擅自确认", LocalPlayerIdentity.State, IdentityState.Unknown);
+
+        LocalPlayerIdentity.Reset();
+        IncomeTracker.Reset();
     }
 }
