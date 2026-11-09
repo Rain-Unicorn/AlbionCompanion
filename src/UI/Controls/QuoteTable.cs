@@ -19,8 +19,9 @@ namespace AlbionCompanion.UI.Controls
     /// </summary>
     public class QuoteTable : Control
     {
-        // ── 布局（设计 §3.4：卡头 40 + 表头 24 + 6×26 + 底注 28 = 248，卡宽 620 减两侧 16 = 588）
+        // ── 布局（设计 §3.4：卡头 40 + 表头 24 + N×26 + 底注 28；卡宽 620 减两侧 16 = 588）
         public const int CardWidth = 620;
+        /// <summary>空态/未选态的基础卡高（按六城行位预留）。有数据时用 <see cref="PreferredHeight"/> 动态加高。</summary>
         public const int CardHeight = 248;
         private const int HeadHeight = 40;
         private const int ColumnHeadHeight = 24;
@@ -28,7 +29,14 @@ namespace AlbionCompanion.UI.Controls
         private const int FooterHeight = 28;
         private const int PadX = 16;
 
-        // 四列权重 120 / 180 / 180 / 108 = 588
+        /// <summary>城市行数变化时卡片应有的高度（7 城 = 274，六城 = 248）。</summary>
+        public static int PreferredHeight(int cityCount)
+        {
+            int rows = cityCount <= 0 ? 6 : cityCount;
+            return HeadHeight + ColumnHeadHeight + rows * RowHeight + FooterHeight;
+        }
+
+        // 四列权重（设计规范 §三）：城市 120 / 买入 180 / 卖出 180 / 数据时间 108 = 588
         private static readonly int[] ColumnWidths = { 120, 180, 180, 108 };
 
         // GDI+ 没有透明度：所有 12% 底纹预计算成实色（设计 §8）
@@ -73,6 +81,7 @@ namespace AlbionCompanion.UI.Controls
 
         /// <summary>
         /// 设置数据。now 由调用方传入（不用 DateTime.Now 直接算，保证同一帧内三处时间同源同精度）。
+        /// 卡片高度随城市行数自适应（7 城含黑市时比六城高一行）。
         /// </summary>
         public void SetData(List<QuoteViewRow> rows, DateTimeOffset now)
         {
@@ -80,6 +89,8 @@ namespace AlbionCompanion.UI.Controls
             _now = now;
             _state = QuoteTableModel.StateOf(_rows);
             _hoverRow = -1;
+            _warnBar = null;
+            Height = PreferredHeight(_rows.Count);
             Invalidate();
         }
 
@@ -89,8 +100,24 @@ namespace AlbionCompanion.UI.Controls
             _rows = new List<QuoteViewRow>();
             _state = QuoteTableModel.CardState.NotSelected;
             _emptyTitle = "↑ 请先选择物品";
-            _emptyDetail = "在左侧选满一级 / 二级 / 三级后显示六城报价";
+            _emptyDetail = "在左侧选满一级 / 二级 / 三级与阶级后显示各城报价";
             _showRetry = false;
+            Height = CardHeight;
+            Invalidate();
+        }
+
+        /// <summary>
+        /// 筛选组合已选满、但还没查过（缓存里没有该组合）：明确写「尚未查询」，不冒充「无挂单」。
+        /// 渲染路径仍然零 HTTP，点「查询行情」才回源。
+        /// </summary>
+        public void SetNotQueried()
+        {
+            _rows = new List<QuoteViewRow>();
+            _state = QuoteTableModel.CardState.NoDataAtAll;
+            _emptyTitle = "尚未查询该组合";
+            _emptyDetail = "点击「查询行情」回源各城报价";
+            _showRetry = true;
+            Height = CardHeight;
             Invalidate();
         }
 
@@ -102,6 +129,22 @@ namespace AlbionCompanion.UI.Controls
             _emptyTitle = "取不到亚服数据";
             _emptyDetail = "检查网络或稍后重试";
             _showRetry = true;
+            Height = CardHeight;
+            Invalidate();
+        }
+
+        /// <summary>
+        /// 通用空态：搜索无结果 / 组合不存在等「不是网络失败」的提示。
+        /// 明确写清原因 + 不显示无关缓存（搜索无结果时旧实现会回落渲染全量缓存，这里由调用方给提示）。
+        /// </summary>
+        public void SetMessage(string title, string detail, bool showRetry)
+        {
+            _rows = new List<QuoteViewRow>();
+            _state = QuoteTableModel.CardState.NoDataAtAll;
+            _emptyTitle = title ?? "";
+            _emptyDetail = detail ?? "";
+            _showRetry = showRetry;
+            Height = CardHeight;
             Invalidate();
         }
 
@@ -142,6 +185,18 @@ namespace AlbionCompanion.UI.Controls
 
         private int RowsTop { get { return HeadHeight + ColumnHeadHeight; } }
 
+        /// <summary>当前帧卡片实际高度：有数据行时按城市数自适应，空态用基础卡高。</summary>
+        private int CardHeightNow
+        {
+            get
+            {
+                if (_state == QuoteTableModel.CardState.Rows
+                    || _state == QuoteTableModel.CardState.AllSellEmpty)
+                    return PreferredHeight(_rows.Count);
+                return CardHeight;
+            }
+        }
+
         private int RowAt(int y)
         {
             if (_state != QuoteTableModel.CardState.Rows && _state != QuoteTableModel.CardState.AllSellEmpty)
@@ -157,7 +212,7 @@ namespace AlbionCompanion.UI.Controls
             g.Clear(Th.Bg);
             int w = ClientSize.Width > 0 ? ClientSize.Width : CardWidth;
 
-            Th.FillRound(g, new Rectangle(0, 0, w, CardHeight), 6, Th.Card);
+            Th.FillRound(g, new Rectangle(0, 0, w, CardHeightNow), 6, Th.Card);
             DrawHead(g, w);
 
             if (_warnBar != null)
@@ -227,35 +282,28 @@ namespace AlbionCompanion.UI.Controls
                 Color subColor = row.Stale ? StaleTextColor : Th.Sub;
 
                 int cx = rect.X;
-                TextRenderer.DrawText(g, Th.Cape(row.City, 12), _cityFont,
+                TextRenderer.DrawText(g, MarketCities.ShortName(row.City), _cityFont,
                     new Rectangle(cx, rect.Y, ColumnWidths[0], RowHeight), textColor,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
-                // 买入（左）
+                // 买入（左）——按买入侧自己的时间戳判时效，不用行级最新时间背书
                 cx += ColumnWidths[0];
                 DrawPriceCell(g, cx, rect.Y, ColumnWidths[1], row, true, textColor, subColor);
 
-                // 卖出（右）
+                // 卖出（右）——按卖出侧自己的时间戳判时效
                 cx += ColumnWidths[1];
                 DrawPriceCell(g, cx, rect.Y, ColumnWidths[2], row, false, textColor, subColor);
 
-                // 数据时间（逐城各自算，本行取该城较新的那一路）
+                // 数据时间（逐城、逐路：↓ 买入侧 / ↑ 卖出侧 各用自己的时间戳）
                 cx += ColumnWidths[2];
-                var at = row.BuyDataAt;
-                if (row.SellDataAt.HasValue && (!at.HasValue || row.SellDataAt.Value > at.Value))
-                    at = row.SellDataAt;
-                string timeText = at.HasValue
-                    ? QuoteTableModel.CellTimeTextWithTier(at, _now)
-                    : (row.BuyKind == QuoteCellKind.NoData ? "无数据" : "暂无上报");
+                string timeText = QuoteTableModel.SideTimeSummary(row, _now);
+                var worst = QuoteTableModel.WorstSideFreshness(row);
                 Color timeColor = row.Stale ? StaleTextColor : Th.Sub;
-                if (at.HasValue)
-                {
-                    var tier = QuoteTableModel.Classify(_now - at.Value);
-                    if (tier != QuoteFreshness.Fresh) timeColor = Th.Accent;
-                }
+                if (worst != QuoteFreshness.Fresh) timeColor = Th.Accent;
                 TextRenderer.DrawText(g, timeText, _timeFont,
                     new Rectangle(cx, rect.Y, ColumnWidths[3], RowHeight), timeColor,
-                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+                    | TextFormatFlags.EndEllipsis);
             }
 
             DrawFooter(g, w, top + _rows.Count * RowHeight);
@@ -264,6 +312,7 @@ namespace AlbionCompanion.UI.Controls
         /// <summary>
         /// 价格格：有价画数字（Consolas）；0 值画「暂无挂单」/「无数据」（雅黑，非数字字体）。
         /// 0 绝不画成 0（会被读成白送），也不画成 -（会被读成解析失败）。
+        /// 单侧时效过期时该侧数字弱化、偏旧时用 accent 标出——买卖两路各判各的。
         /// </summary>
         private void DrawPriceCell(Graphics g, int x, int y, int width, QuoteViewRow row,
             bool isBuy, Color priceColor, Color subColor)
@@ -271,10 +320,14 @@ namespace AlbionCompanion.UI.Controls
             var cell = new Rectangle(x, y, width, RowHeight);
             var kind = isBuy ? row.BuyKind : row.SellKind;
             long price = isBuy ? row.BuyPrice : row.SellPrice;
+            var freshness = isBuy ? row.BuyFreshness : row.SellFreshness;
 
             if (kind == QuoteCellKind.Value)
             {
-                TextRenderer.DrawText(g, price.ToString("N0"), _priceFont, cell, priceColor,
+                Color color = priceColor;
+                if (freshness == QuoteFreshness.Expired) color = subColor;
+                else if (freshness == QuoteFreshness.Aging) color = Th.Accent;
+                TextRenderer.DrawText(g, price.ToString("N0"), _priceFont, cell, color,
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
                 return;
             }
@@ -319,7 +372,7 @@ namespace AlbionCompanion.UI.Controls
             // 硬性披露：只要有一格因 0 值/过期被排除，就必须写清排除了几格
             if (excluded > 0)
             {
-                TextRenderer.DrawText(g, "含 " + excluded + " 格未参与比较", _footFont,
+                TextRenderer.DrawText(g, "含 0 值 " + excluded + " 格，未参与比较", _footFont,
                     new Rectangle(r.Right - 200, r.Y, 200, FooterHeight), Th.Accent,
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             }
@@ -327,24 +380,14 @@ namespace AlbionCompanion.UI.Controls
 
         private static string ShortCity(string city)
         {
-            if (string.IsNullOrEmpty(city)) return "—";
-            // 六城中文短名（仅用于底注一行放得下；城市列仍用全名）
-            switch (city)
-            {
-                case "Caerleon": return "卡拉";
-                case "Bridgewatch": return "桥望";
-                case "Martlock": return "马特";
-                case "Thetford": return "塞特";
-                case "Fort Sterling": return "Fort";
-                case "Lymhurst": return "林木";
-                default: return city;
-            }
+            // 城市短名统一由 MarketCities 提供（含 Black Market → 黑市）
+            return MarketCities.ShortName(city);
         }
 
         private void DrawEmptyState(Graphics g, int w)
         {
             int top = RowsTop;
-            int bottom = CardHeight - FooterHeight;
+            int bottom = CardHeightNow - FooterHeight;
             int cy = (top + bottom) / 2 - 20;
 
             string title = _emptyTitle ?? "";
@@ -390,7 +433,7 @@ namespace AlbionCompanion.UI.Controls
             base.OnMouseClick(e);
             int w = ClientSize.Width > 0 ? ClientSize.Width : CardWidth;
             int top = RowsTop;
-            int bottom = CardHeight - FooterHeight;
+            int bottom = CardHeightNow - FooterHeight;
             int cy = (top + bottom) / 2 - 20;
             if (_showRetry)
             {

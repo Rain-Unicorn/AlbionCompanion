@@ -460,8 +460,10 @@ namespace AlbionCompanion.Core
             {
                 if (LooksLikeItemId(token))
                 {
-                    string baseId = token.Split('@')[0];
-                    if (!seen.Contains(baseId)) { seen.Add(baseId); result.Add(baseId); }
+                    // P0 修复：旧实现 token.Split('@')[0] 把附魔后缀剥掉 → 选 +1..+4 恒空。
+                    // 保留完整 uniqueName（T5_2H_BOW@2），查询/过滤/缓存键都以完整 ID 为准。
+                    string itemId = token.Trim();
+                    if (!seen.Contains(itemId)) { seen.Add(itemId); result.Add(itemId); }
                     continue;
                 }
 

@@ -81,6 +81,11 @@ namespace AlbionCompanion.Core
         public bool SellHasData; // sell_price_min > 0
         public bool SellStale;   // sell_price_min_date 距今 > 24h（陈旧无数据；读取时按当前时间重算）
 
+        // 接口契约（设计规范 §八.7）：必须能区分「字段缺失」与「字段值为 0」。
+        // AODP 正常返回时字段恒在、0 表示「该城无挂单」；字段缺失则按「无数据」渲染，不混为一谈。
+        public bool SellMinPresent = true;
+        public bool BuyMaxPresent = true;
+
         public MarketQuote Clone()
         {
             return new MarketQuote
@@ -88,7 +93,8 @@ namespace AlbionCompanion.Core
                 ItemId = ItemId, City = City, Quality = Quality,
                 SellMin = SellMin, SellMinDate = SellMinDate,
                 BuyMax = BuyMax, BuyMaxDate = BuyMaxDate,
-                SellHasData = SellHasData, SellStale = SellStale
+                SellHasData = SellHasData, SellStale = SellStale,
+                SellMinPresent = SellMinPresent, BuyMaxPresent = BuyMaxPresent
             };
         }
     }
@@ -206,6 +212,9 @@ namespace AlbionCompanion.Core
                 q.ItemId = ReadStringElem(row, "item_id");
                 q.City = ReadStringElem(row, "city");
                 q.Quality = (int)ReadLongElem(row, "quality");
+                // 字段存在性单独记录：price=0 且字段在 → 「无挂单」；字段缺失 → 「无数据」
+                q.SellMinPresent = row.TryGetProperty("sell_price_min", out _);
+                q.BuyMaxPresent = row.TryGetProperty("buy_price_max", out _);
                 q.SellMin = sellMin;
                 q.SellMinDate = ReadStringElem(row, "sell_price_min_date");
                 q.BuyMax = buyMax;

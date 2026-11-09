@@ -38,18 +38,41 @@ namespace AlbionCompanion.Core
         public QuoteCellKind BuyKind;
         public QuoteCellKind SellKind;
 
+        /// <summary>买入侧字段（sell_price_min）在 AODP 响应里是否存在：区分「字段缺失」与「字段值为 0」。</summary>
+        public bool BuyFieldPresent = true;
+        /// <summary>卖出侧字段（buy_price_max）是否存在。</summary>
+        public bool SellFieldPresent = true;
+
         /// <summary>本城自己的数据时间（取自该城的 sell_price_min_date），不是页头一个总时间。</summary>
         public DateTimeOffset? BuyDataAt;
         public DateTimeOffset? SellDataAt;
 
-        /// <summary>本城数据距 now 的时效档。</summary>
+        /// <summary>
+        /// 本城数据距 now 的**行级**时效档（取买入/卖出两路里较新的那一路，用于整行时间列与弱化）。
+        /// 单侧判定请用 <see cref="BuyFreshness"/> / <see cref="SellFreshness"/>——
+        /// 同一个城市两路时间戳可以差很多（卖单刚采、买单是昨天的），行级档不能代替单侧档。
+        /// </summary>
         public QuoteFreshness Freshness;
+
+        /// <summary>买入侧（sell_price_min_date）自带的时效档；无时间戳/无数据 = Expired。</summary>
+        /// <remarks>
+        /// P0 修复：旧实现只有一个行级 <see cref="Freshness"/>（取两路较新），底注极值买卖两侧
+        /// 都用它判过期 → 「卖价是昨天、买价刚刚」的行，卖出价会被当成新鲜价参与「最高卖出」。
+        /// </remarks>
+        public QuoteFreshness BuyFreshness;
+        /// <summary>卖出侧（buy_price_max_date）自带的时效档；无时间戳/无数据 = Expired。</summary>
+        public QuoteFreshness SellFreshness;
 
         /// <summary>整行弱化：本城数据距今 &gt; 24h（各城可差十几小时，故必须逐城判）。</summary>
         public bool Stale;
 
-        /// <summary>本城数据年龄（分钟）；无时间为 -1。</summary>
+        /// <summary>本城数据年龄（分钟，取两路较新者）；无时间为 -1。</summary>
         public int AgeMinutes = -1;
+
+        /// <summary>买入侧数据年龄（分钟）；无时间戳为 -1。</summary>
+        public int BuyAgeMinutes = -1;
+        /// <summary>卖出侧数据年龄（分钟）；无时间戳为 -1。</summary>
+        public int SellAgeMinutes = -1;
     }
 
     /// <summary>底注极值（只说价格事实，不给差额——差额是算账结论，归跑商页）。</summary>
@@ -102,6 +125,19 @@ namespace AlbionCompanion.Core
         /// <summary>单格形态：0 价 + 有时间戳 = 无挂单；0 价 + 无时间戳 = 无采集数据。</summary>
         public static QuoteCellKind KindOf(long price, string dateText)
         {
+            return KindOf(price, dateText, true);
+        }
+
+        /// <summary>
+        /// 单格形态（区分「字段缺失」与「字段为 0」，设计规范 §八.7）：
+        ///   ① 字段缺失（present=false）→ 无数据（契约异常/未上报），即使价格为 0 也不能说「无挂单」；
+        ///   ② 有价 → 正常价格；
+        ///   ③ 0 价 + 有时间戳 → 该城确实无挂单；
+        ///   ④ 0 价 + 无时间戳 → 该城未采集到数据。
+        /// </summary>
+        public static QuoteCellKind KindOf(long price, string dateText, bool fieldPresent)
+        {
+            if (!fieldPresent) return QuoteCellKind.NoData;
             if (price > 0) return QuoteCellKind.Value;
             return MarketClient.TryParsePriceDate(dateText) == null ? QuoteCellKind.NoData : QuoteCellKind.NoOrders;
         }
@@ -155,6 +191,8 @@ namespace AlbionCompanion.Core
                     row.BuyKind = QuoteCellKind.NoData;
                     row.SellKind = QuoteCellKind.NoData;
                     row.Freshness = QuoteFreshness.Expired;
+                    row.BuyFreshness = QuoteFreshness.Expired;
+                    row.SellFreshness = QuoteFreshness.Expired;
                     row.Stale = true;
                     list.Add(row);
                     continue;
@@ -162,12 +200,22 @@ namespace AlbionCompanion.Core
 
                 row.BuyPrice = q.SellMin;   // 买入 = 你付出 = sell_price_min（最低挂单）
                 row.SellPrice = q.BuyMax;   // 卖出 = 你到手 = buy_price_max（最高收购单）
-                row.BuyKind = KindOf(q.SellMin, q.SellMinDate);
-                row.SellKind = KindOf(q.BuyMax, q.BuyMaxDate);
+                row.BuyFieldPresent = q.SellMinPresent;
+                row.SellFieldPresent = q.BuyMaxPresent;
+                row.BuyKind = KindOf(q.SellMin, q.SellMinDate, q.SellMinPresent);
+                row.SellKind = KindOf(q.BuyMax, q.BuyMaxDate, q.BuyMaxPresent);
                 row.BuyDataAt = MarketClient.TryParsePriceDate(q.SellMinDate);
                 row.SellDataAt = MarketClient.TryParsePriceDate(q.BuyMaxDate);
 
-                // 逐城时间：取本城两路里较新的那个
+                // 单侧时效：各用各的时间戳（买卖两路互不背书）
+                SetSideAge(row.BuyDataAt, now, true, out int buyAge, out QuoteFreshness buyFresh);
+                SetSideAge(row.SellDataAt, now, false, out int sellAge, out QuoteFreshness sellFresh);
+                row.BuyAgeMinutes = buyAge;
+                row.SellAgeMinutes = sellAge;
+                row.BuyFreshness = buyFresh;
+                row.SellFreshness = sellFresh;
+
+                // 逐城行级时间：取本城两路里较新的那个（仅用于行级弱化/时间列底色）
                 DateTimeOffset? newest = null;
                 if (row.BuyDataAt.HasValue) newest = row.BuyDataAt;
                 if (row.SellDataAt.HasValue && (!newest.HasValue || row.SellDataAt.Value > newest.Value))
@@ -193,8 +241,29 @@ namespace AlbionCompanion.Core
         }
 
         /// <summary>
-        /// 底注极值：只在「有价且未过期」的行里比，0 值与过期值一律排除并计数（excluded 按格计）。
+        /// 单侧年龄/时效：时间戳缺失或早于 2000 哨兵 → 该侧 Expired、年龄 -1（不把「无时间」当新鲜）。
+        /// 采集端时钟略超前时钳到 0，不产生负年龄。
+        /// </summary>
+        private static void SetSideAge(DateTimeOffset? at, DateTimeOffset now, bool isBuy,
+            out int ageMinutes, out QuoteFreshness freshness)
+        {
+            if (!at.HasValue)
+            {
+                ageMinutes = -1;
+                freshness = QuoteFreshness.Expired;
+                return;
+            }
+            var age = now - at.Value;
+            if (age < TimeSpan.Zero) age = TimeSpan.Zero;
+            ageMinutes = (int)age.TotalMinutes;
+            freshness = Classify(age);
+        }
+
+        /// <summary>
+        /// 底注极值：只在「有价 + **该侧自己**未过期」的行里比，0 值与过期值一律排除并计数（excluded 按格计）。
         /// 有任一格被排除，底注就必须写清排除了几格——否则用户看到的「最低价」可能是错的。
+        /// 买入侧用 <see cref="QuoteViewRow.BuyFreshness"/>、卖出侧用 <see cref="QuoteViewRow.SellFreshness"/>，
+        /// 两路时间戳互不背书（P0：旧实现用行级最新时间给买卖两侧背书）。
         /// </summary>
         public static QuoteExtremes Extremes(IEnumerable<QuoteViewRow> rows, out int excluded)
         {
@@ -204,14 +273,15 @@ namespace AlbionCompanion.Core
             foreach (var r in rows)
             {
                 if (r == null) continue;
-                // 最低买入：0 价与已过期不参与（拿一小时前的价当全服最低会让人跑冤枉路）
-                if (r.BuyKind == QuoteCellKind.Value && r.Freshness != QuoteFreshness.Expired)
+                // 最低买入：0 价与买入侧已过期不参与（拿一小时前的价当全服最低会让人跑冤枉路）
+                if (r.BuyKind == QuoteCellKind.Value && r.BuyFreshness != QuoteFreshness.Expired)
                 {
                     if (ex.MinBuy <= 0 || r.BuyPrice < ex.MinBuy) { ex.MinBuy = r.BuyPrice; ex.MinBuyCity = r.City; }
                 }
                 else excluded++;
 
-                if (r.SellKind == QuoteCellKind.Value && r.Freshness != QuoteFreshness.Expired)
+                // 最高卖出：0 价与卖出侧已过期不参与
+                if (r.SellKind == QuoteCellKind.Value && r.SellFreshness != QuoteFreshness.Expired)
                 {
                     if (r.SellPrice > ex.MaxSell) { ex.MaxSell = r.SellPrice; ex.MaxSellCity = r.City; }
                 }
@@ -258,6 +328,42 @@ namespace AlbionCompanion.Core
             var tier = Classify(now - at.Value);
             if (tier == QuoteFreshness.Fresh) return baseText;
             return baseText + (tier == QuoteFreshness.Aging ? " · 偏旧" : " · 过期");
+        }
+
+        /// <summary>
+        /// 单侧相对时间（**紧凑形态**，供报价卡 108px 时间列放买卖两路）：
+        /// 「刚刚 / N分 / N时 / N天」；无时间戳 = 「无」。所有相对时间都从本函数出，同源同精度。
+        /// </summary>
+        public static string CellTimeCompact(DateTimeOffset? at, DateTimeOffset now)
+        {
+            if (!at.HasValue || at.Value.UtcDateTime.Year < 2000) return "无";
+            var age = now - at.Value;
+            if (age < TimeSpan.Zero) age = TimeSpan.Zero;
+            if (age.TotalMinutes < 1) return "刚刚";
+            if (age.TotalMinutes < 60) return (int)age.TotalMinutes + "分";
+            if (age.TotalHours < 24) return (int)age.TotalHours + "时";
+            return (int)age.TotalDays + "天";
+        }
+
+        /// <summary>
+        /// 数据时间列文案：买入/卖出**各自**用自己的时间戳（↓ = 买入侧 sell_price_min_date，
+        /// ↑ = 卖出侧 buy_price_max_date）。旧控件把两路里较新的那个同时盖在两侧上，
+        /// 会出现「卖出价是昨天的，时间列却显示刚刚」的误导。
+        /// </summary>
+        public static string SideTimeSummary(QuoteViewRow row, DateTimeOffset now)
+        {
+            if (row == null) return "无数据";
+            if (row.BuyKind == QuoteCellKind.NoData && row.SellKind == QuoteCellKind.NoData)
+                return "无数据";
+            return "↓" + CellTimeCompact(row.BuyDataAt, now)
+                   + " · ↑" + CellTimeCompact(row.SellDataAt, now);
+        }
+
+        /// <summary>两路里更差的一档（Fresh &lt; Aging &lt; Expired），供时间列/整行标色。</summary>
+        public static QuoteFreshness WorstSideFreshness(QuoteViewRow row)
+        {
+            if (row == null) return QuoteFreshness.Expired;
+            return (QuoteFreshness)Math.Max((int)row.BuyFreshness, (int)row.SellFreshness);
         }
     }
 }

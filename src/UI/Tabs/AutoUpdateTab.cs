@@ -85,9 +85,10 @@ namespace AlbionCompanion.UI.Tabs
         private void UpdateStats()
         {
             var db = Rt.Db;
+            var rows = db.Rows; // 快照：避免遍历时后台 worker 写入造成 List 撕裂
             var citySet = new HashSet<string>();
-            foreach (var r in db.Rows) citySet.Add(r.City);
-            _stats.Text = "本地库：" + db.Rows.Count + " 行 · " + db.KnownItemIds().Count + " 种物品 · " + citySet.Count + " 城市";
+            foreach (var r in rows) citySet.Add(r.City);
+            _stats.Text = "本地库：" + rows.Count + " 行 · " + db.KnownItemIds().Count + " 种物品 · " + citySet.Count + " 城市";
         }
 
         private void Toggle()
@@ -224,7 +225,9 @@ namespace AlbionCompanion.UI.Tabs
                     // 既绕过限流器（→ 429），也让用户只看到一个不动的小时级队列。
                     // 现在①按 URL ≤3000 字符切批（不只是按条数）②每批上报进度/预计剩余③429 交给限流器退避，
                     // 不再在这里手搓 30/60/90 秒睡眠（那会和限流器算两遍，越等越慢）。
-                    var cities = new string[] { "Caerleon", "Bridgewatch", "Martlock", "Thetford", "Fort Sterling", "Lymhurst" };
+                    // 城市全集含 Black Market（凯尔莱恩黑市）：跑商的黑市腿依赖这里有黑市报价，
+                    // 缺了黑市就永远算不出「普通城收 → 黑市卖」的路线。
+                    var cities = MarketCities.AllCopy();
                     var staleItems = Rt.Db.GetStaleItems(new List<string>(allIds));
                     int skipped = allIds.Count - staleItems.Count;
                     SetDetail("过期物品 " + staleItems.Count + " 个（2 小时未拉），跳过近期已拉 " + skipped + " 个");

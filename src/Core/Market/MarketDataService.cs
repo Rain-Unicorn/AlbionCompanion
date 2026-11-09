@@ -65,9 +65,17 @@ namespace AlbionCompanion.Core
         private readonly Dictionary<string, MarketCacheEntry> _entries =
             new Dictionary<string, MarketCacheEntry>();
 
+        /// <summary>
+        /// 缓存键：<c>(规范 itemId, 规范 city, quality)</c>。
+        ///
+        /// P0 修复（缓存键读写不同源）：旧实现 Put 用 AODP 响应字段（恒大写）、Get 用请求参数，
+        /// 用户输入小写 ID/城市别名时 Put 与 Get 落在两个键上 → **小写 ID 永久 miss**，
+        /// 每次查询都重打 AODP（还顶限流）。现在两边都过 <see cref="MarketItemKey.Normalize"/> /
+        /// <see cref="MarketCities.Normalize"/>，Put/Get/单飞/请求 URL 全部同源。
+        /// </summary>
         public static string Key(string itemId, string city, int quality)
         {
-            return (itemId ?? "") + "|" + (city ?? "") + "|" + quality;
+            return MarketItemKey.Normalize(itemId) + "|" + MarketCities.Normalize(city) + "|" + quality;
         }
 
         public int Count
@@ -448,6 +456,25 @@ namespace AlbionCompanion.Core
             return _cache.Snapshot();
         }
 
+        /// <summary>
+        /// 只读「可展示报价」快照：**绝不发请求**。
+        /// 只返回上游真有上报行（HasResponse=true）且至少一侧有价的条目——
+        /// 0 价合成行（无上报）不进 UI，让 UI 直接按「该城无该行」渲染缺失态，
+        /// 而不是先拿到 0 再靠显示层遮盖（数据层过滤 0 价）。缓存里的合成行仍保留用于防重复请求。
+        /// </summary>
+        public List<MarketCacheEntry> SnapshotPricingEntries()
+        {
+            var result = new List<MarketCacheEntry>();
+            foreach (var entry in _cache.Snapshot())
+            {
+                if (entry == null || entry.Quote == null) continue;
+                if (!entry.HasResponse) continue;
+                if (entry.Quote.SellMin <= 0 && entry.Quote.BuyMax <= 0) continue;
+                result.Add(entry);
+            }
+            return result;
+        }
+
         /// <summary>后台刷新入口（估值用途：TTL 4 小时档，限流优先级最低）。</summary>
         public Task<List<MarketQuote>> RefreshAsync(IReadOnlyCollection<string> items,
             IReadOnlyCollection<string> cities, CancellationToken ct = default)
@@ -508,17 +535,22 @@ namespace AlbionCompanion.Core
                             MarketQuote quote;
                             if (!byKey.TryGetValue(MarketDataCache.Key(item, city, q), out quote))
                             {
-                                // AODP 无该键上报行：合成"暂无上报数据"条目（短 TTL 同档），避免反复重打
+                                // AODP 无该键上报行：合成"暂无上报数据"条目（短 TTL 同档），避免反复重打。
+                                // HasResponse=false 表示"上游没有这一行"，与"有行但价格为 0"区分开；
+                                // 展示层（SnapshotPricingEntries）据此过滤，不把 0 价当报价渲染。
                                 quote = new MarketQuote
                                 {
                                     ItemId = item, City = city, Quality = q,
                                     SellMin = 0, SellMinDate = "", BuyMax = 0, BuyMaxDate = "",
-                                    SellHasData = false, SellStale = false
+                                    SellHasData = false, SellStale = false,
+                                    // 上游整行缺失 ≠ 字段值为 0：两者在报价卡上是「无数据」vs「无挂单」
+                                    SellMinPresent = false, BuyMaxPresent = false
                                 };
                             }
                             _cache.Put(new MarketCacheEntry
                             {
-                                Quote = quote.Clone(), Ttl = ttl, FetchedAt = now, HasResponse = true
+                                Quote = quote.Clone(), Ttl = ttl, FetchedAt = now,
+                                HasResponse = byKey.ContainsKey(MarketDataCache.Key(item, city, q))
                             });
                         }
                     }
@@ -644,11 +676,11 @@ namespace AlbionCompanion.Core
         {
             var list = new List<string>();
             if (items == null) return list;
-            var seen = new HashSet<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var raw in items)
             {
-                if (string.IsNullOrEmpty(raw)) continue;
-                string id = raw.Trim();
+                // 与缓存键同源：Trim + 大写 + 保留 @附魔（小写 id 不再永久 miss）
+                string id = MarketItemKey.Normalize(raw);
                 if (id.Length == 0 || !seen.Add(id)) continue;
                 list.Add(id);
             }
@@ -659,11 +691,11 @@ namespace AlbionCompanion.Core
         {
             var list = new List<string>();
             if (cities == null) return list;
-            var seen = new HashSet<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var raw in cities)
             {
-                if (string.IsNullOrEmpty(raw)) continue;
-                string c = raw.Trim();
+                // 与缓存键同源：Trim + 别名归一（"fort sterling"/"凯城"/"黑市" → 规范名）
+                string c = MarketCities.Normalize(raw);
                 if (c.Length == 0 || !seen.Add(c)) continue;
                 list.Add(c);
             }
