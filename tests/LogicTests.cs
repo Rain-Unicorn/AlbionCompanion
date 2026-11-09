@@ -15,13 +15,13 @@ static class LogicTests
     static int _fail;
     static int _pass;
 
-    static void Check(string name, bool ok, string detail)
+    internal static void Check(string name, bool ok, string detail)
     {
         if (ok) { _pass++; Console.WriteLine("PASS  " + name); }
         else { _fail++; Console.WriteLine("FAIL  " + name + "  :: " + detail); }
     }
 
-    static void Eq(string name, object actual, object expected)
+    internal static void Eq(string name, object actual, object expected)
     {
         Check(name, actual != null && actual.Equals(expected),
               "expected <" + expected + "> but got <" + actual + ">");
@@ -2078,6 +2078,12 @@ static class LogicTests
 
         // ───────────────── 复核：真实会话序列回放（2026-11-09 23:44 / 23:49 实机抓包） ─────────────────
         RunRealSessionReplayTests();
+
+        // ───────────────── 模块回归（并行开发：每模块独立文件，避免互相冲突） ─────────────────
+        IncomeModuleTests.Run();
+        CombatModuleTests.Run();
+        GatheringModuleTests.Run();
+        MarketModuleTests.Run();
 
         // ───────────────── 复核 P0：JoinResponse 码值可配置（0=禁用，越界回落 0） ─────────────────
         RunJoinResponseConfigTests();

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <!--
     独立的测试可执行入口（设计 §10.3 / P2-9）。
@@ -19,6 +19,11 @@
   <ItemGroup>
     <!-- 测试本体 + 主工程的全局 using -->
     <Compile Include="LogicTests.cs" />
+    <!-- 模块回归：每模块独立文件（并行开发避免冲突） -->
+    <Compile Include="Tests.Market.cs" />
+    <Compile Include="Tests.Income.cs" />
+    <Compile Include="Tests.Combat.cs" />
+    <Compile Include="Tests.Gathering.cs" />
     <Compile Include="..\src\GlobalUsings.cs" />
 
     <!-- 待测的 Core 层；OcrHelper 依赖 System.Drawing/WinForms，排除 -->
