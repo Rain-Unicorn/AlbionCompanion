@@ -98,6 +98,12 @@ namespace AlbionCompanion.Core
         {
             lock (_sync) { _entries.Clear(); }
         }
+
+        /// <summary>当前缓存全部条目的快照（供只读渲染用；调用方拿到的是一份浅拷贝列表，条目对象本身只在写入时替换）。</summary>
+        public List<MarketCacheEntry> Snapshot()
+        {
+            lock (_sync) { return new List<MarketCacheEntry>(_entries.Values); }
+        }
     }
 
     /// <summary>
@@ -366,6 +372,16 @@ namespace AlbionCompanion.Core
         public void ClearCache() { _cache.Clear(); }
 
         public int CachedEntryCount { get { return _cache.Count; } }
+
+        /// <summary>
+        /// 只读缓存快照：**绝不发请求**。UI 渲染（筛选联动、换城市、翻页、重绘）一律走这里，
+        /// 这也是「筛选全程零 HTTP」的实现依据——渲染路径上没有 await、没有 GetPricesAsync，
+        /// 物理上不可能出网。要刷新请显式调 <see cref="GetPricesAsync"/> 或 <see cref="RefreshAsync"/>。
+        /// </summary>
+        public List<MarketCacheEntry> SnapshotCache()
+        {
+            return _cache.Snapshot();
+        }
 
         /// <summary>后台刷新入口（估值用途：TTL 4 小时档，限流优先级最低）。</summary>
         public Task<List<MarketQuote>> RefreshAsync(IReadOnlyCollection<string> items,

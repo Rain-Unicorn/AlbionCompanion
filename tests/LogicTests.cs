@@ -2011,6 +2011,33 @@ static class LogicTests
                         .Contains("Fort%20Sterling"), MarketClient.EncodeSegment("Fort Sterling"));
             }
 
+            // ───── 唯一读源：SnapshotCache 只读、绝不发请求 ─────
+            {
+                int snapCalls = 0;
+                var svc5 = new MarketDataService(
+                    delegate (string u, CancellationToken tk) { snapCalls++; return Task.FromResult(m2Body); },
+                    () => svcClockTime,
+                    new MarketRateLimiter(600));
+                svc5.GetPricesAsync(new[] { "T4_BAG" }, new[] { "Caerleon" },
+                    MarketQueryPurpose.ManualQuery).GetAwaiter().GetResult();
+                Eq("读源：首次回源 1 次请求", snapCalls, 1);
+
+                // SnapshotCache 是 UI 渲染唯一读口：反复调用不得产生任何请求
+                for (int i = 0; i < 50; i++)
+                {
+                    var snap = svc5.SnapshotCache();
+                    if (snap.Count == 0) break;
+                }
+                Eq("读源：快照读 50 次仍是 1 次请求（渲染路径物理上不出网）", snapCalls, 1);
+                Check("读源：快照能取到缓存条目", svc5.SnapshotCache().Count == 5,
+                    "条目=" + svc5.SnapshotCache().Count);
+
+                // 快照必须返回副本：调用方排序/清空不得改写服务内部缓存
+                var copy = svc5.SnapshotCache();
+                copy.Clear();
+                Eq("读源：清空快照不影响内部缓存", svc5.CachedEntryCount, 5);
+            }
+
             // ───── P2-7 非 2xx 响应体上下文：宁可截断不可丢弃 ─────
             {
                 string shortBody = "Throttled, be nice to the server!";

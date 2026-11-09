@@ -21,6 +21,8 @@ namespace AlbionCompanion.UI.Tabs
         private Thread _worker;
         private int _phaseProgress; // 0-100
         private int _phaseTotal;
+        /// <summary>取消源：用户点「停止」时中断在途请求（MarketDataService 已接调用方 ct）。</summary>
+        private CancellationTokenSource _cts = new CancellationTokenSource();
 
         public AutoUpdateTab(Runtime runtime) : base(runtime)
         {
@@ -96,6 +98,8 @@ namespace AlbionCompanion.UI.Tabs
         private void Start()
         {
             if (_running) return;
+            // 每次启动都换一个新的取消源：Stop 会取消旧源，复用旧源会让新一轮第一批判定为已取消
+            if (_cts.IsCancellationRequested) _cts = new CancellationTokenSource();
             _running = true;
             if (!IsDisposed && IsHandleCreated)
                 BeginInvoke(new MethodInvoker(delegate {
@@ -109,6 +113,7 @@ namespace AlbionCompanion.UI.Tabs
 
         private void Stop()
         {
+            try { _cts.Cancel(); } catch (ObjectDisposedException) { }
             _running = false;
             if (!IsDisposed && IsHandleCreated)
                 BeginInvoke(new MethodInvoker(delegate {
@@ -214,70 +219,76 @@ namespace AlbionCompanion.UI.Tabs
 
                     if (!_running) break;
 
-                    // 分批拉行情 - 串行避免429
+                    // 批量拉行情——**唯一合法出口**：MarketDataService（进程级 60rpm 限流 + 内存缓存 + 单飞去重）。
+                    // 旧写法绕开服务层直接打 AODP：约 6.3k 物品 × 6 城全量扫，每批还要睡 3 秒，
+                    // 既绕过限流器（→ 429），也让用户只看到一个不动的小时级队列。
+                    // 现在①按 URL ≤3000 字符切批（不只是按条数）②每批上报进度/预计剩余③429 交给限流器退避，
+                    // 不再在这里手搓 30/60/90 秒睡眠（那会和限流器算两遍，越等越慢）。
                     var cities = new string[] { "Caerleon", "Bridgewatch", "Martlock", "Thetford", "Fort Sterling", "Lymhurst" };
                     var staleItems = Rt.Db.GetStaleItems(new List<string>(allIds));
                     int skipped = allIds.Count - staleItems.Count;
-                    SetDetail("过期物品 " + staleItems.Count + " 个（2小时未拉），跳过近期已拉 " + skipped + " 个");
+                    SetDetail("过期物品 " + staleItems.Count + " 个（2 小时未拉），跳过近期已拉 " + skipped + " 个");
 
-                    var chunks = MarketDb.Chunk(staleItems, 80);
+                    var chunks = PriceBatcher.CreatePriceBatches(staleItems, cities);
                     int upserted = 0;
                     int failedBatches = 0;
                     DateTime marketStart = DateTime.Now;
+                    SetPhase("拉取行情", 0, Math.Max(1, chunks.Count));
 
                     for (int i = 0; i < chunks.Count && _running; i++)
                     {
                         DateTime t0 = DateTime.Now;
-                        int retries = 0;
-                        bool success = false;
-                        while (retries < 3 && !success && _running)
+                        try
                         {
-                            try
-                            {
-                                var quotes = MarketClient.Fetch(chunks[i].ToArray(), cities, 25);
-                                int elapsed = (int)(DateTime.Now - t0).TotalMilliseconds;
-                                Rt.Db.MarkFetched(chunks[i]);
-                                upserted += quotes.Count;
-                                Rt.Db.UpsertBatch(quotes);
-                                int pct = (chunks.Count > 0) ? (int)((double)(i + 1) / chunks.Count * 100) : 100;
-                                SetProgress("批次 " + (i + 1) + "/" + chunks.Count + " (" + pct + "%) · " +
-                                    chunks[i].Count + " 物品 → " + quotes.Count + " 条 · " + elapsed + "ms · 累计 " + upserted);
-                                success = true;
-                                Thread.Sleep(3000); // 成功后间隔3秒
-                            }
-                            catch (Exception ex)
-                            {
-                                retries++;
-                                bool is429 = ex.Message.IndexOf("429") >= 0;
-                                if (is429)
-                                {
-                                    int waitSec = 30 * retries; // 30s, 60s, 90s
-                                    SetDetail("批次 " + (i + 1) + " 限流(429)，第 " + retries + " 次重试，等待 " + waitSec + " 秒...");
-                                    Thread.Sleep(waitSec * 1000);
-                                }
-                                else
-                                {
-                                    failedBatches++;
-                                    SetDetail("批次 " + (i + 1) + " 失败: " + ex.Message);
-                                    Thread.Sleep(2000);
-                                    break; // 非429错误不重试
-                                }
-                            }
+                            var quotes = MarketDataService.Instance
+                                .GetPricesAsync(chunks[i], cities, MarketQueryPurpose.Valuation, null, _cts.Token)
+                                .GetAwaiter().GetResult();
+                            Rt.Db.MarkFetched(chunks[i]);
+                            upserted += quotes.Count;
+                            Rt.Db.UpsertBatch(quotes);
+
+                            int pct = (int)((double)(i + 1) / Math.Max(1, chunks.Count) * 100);
+                            int elapsed = (int)(DateTime.Now - t0).TotalMilliseconds;
+                            int spendMs = (int)(DateTime.Now - marketStart).TotalMilliseconds;
+                            // 预计剩余：按已完成批次的平均耗时外推（不是负数，也不假装精确）
+                            int etaSec = 0;
+                            if (i + 1 >= 2)
+                                etaSec = (int)((double)spendMs / (i + 1) * (chunks.Count - i - 1) / 1000);
+                            string eta = etaSec > 0 ? " · 预计剩余 " + etaSec + "s" : "";
+                            SetPhase("拉取行情 " + (i + 1) + "/" + chunks.Count, i + 1, Math.Max(1, chunks.Count));
+                            SetProgress("批次 " + (i + 1) + "/" + chunks.Count + "（" + pct + "%）· "
+                                        + chunks[i].Count + " 物品 → " + quotes.Count + " 条 · " + elapsed + "ms"
+                                        + eta + " · 累计 " + upserted);
+                            // 不再手工 Sleep：限流节拍由 MarketRateLimiter 统一掌握（这里多睡就是双倍等待）
                         }
-                        if (!success && retries >= 3)
+                        catch (OperationCanceledException)
+                        {
+                            SetDetail("已停止：第 " + (i + 1) + " 批被取消");
+                            break;
+                        }
+                        catch (MarketRateLimitedException ex)
+                        {
+                            // 限流器已按 RateLimit-Reset / 指数退避重试过 3 次，仍被限流就停本轮（不裸重试）
+                            failedBatches++;
+                            SetDetail("第 " + (i + 1) + " 批仍被限流：" + ex.Message);
+                            break;
+                        }
+                        catch (Exception ex)
                         {
                             failedBatches++;
-                            SetDetail("批次 " + (i + 1) + " 重试3次仍限流，跳过");
+                            SetDetail("第 " + (i + 1) + " 批失败：" + ex.Message);
                         }
+                        if (!_running) break;
                     }
 
                     int marketMs = (int)(DateTime.Now - marketStart).TotalMilliseconds;
-                    SetDetail("行情拉取完成：" + chunks.Count + " 批 / " + marketMs + "ms / " + upserted + " 条 / 失败 " + failedBatches + " 批");
+                    SetDetail("行情拉取完成：" + chunks.Count + " 批 / " + marketMs + "ms / " + upserted
+                              + " 条 / 失败 " + failedBatches + " 批 / 缓存 " + MarketDataService.Instance.CachedEntryCount + " 条");
 
                     if (!_running) break;
 
                     SetPhase("本轮完成，等待下一轮", 1, 1);
-                    SetProgress("本轮完成：收集 " + allIds.Count + " 种物品，入库 " + upserted + " 条行情");
+                    SetProgress("本轮完成：收集 " + allIds.Count + " 种物品，回源 " + upserted + " 条行情");
                     SetDetail("5 分钟后自动开始下一轮...");
                     UpdateStats();
 

@@ -41,6 +41,8 @@ namespace AlbionCompanion.UI.Tabs
         private DateTime _lastRefresh;
         private bool _refreshing;
         private int _iconTicks;
+        /// <summary>本轮回源的取消源：窗体关闭 / 用户重新查询时中断在途请求（MarketDataService 已接 ct）。</summary>
+        private CancellationTokenSource _cts = new CancellationTokenSource();
 
         private static readonly string[] CityNames =
             { "Caerleon", "Bridgewatch", "Martlock", "Thetford", "Fort Sterling", "Lymhurst" };
@@ -65,7 +67,8 @@ namespace AlbionCompanion.UI.Tabs
             _query.Click += delegate { StartQuery(); };
             Controls.Add(_query);
 
-            _status = CardText("本地库 " + _db.Rows.Count + " 条 · 点击查询后自动入库，之后每 5 分钟刷新",
+            _status = CardText("缓存 " + MarketDataService.Instance.CachedEntryCount
+                               + " 条 · 点击查询后回源，之后每 5 分钟自动刷新",
                                14, 70, 540, 20, Th.Sub, 8f, false);
 
             // M3：物品数据版本号 + 手动更新入口（ao-bin-dumps items.json 本地索引）
@@ -257,22 +260,7 @@ namespace AlbionCompanion.UI.Tabs
             else if (l3 == "全部") { _catBtn.Text = "类别：" + l1 + " / " + l2; }
             else { _catBtn.Text = "类别：" + l1 + " / " + l2 + " / " + l3; }
 
-            // 选了具体三级物品，自动拿它当搜索词立即查询
-            if (l3 != "全部" && l3 != null)
-            {
-                _items.Text = l3;
-                _selL3 = "全部"; // 搜索词已经限定了物品，不再拿显示名二次过滤
-                StartQuery();
-                return;
-            }
-            // 选了二级子类（不是"全部"），用二级名当搜索词查询
-            if (l2 != "全部" && l2 != null)
-            {
-                _items.Text = l2;
-                _selL3 = "全部";
-                StartQuery();
-                return;
-            }
+            // 筛选不联网：只改选择 → 重过滤 → 重绘（零 HTTP）。要拿新价必须显式点「查询行情」。
             RenderRows();
         }
 
@@ -353,10 +341,8 @@ namespace AlbionCompanion.UI.Tabs
                         shown = ItemCatalog.ResolveTerms(rawText, names, _cache, ItemIndex.Default);
                     }
 
-                    // 2. 先把本地库里现有的全部物品作为刷新范围；首次查询时也含新解析出的 id
-                    var toRefresh = new List<string>(_db.KnownItemIds());
-                    foreach (string id in shown)
-                        if (!toRefresh.Contains(id)) toRefresh.Add(id);
+                    // 2. 刷新范围 = 缓存里已有的物品 + 本次解析出的 id（纯内存，不联网）
+                    var toRefresh = RefreshScope(shown);
 
                     // 3. 本地库先渲染（秒开）
                     if (!IsDisposed && IsHandleCreated)
@@ -367,7 +353,7 @@ namespace AlbionCompanion.UI.Tabs
                             if (rawText != null && rawText.Trim().Length > 0)
                                 _shownIds = new List<string>(shown);
                             else
-                                _shownIds = new List<string>(_db.KnownItemIds());
+                                _shownIds = new List<string>();
                             MergeNames(names);
                             RenderRows();
                             if (shown.Count == 0 && rawText != null && rawText.Trim().Length > 0)
@@ -375,23 +361,38 @@ namespace AlbionCompanion.UI.Tabs
                         }));
                     }
 
-                    // 4. 分批回源
+                    // 4. 分批回源——**唯一合法出口**：MarketDataService（限流 60rpm + 内存缓存 + 单飞去重）。
+                    //    任何绕开服务层直连 AODP 的写法都会跳过限流器，顶到 429 后用户会看到「刷新一半没数据」。
                     var chunks = MarketDb.Chunk(toRefresh, 80);
                     int fetched = 0;
                     bool rateLimited = false;
-                    foreach (var chunk in chunks)
+                    for (int ci = 0; ci < chunks.Count; ci++)
                     {
                         if (IsDisposed) break;
                         try
                         {
-                            var quotes = MarketClient.Fetch(chunk.ToArray(), cities.ToArray(), 25);
-                            _db.UpsertBatch(quotes);
+                            var quotes = MarketDataService.Instance
+                                .GetPricesAsync(chunks[ci], cities, MarketQueryPurpose.ManualQuery, null, _cts.Token)
+                                .GetAwaiter().GetResult();
                             fetched += quotes.Count;
+                            // MarketDb 降级为「只写持久化历史」（唯一读源裁定见报告）：
+                            // 价格一律从 MarketDataService 内存缓存读，这里只把本轮结果归档落盘。
+                            _db.UpsertBatch(quotes);
+                            _db.MarkFetched(chunks[ci]);
                             _lastRefresh = DateTime.Now;
+                            if (!IsDisposed && IsHandleCreated)
+                            {
+                                int pct = (ci + 1) * 100 / Math.Max(1, chunks.Count);
+                                string msg = "回源 " + (ci + 1) + "/" + chunks.Count + " 批（" + pct
+                                             + "%）· 缓存 " + MarketDataService.Instance.CachedEntryCount + " 条";
+                                BeginInvoke(new MethodInvoker(delegate { SetStatus(msg, Th.Sub); }));
+                            }
                         }
+                        catch (OperationCanceledException) { break; }
                         catch (Exception ex)
                         {
-                            if (ex.Message.IndexOf("429", StringComparison.OrdinalIgnoreCase) >= 0)
+                            if (ex is MarketRateLimitedException ||
+                                ex.Message.IndexOf("429", StringComparison.OrdinalIgnoreCase) >= 0)
                             {
                                 rateLimited = true;
                                 break;
@@ -408,12 +409,14 @@ namespace AlbionCompanion.UI.Tabs
                             _query.Enabled = true;
                             if (rateLimited)
                             {
-                                SetStatus("本地库 " + _db.Rows.Count + " 条 · 稍后自动重试", Th.Sub);
+                                SetStatus("缓存 " + MarketDataService.Instance.CachedEntryCount
+                                          + " 条 · 限流稍后自动重试", Th.Sub);
                             }
                             else
                             {
-                                SetStatus("本地库 " + _db.Rows.Count + " 条 · 刚更新 " + fetched +
-                                          " 行 · " + _lastRefresh.ToString("HH:mm:ss") + " · 5 分钟后自动刷新", Th.Good);
+                                SetStatus("缓存 " + MarketDataService.Instance.CachedEntryCount
+                                          + " 条 · 刚回源 " + fetched + " 行 · "
+                                          + _lastRefresh.ToString("HH:mm:ss") + " · 5 分钟后自动刷新", Th.Good);
                             }
                             RenderRows();
                             _iconTicks = 0;
@@ -447,21 +450,66 @@ namespace AlbionCompanion.UI.Tabs
             if (dirty) _cache.Save(_cachePath);
         }
 
+        /// <summary>
+        /// 唯一读源：MarketDataService 内存缓存。**这里不发任何请求、不改任何状态**，
+        /// 只把快照克隆出来并按当前时间重算陈旧标记（缓存写入时不冻结陈旧判定）。
+        /// MarketDb 在本页降级为只写归档，不再参与读。
+        /// </summary>
+        private List<MarketQuote> CacheRows()
+        {
+            var now = DateTimeOffset.UtcNow;
+            var list = new List<MarketQuote>();
+            foreach (var e in MarketDataService.Instance.SnapshotCache())
+            {
+                if (e == null || e.Quote == null) continue;
+                var q = e.Quote.Clone();
+                q.SellStale = MarketClient.IsSellStale(q.SellHasData, q.SellMinDate, now);
+                list.Add(q);
+            }
+            list.Sort(delegate (MarketQuote a, MarketQuote b)
+            {
+                int c = string.Compare(a.ItemId, b.ItemId, StringComparison.Ordinal);
+                if (c != 0) return c;
+                c = string.Compare(a.City, b.City, StringComparison.Ordinal);
+                if (c != 0) return c;
+                return a.Quality.CompareTo(b.Quality);
+            });
+            return list;
+        }
+
+        /// <summary>回源范围：缓存里已有的物品 + 本次解析出的物品（去重）。不发请求，纯内存。</summary>
+        private List<string> RefreshScope(List<string> resolved)
+        {
+            var ids = new List<string>();
+            var seen = new HashSet<string>();
+            foreach (var q in CacheRows())
+                if (seen.Add(q.ItemId)) ids.Add(q.ItemId);
+            if (resolved != null)
+                foreach (string id in resolved)
+                    if (seen.Add(id)) ids.Add(id);
+            // 缓存空且用户没输入时，退回本地归档里的物品名（只取 id，不取价格），让首轮刷新有范围
+            if (ids.Count == 0)
+                foreach (string id in _db.KnownItemIds())
+                    if (seen.Add(id)) ids.Add(id);
+            return ids;
+        }
+
         private void RenderRows()
         {
             var cities = CheckedCities();
-            var source = _items.Text.Trim().Length > 0
-                ? _db.Query(_shownIds, cities)
-                : _db.Query(_db.KnownItemIds(), cities);
+            var wanted = new HashSet<string>(cities);
+            var allowed = new HashSet<string>(_shownIds ?? new List<string>());
+            bool scoped = _items.Text.Trim().Length > 0 && allowed.Count > 0;
 
+            var source = CacheRows();
             var rows = new List<string[]>();
             var images = new List<Image>();
-            int shown = 0;
             for (int i = 0; i < source.Count; i++)
             {
                 var q = source[i];
+                if (wanted.Count > 0 && !wanted.Contains(q.City)) continue;
+                if (scoped && !allowed.Contains(q.ItemId)) continue;
                 if (!PassesFilter(q.ItemId, q.Quality)) continue;
-                shown++;
 
                 string display;
                 if (!_cache.Map.TryGetValue(MarketDb.BaseOf(q.ItemId), out display) || string.IsNullOrEmpty(display))
@@ -472,9 +520,10 @@ namespace AlbionCompanion.UI.Tabs
                     display,
                     q.City,
                     QualityLabel(q.Quality),
-                    Th.Price(q.SellMin),
-                    Th.Price(q.BuyMax),
-                    Th.DateText(q.SellMinDate)
+                    // 0 = AODP 无上报数据（不是免费），不得画成 0
+                    q.SellHasData ? Th.Price(q.SellMin) : "—",
+                    q.BuyMax > 0 ? Th.Price(q.BuyMax) : "—",
+                    q.SellHasData ? Th.DateText(q.SellMinDate) : "暂无上报"
                 });
                 images.Add(ItemIcons.Get(MarketDb.BaseOf(q.ItemId), q.Quality));
             }
@@ -483,13 +532,21 @@ namespace AlbionCompanion.UI.Tabs
 
         private void RefreshRowIcons()
         {
-            if (_db.Rows.Count == 0) { _iconTimer.Stop(); return; }
+            if (MarketDataService.Instance.CachedEntryCount == 0) { _iconTimer.Stop(); return; }
             RenderRows();
             if (++_iconTicks >= 6) _iconTimer.Stop();
         }
 
         public override void RefreshData()
         {
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            // 中断在途回源：MarketDataService 的在途请求挂在调用方 ct 上（P1-2），
+            // 窗体关掉后不该再让后台线程替一个不存在的界面把队列跑完。
+            try { _cts.Cancel(); } catch (ObjectDisposedException) { }
+            base.Dispose(disposing);
         }
     }
 }
