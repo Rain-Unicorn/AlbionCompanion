@@ -3,8 +3,11 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 using AlbionCompanion.Core;
+using AlbionCompanion.Core.Income;
+using AlbionCompanion.Core.Party;
 
 namespace AlbionCompanion.UI
 {
@@ -122,6 +125,8 @@ namespace AlbionCompanion.UI
         private readonly NotifyIcon _tray;
         private readonly HotkeyWindow _hotkey;
         private readonly Icon _icon;
+        private int _quitting;          // 防重入：托盘退出 / 悬浮条退出 / ApplicationExit 只排水一次
+        private static int _drained;    // 退出排水幂等标记（Quit + ApplicationExit + Program finally 三路兜底）
 
         public CompanionApp(Runtime runtime)
         {
@@ -129,6 +134,9 @@ namespace AlbionCompanion.UI
             _icon = BuildIcon();
 
             _panel = new PanelForm(_rt);
+            // 高 DPI：配合 Program.Main 的 Application.SetHighDpiMode(HighDpiMode.SystemAware)，
+            // 主面板按字体缩放，避免 125%/150% 缩放时硬编码像素坐标错位（其他窗体不在本模块范围内）。
+            _panel.AutoScaleMode = AutoScaleMode.Font;
             _panel.CollapseRequested += delegate { Collapse(); };
 
             _overlay = new OverlayForm(_rt);
@@ -136,6 +144,9 @@ namespace AlbionCompanion.UI
             _overlay.ExitRequested += delegate { Quit(); };
             PlaceOverlay();
             _overlay.Show();
+
+            // P1-13：任一路径结束消息循环（Alt+F4 / 系统关机 / ExitThread）都要排水，不能只靠托盘 Quit
+            Application.ApplicationExit += delegate { DrainOnExit(); };
 
             _tray = new NotifyIcon();
             _tray.Icon = _icon;
@@ -227,11 +238,28 @@ namespace AlbionCompanion.UI
 
         public void Quit()
         {
+            if (Interlocked.Exchange(ref _quitting, 1) != 0) return; // 重复点退出：不再重复排水/释放
             _rt.Save();
+            DrainOnExit(); // P1-13：先停抓包 + 排空 JSONL/队伍缓存，再释放 UI（尾批不丢）
             _tray.Visible = false;
             _tray.Dispose();
             _hotkey.Dispose();
             ExitThread();
+        }
+
+        /// <summary>
+        /// P1-13 退出排水（幂等，可从 Quit / ApplicationExit / Program.Main finally 任一路径调用）：
+        /// 1) ChatSniffer.Stop——先停抓包线程，避免排水期间继续入账/改状态；
+        /// 2) IncomeTracker.FlushPendingWrites(2000)——等 JSONL 写线程把队列写穿（尾批不丢）；
+        /// 3) PartyState.FlushCache——取消防抖，立即落盘队伍缓存。
+        /// 全部 try/catch 兜底：退出路径绝不能再抛异常卡住进程。
+        /// </summary>
+        public static void DrainOnExit()
+        {
+            if (Interlocked.Exchange(ref _drained, 1) != 0) return;
+            try { ChatSniffer.Stop(); } catch { }
+            try { IncomeTracker.FlushPendingWrites(2000); } catch { }
+            try { PartyState.FlushCache(); } catch { }
         }
 
         private static Icon BuildIcon()

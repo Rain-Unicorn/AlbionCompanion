@@ -46,8 +46,17 @@ namespace AlbionCompanion.Core
         private static DateTime _candidateSince;
         private static int _candidateHits;             // 候选拾取次数
         private static long _candidateSilver;          // 挂起银币合计（原始 FixPoint 值）
+        private static int _unattributedPickups;       // P0-3：候选期「候选之外的拾取者」次数（未归属，不入账）
+        private static int _candidateTtlExpiries;      // P0-3：候选 TTL 到期自愈次数（暴露给 UI/状态栏）
         private static long _accSinceMoney;            // 自上一条 evt=81 以来候选拾取累计（原始 FixPoint，余额比对窗口）
         private static long? _lastBalance;             // evt=81 银币余额基线（原始 FixPoint）
+
+        /// <summary>
+        /// P0-3：候选有效期。候选自首次拾取起 10 分钟未被任何权威证据（JoinResponse/evt=81/evt=278/手选名）确认，
+        /// 即回 Unknown 让下一次拾取重新起候选——修复「队友先捡 → 候选锁死在他身上 → 我捡的银币全被 Ignore」。
+        /// 故意不因候选本人继续拾取而续期：否则队友持续拾取时锁死会无限延长。
+        /// </summary>
+        public static readonly TimeSpan CandidateTtl = TimeSpan.FromMinutes(10);
 
         /// <summary>状态变化 / 冲突日志的对外通知（ChatSniffer 订阅转发到状态栏）。</summary>
         public static event Action<string>? OnStatus;
@@ -69,6 +78,18 @@ namespace AlbionCompanion.Core
 
         /// <summary>候选期间挂起的银币额（显示单位：原始值 ÷ 10000），供 UI 三态徽标。</summary>
         public static long CandidateSilverTotal { get { lock (_gate) { return _candidateSilver / 10000; } } }
+
+        /// <summary>
+        /// P0-3：候选期检测到的「未归属拾取」次数——候选 id 之外的人捡银币（evt=62）。
+        /// 这些钱不入账（归属不改），只计数并通过收益页/状态栏暴露，避免「有拾取但收益不动」的静默。
+        /// </summary>
+        public static int UnattributedPickups { get { lock (_gate) { return _unattributedPickups; } } }
+
+        /// <summary>P0-3：候选 TTL 到期自愈次数（收益页/状态栏可提示「候选已超时重置 N 次」）。</summary>
+        public static int CandidateTtlExpiries { get { lock (_gate) { return _candidateTtlExpiries; } } }
+
+        /// <summary>候选起始时刻（UTC，default 表示当前无候选）；供 UI 显示剩余有效期。</summary>
+        public static DateTime CandidateSinceUtc { get { lock (_gate) { return _candidateSince; } } }
 
         public static string? ManualName { get { lock (_gate) { return _manualName; } } }
 
@@ -264,12 +285,17 @@ namespace AlbionCompanion.Core
         /// evt=62 TakeSilver：弱证据。Confirmed+本人 → CountAsMine；
         /// Unknown/Candidate 首个拾取者 → 置候选并挂起（Pending）；其余 → Ignore。
         /// silverAfterTax 为原始 FixPoint 值（供余额严格比对）。
+        /// P0-3（保守修复，不改归属语义）：Candidate 分支先做 TTL 自愈——候选超 10 分钟未被确认 → 回 Unknown，
+        /// 本次拾取按「首捡」重新起候选；候选之外的拾取仍然 Ignore（不入账），但计「未归属拾取」暴露给 UI。
         /// </summary>
         public static TakeSilverDisposition OnTakeSilver(long pickerId, long silverAfterTax)
         {
             if (pickerId <= 0) return TakeSilverDisposition.Ignore;
             lock (_gate)
             {
+                // P0-3：候选 TTL 到期先自愈，避免把别的人（队友）当成本人候选锁死
+                if (_state == IdentityState.Candidate) SweepCandidateLocked(DateTime.UtcNow);
+
                 if (_state == IdentityState.Confirmed)
                 {
                     if (_confirmedId == pickerId) return TakeSilverDisposition.CountAsMine;
@@ -294,9 +320,27 @@ namespace AlbionCompanion.Core
                     _accSinceMoney += Math.Max(0, silverAfterTax);
                     return TakeSilverDisposition.Pending;
                 }
-                // ⑤ 候选之外的拾取者：丢弃这笔，但不动候选（可能只是队友在捡）
+                // ⑤ 候选之外的拾取者：丢弃这笔，但不动候选（可能只是队友在捡）。
+                // P0-3：不再静默——计「未归属拾取」，由收益页/状态栏展示（归属语义不变：仍不入账）。
+                _unattributedPickups++;
+                if (_unattributedPickups == 1 || _unattributedPickups % 20 == 0)
+                {
+                    Log("[身份] 候选期检测到他人拾取（ObjectId=" + pickerId + "），未归属拾取累计 "
+                        + _unattributedPickups + " 次（不入账；候选 ObjectId=" + _candidateId + "，超 "
+                        + (int)CandidateTtl.TotalMinutes + " 分钟未确认将自动重置）");
+                }
                 return TakeSilverDisposition.Ignore;
             }
+        }
+
+        /// <summary>
+        /// P0-3：候选 TTL 检查（可注入「现在」，测试与 UI 定时刷新共用；不触发事件、线程安全）。
+        /// 候选超过 <see cref="CandidateTtl"/> 仍未确认 → 回 Unknown，候选及其挂起收益整体丢弃（挂起本来就不计入合计）。
+        /// 返回 true 表示本次调用确实发生了超时重置。
+        /// </summary>
+        public static bool SweepCandidate(DateTime nowUtc)
+        {
+            lock (_gate) { return SweepCandidateLocked(nowUtc); }
         }
 
         /// <summary>
@@ -347,6 +391,7 @@ namespace AlbionCompanion.Core
                         long dropped = _candidateSilver / 10000;
                         _state = IdentityState.Unknown;
                         _candidateId = null;
+                        _candidateSince = default(DateTime);
                         _candidateHits = 0;
                         _candidateSilver = 0;
                         _accSinceMoney = 0;
@@ -411,6 +456,8 @@ namespace AlbionCompanion.Core
                 _candidateSince = default(DateTime);
                 _candidateHits = 0;
                 _candidateSilver = 0;
+                _unattributedPickups = 0;
+                _candidateTtlExpiries = 0;
                 _accSinceMoney = 0;
                 _lastBalance = null;
             }
@@ -440,6 +487,7 @@ namespace AlbionCompanion.Core
 
             long? candidateId = _candidateId;
             _candidateId = null;
+            _candidateSince = default(DateTime);
             _candidateHits = 0;
             _candidateSilver = 0;
             _accSinceMoney = 0;
@@ -470,6 +518,33 @@ namespace AlbionCompanion.Core
             _accSinceMoney = 0;
             // _confirmedName 清空但 _lastSelfName 保留（供 evt=29 规则①的名字比对）
             _confirmedName = null;
+        }
+
+        /// <summary>
+        /// P0-3：候选 TTL 到期处理（调用方必须已持有 _gate）。
+        /// 只有「候选超过 10 分钟且期间没有任何权威证据」才清空——Confirmed 态与 Unknown 态一律不动。
+        /// 同时清掉 IncomeTracker 里该候选的挂起条目（它们从未计入任何合计，丢弃不改变已展示收益）。
+        /// </summary>
+        private static bool SweepCandidateLocked(DateTime nowUtc)
+        {
+            if (_state != IdentityState.Candidate) return false;
+            if (_candidateSince == default(DateTime)) return false;
+            if (nowUtc - _candidateSince < CandidateTtl) return false;
+
+            long? expiredCandidate = _candidateId;
+            long droppedSilver = Math.Max(0, _candidateSilver) / 10000;
+            _state = IdentityState.Unknown;
+            _candidateId = null;
+            _candidateSince = default(DateTime);
+            _candidateHits = 0;
+            _candidateSilver = 0;
+            _accSinceMoney = 0;
+            _candidateTtlExpiries++;
+            IncomeTracker.DiscardPending();
+            Log("[身份] 候选 ObjectId=" + expiredCandidate + " 超过 " + (int)CandidateTtl.TotalMinutes
+                + " 分钟未确认，已回到未识别（丢弃挂起 " + droppedSilver
+                + " 银币）；下一次拾取将重新起候选");
+            return true;
         }
 
         private static void Log(string message)

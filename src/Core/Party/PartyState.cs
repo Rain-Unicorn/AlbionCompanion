@@ -392,7 +392,7 @@ namespace AlbionCompanion.Core.Party
         /// <summary>测试钩子：指定缓存目录（LoadOrRestore 内部也调用）。</summary>
         public static void SetCacheDir(string dir) { lock (_gate) _cacheDir = dir; }
 
-        /// <summary>测试钩子：立即落盘（取消防抖）。</summary>
+        /// <summary>立即落盘（取消防抖）。生产调用点：CompanionApp.DrainOnExit（退出排水）；测试也用它。</summary>
         public static void FlushCache()
         {
             lock (_gate) SaveLocked(immediate: true);

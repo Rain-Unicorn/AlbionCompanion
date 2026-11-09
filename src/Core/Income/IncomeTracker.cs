@@ -49,6 +49,11 @@ namespace AlbionCompanion.Core.Income
         public int UnconfirmedRecords;    // pending 条数
         public int AmountUnconfirmedCount; // 金额待确认条数（evt=243）
         public long PendingSilver;        // pending 合计（显示单位）
+        /// <summary>
+        /// pending 超过 <see cref="IncomeTracker.MaxPending"/> 被丢弃的最旧条数（累计；Reset 归零）。
+        /// 不为 0 时收益页/状态栏必须显式提示——旧实现是静默 RemoveRange，用户只看到「待确认没涨」。
+        /// </summary>
+        public long DroppedPendingCount;
         public int RecordCount;
     }
 
@@ -66,6 +71,9 @@ namespace AlbionCompanion.Core.Income
         private static readonly object _lock = new object();
         private static readonly List<IncomeRecord> _confirmed = new List<IncomeRecord>();
         private static readonly List<IncomeRecord> _pending = new List<IncomeRecord>();
+
+        // pending 溢出丢弃计数（P2：旧实现 MaxPending 裁剪是静默的）。累计作用域 = 本次会话，Reset 归零。
+        private static long _droppedPending;
 
         // 本次会话起点：LoadRecent 恢复的历史记录只用于「总收益/CSV/持久化」，不得计入「本次收益/时薪」。
         // 存 sum+count 而不是下标：_confirmed 超过 MaxConfirmed 时会 RemoveRange(0,n)，下标会失效。
@@ -85,6 +93,12 @@ namespace AlbionCompanion.Core.Income
         public static long TotalSilver
         {
             get { lock (_lock) { return SumLocked(_confirmed); } }
+        }
+
+        /// <summary>pending 超上限被丢弃的最旧条数（累计，Reset 归零）。UI/状态栏读此值做非静默提示。</summary>
+        public static long DroppedPendingRecords
+        {
+            get { lock (_lock) { return _droppedPending; } }
         }
 
         /// <summary>正式入账（已确认是我的收益）。</summary>
@@ -129,7 +143,13 @@ namespace AlbionCompanion.Core.Income
             {
                 r.Pending = true;
                 _pending.Add(r);
-                if (_pending.Count > MaxPending) _pending.RemoveRange(0, _pending.Count - MaxPending);
+                if (_pending.Count > MaxPending)
+                {
+                    // P2：溢出丢最旧，但必须计数暴露（旧实现静默 RemoveRange，UI 完全无感）
+                    int overflow = _pending.Count - MaxPending;
+                    _pending.RemoveRange(0, overflow);
+                    _droppedPending += overflow;
+                }
             }
         }
 
@@ -188,6 +208,7 @@ namespace AlbionCompanion.Core.Income
                 s.UnconfirmedRecords = _pending.Count;
                 s.AmountUnconfirmedCount = CountAmountUnconfirmedLocked(_confirmed);
                 s.PendingSilver = SumLocked(_pending);
+                s.DroppedPendingCount = _droppedPending;
                 s.RecordCount = _confirmed.Count + _pending.Count;
                 return s;
             }
@@ -210,7 +231,7 @@ namespace AlbionCompanion.Core.Income
 
         public static void Reset()
         {
-            lock (_lock) { _confirmed.Clear(); _pending.Clear(); _sessionBaselineSum = 0; _sessionBaselineCount = 0; }
+            lock (_lock) { _confirmed.Clear(); _pending.Clear(); _sessionBaselineSum = 0; _sessionBaselineCount = 0; _droppedPending = 0; }
         }
 
         // ---- CSV 导出（§8.3.4）：8 列固定顺序、UTF8 BOM、\r\n、Quote 复用 IncomeLedger ----

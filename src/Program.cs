@@ -13,6 +13,10 @@ namespace AlbionCompanion.UI
         [STAThread]
         private static void Main()
         {
+            // 高 DPI（设计规范缺失项）：本程序无 app.manifest，坐标全是硬编码像素，
+            // 125%/150% 缩放下必须显式声明 SystemAware 才不会错位。
+            // 必须在 EnableVisualStyles / 任何窗体创建之前调用（.NET 8 WinForms API）。
+            Application.SetHighDpiMode(HighDpiMode.SystemAware);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
@@ -89,7 +93,15 @@ namespace AlbionCompanion.UI
                 MobDatabase.Load(mobsPath, locPath);
                 System.Diagnostics.Debug.WriteLine("MobDatabase loaded: " + MobDatabase.MobCount + " mobs");
 
-                Application.Run(new CompanionApp(runtime));
+                // P1-13：无论消息循环如何退出（托盘 Quit / 系统关机 / 未捕获异常），都排空收益 JSONL 与队伍缓存
+                try
+                {
+                    Application.Run(new CompanionApp(runtime));
+                }
+                finally
+                {
+                    CompanionApp.DrainOnExit();
+                }
             }
         }
 

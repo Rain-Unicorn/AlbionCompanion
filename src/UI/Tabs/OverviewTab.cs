@@ -73,9 +73,19 @@ namespace AlbionCompanion.UI.Tabs
 
             // 收益（C7/§8.4：一次取齐 GetSummary——合计与明细条数均来自 summary，与收益页/悬浮条同源，§9.7）
             // 复核修复：总览的「银币收益」是本次会话口径 → SessionTotal/SessionCount（排除 JSONL 历史恢复）
+            // 复核 P0-3/P2：副标题显式暴露 待确认 / 未归属拾取 / 挂起溢出丢弃，避免「有拾取但数字不动」的静默
             var incSum = IncomeTracker.GetSummary();
-            _income.SetData("银币收益", Th.Money(incSum.SessionTotal),
-                            "本次明细 " + incSum.SessionCount + " 条");
+            var incNotes = new List<string>();
+            incNotes.Add("本次明细 " + incSum.SessionCount + " 条");
+            if (incSum.ConfirmedTotal != incSum.SessionTotal)
+                incNotes.Add("累计 " + Th.Money(incSum.ConfirmedTotal));
+            int incUnconfirmed = incSum.UnconfirmedRecords + incSum.AmountUnconfirmedCount;
+            if (incUnconfirmed > 0) incNotes.Add("待确认 " + incUnconfirmed + " 笔");
+            int incUnattributed = LocalPlayerIdentity.UnattributedPickups;
+            if (incUnattributed > 0) incNotes.Add("未归属 " + incUnattributed + " 次");
+            if (incSum.DroppedPendingCount > 0) incNotes.Add("溢出丢弃 " + incSum.DroppedPendingCount + " 笔");
+            _income.SetData("银币收益（本次会话）", Th.Money(incSum.SessionTotal),
+                            string.Join(" · ", incNotes.ToArray()));
             var income = GameEvents.SnapshotIncome();
 
             // 合并最近动态：三份快照在锁外归并，UI 不再持有活集合
