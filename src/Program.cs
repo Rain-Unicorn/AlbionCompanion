@@ -42,6 +42,17 @@ namespace AlbionCompanion.UI
                 var settings = SettingsStore.Load(path);
                 var runtime = new Runtime(settings, path);
 
+                // P0-1 收口（复核）：JoinResponse 权威 OperationCode 由实机取证给出。
+                // 0 = 未取证 → 保持 null 白名单（精确等值匹配、不确认身份），绝不猜值放宽；
+                // 取证方式见 HANDOFF「P0-1 JoinResponse 取证」：实机跑一次，从 events.log 的
+                // 「[OpResp] opCode=.. ret=.. keys=[..]」行取稳定值，填 settings.json 的
+                // JoinResponseOperationCode 后重启即启用。
+                if (settings.JoinResponseOperationCode > 0)
+                {
+                    PhotonParser.JoinResponseOperationCode = (byte)settings.JoinResponseOperationCode;
+                    System.Diagnostics.Debug.WriteLine("[P0-1] JoinResponseOperationCode=" + settings.JoinResponseOperationCode);
+                }
+
                 // R1/C3：播种「我的角色」手选名（弱兜底：等 evt=29 名字命中再绑定 ObjectId）
                 if (!string.IsNullOrEmpty(settings.LocalPlayerName))
                     LocalPlayerIdentity.SetManualName(settings.LocalPlayerName);

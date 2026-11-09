@@ -141,6 +141,10 @@ namespace AlbionCompanion.Core
         public string LastCities;
         public string LocalPlayerName = ""; // R1/C3：设置页「我的角色」，无法自动识别身份时的兜底
 
+        // P0-1 收口（复核）：JoinResponse 的权威 OperationCode。0 = 未取证 → 保持禁用（绝不猜值，
+        // 精确等值匹配不变）；实机跑一次后从 events.log 的「[OpResp] opCode=..」行取稳定值填这里。
+        public int JoinResponseOperationCode;
+
         public AppSettings()
         {
             AlwaysOnTop = true;
@@ -150,6 +154,7 @@ namespace AlbionCompanion.Core
             LastItems = "T4_BAG,T5_2H_BOW@2";
             LastCities = "Caerleon,Bridgewatch,Martlock,Thetford,Fortuna,Lymhurst";
             LocalPlayerName = "";
+            JoinResponseOperationCode = 0;
         }
     }
 
@@ -181,6 +186,9 @@ namespace AlbionCompanion.Core
                 if (string.IsNullOrEmpty(settings.Hotkey)) settings.Hotkey = "Ctrl+Alt+A";
                 if (settings.LastCities == null) settings.LastCities = "Caerleon,Bridgewatch,Martlock,Thetford,Fortuna,Lymhurst";
                 if (settings.LocalPlayerName == null) settings.LocalPlayerName = "";
+                // P0-1 收口：码值必须是合法 byte；越界/负值一律回落 0（=禁用），绝不把脏配置当白名单
+                if (settings.JoinResponseOperationCode < 0 || settings.JoinResponseOperationCode > 255)
+                    settings.JoinResponseOperationCode = 0;
                 return settings;
             }
             catch

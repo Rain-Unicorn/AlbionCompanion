@@ -168,11 +168,22 @@ namespace AlbionCompanion.Core
     /// </summary>
     public sealed class MarketRateLimiter
     {
+        /// <summary>滚动窗口长度（Prune/唤醒调度/诊断共用同一口径）。</summary>
+        public static readonly TimeSpan Window = TimeSpan.FromSeconds(60);
+
         private readonly object _sync = new object();
         private readonly Queue<DateTimeOffset> _starts = new Queue<DateTimeOffset>();
         private readonly LinkedList<Waiter> _waiters = new LinkedList<Waiter>();
         private readonly int _maxPerMinute;
         private readonly Func<DateTimeOffset> _clock;
+
+        // P0 复核修复：窗口是「滚动"时间"窗」，不是「事件窗」。旧实现只在 Acquire/Release 两个事件里 Pump，
+        // 因此「60 个名额用满 → 之后不再有新请求/完成事件」时，排队者永远等不到窗口滚动（真实触发：
+        // 市场页大查询 79 批，前 60 批完成后第 61 批永久挂起，UI 卡在「回源 60/79 批」只能重启）。
+        // 现在排队存在时按「最早名额到期时刻」自己安排一次唤醒；唤醒回调里重算窗口后再 Pump。
+        private readonly System.Threading.Timer _wakeTimer;                       // 内置定时器（默认路径）
+        private readonly Func<TimeSpan, Action, IDisposable> _wakeScheduler;      // 可注入调度器（单测用）
+        private IDisposable _pendingWake;                                         // 注入调度器返回的句柄
 
         private sealed class Waiter
         {
@@ -182,11 +193,18 @@ namespace AlbionCompanion.Core
             public Waiter(bool priority) { Priority = priority; }
         }
 
-        public MarketRateLimiter(int maxPerMinute = 60, Func<DateTimeOffset> clock = null)
+        public MarketRateLimiter(int maxPerMinute = 60, Func<DateTimeOffset> clock = null,
+            Func<TimeSpan, Action, IDisposable> wakeScheduler = null)
         {
             if (maxPerMinute <= 0) maxPerMinute = 1;
             _maxPerMinute = maxPerMinute;
             _clock = clock ?? (Func<DateTimeOffset>)(() => DateTimeOffset.UtcNow);
+            _wakeScheduler = wakeScheduler;
+            if (wakeScheduler == null)
+            {
+                _wakeTimer = new System.Threading.Timer(delegate (object state) { OnWake(); },
+                    null, Timeout.Infinite, Timeout.Infinite);
+            }
         }
 
         /// <summary>取得一个请求名额。priority=true（手动查询）插队到所有后台等待者之前。</summary>
@@ -214,6 +232,7 @@ namespace AlbionCompanion.Core
                 {
                     _waiters.AddLast(w);
                 }
+                RescheduleWakeLocked(now);
                 return w.Tcs.Task;
             }
         }
@@ -226,7 +245,53 @@ namespace AlbionCompanion.Core
                 var now = _clock();
                 Prune(now);
                 Pump(now);
+                RescheduleWakeLocked(now);
             }
+        }
+
+        /// <summary>窗口滚动检查点（内置 Timer 到点 / 注入调度器回调时执行）：重算窗口 → 唤醒 → 若仍排队则再排一次。</summary>
+        private void OnWake()
+        {
+            lock (_sync)
+            {
+                var now = _clock();
+                Prune(now);
+                Pump(now);
+                RescheduleWakeLocked(now);
+            }
+        }
+
+        /// <summary>
+        /// 让「排队」自己推进：没有新的 Acquire/Release 事件时，也必须有人把时间窗推过去。
+        /// 延迟 = 窗口内最早名额的到期时刻 - now（至少 1ms）；队列清空后立刻取消，不留空转定时器。
+        /// </summary>
+        private void RescheduleWakeLocked(DateTimeOffset now)
+        {
+            if (_waiters.Count == 0 || _starts.Count < _maxPerMinute)
+            {
+                CancelWakeLocked();
+                return;
+            }
+
+            DateTimeOffset due = _starts.Peek() + Window;
+            TimeSpan delay = due - now;
+            if (delay < TimeSpan.FromMilliseconds(1)) delay = TimeSpan.FromMilliseconds(1);
+
+            if (_wakeTimer != null)
+            {
+                _wakeTimer.Change(delay, Timeout.InfiniteTimeSpan);
+                return;
+            }
+
+            // 注入调度器（单测）：由测试控制何时触发回调，断言「不依赖外部 Release 也能醒」
+            if (_pendingWake != null) { try { _pendingWake.Dispose(); } catch { } _pendingWake = null; }
+            _pendingWake = _wakeScheduler(delay, OnWake);
+        }
+
+        private void CancelWakeLocked()
+        {
+            if (_wakeTimer != null) { _wakeTimer.Change(Timeout.Infinite, Timeout.Infinite); }
+            if (_pendingWake != null) { try { _pendingWake.Dispose(); } catch { } _pendingWake = null; }
         }
 
         /// <summary>当前窗口内已开始的请求数（诊断/单测用）。</summary>

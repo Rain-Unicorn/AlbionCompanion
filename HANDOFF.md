@@ -122,6 +122,19 @@ src/
 - **同源取数**: 总览采集卡片/收益卡片、收益页大数字、明细表全部改读 GatheringTracker.GetSummary()/IncomeTracker.GetSummary()/Snapshot()；收益明细列改「时间/来源/银币/待确认」，pending 与金额待确认条目金额列显示「待确认」
 - **测试**: T-15（来源分流+243 形态+采集聚合+小计自洽）、T-15b（JSONL 落盘/重载/CSV BOM+表头+行数），累计 246 断言全绿；编译 0 错误/130 警告（与基线零新增）
 
+## P0-1 JoinResponse 取证（复核补齐 2026-11-09）
+
+- **现状**：判定已收紧为「OperationCode 精确等值匹配」，但权威码值尚未实机取证 → 默认 `JoinResponseOperationCode = null`，
+  **完全不确认身份**（有意保守：不再「非零即接受」，避免无关响应把用户累计伤害清零）。
+- **取证**：实机启动游戏并登录一次；`events.log` 会出现 `[OpResp] opCode=.. ret=.. keys=[..]` 行
+  （复核前该行只进 UI、不落盘，取证链路是断的，现已修复为同时写 events.log）。
+- **收口**：取 `ret=0` 且 `keys` 含 0（UserObjectId）、2（Username）的那条稳定 `opCode`，填进
+  `%AppData%\AlbionCompanion\settings.json` 的 `JoinResponseOperationCode`（0=禁用），重启即启用。
+  码值越界/负值会回落 0，绝不把脏配置当白名单。
+- **启用后**：身份主路径（服务器权威）恢复；evt=81 余额严格匹配 / evt=29 名字命中 / 手选名兜底保持不变。
+- **未清 P0（需产品口径）**：evt=62「首个拾取者即候选」在组队场景可能锁到队友，本人拾取会被静默 Ignore
+  （候选无超时、无人工出口）。修法涉及归属语义，未擅自改，见复核报告 P0-3。
+
 ## 调试
 - 事件日志: `bin\Debug\net8.0-windows\events.log`（记录所有游戏事件码和参数）
 - 调试时通过events.log确认新事件的真实码和参数布局

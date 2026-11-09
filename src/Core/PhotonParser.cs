@@ -429,8 +429,20 @@ namespace AlbionCompanion.Core
             // 只在码值或参数键组合变化时打一行，避免刷屏；始终保留最近一条供 UI/LiveTab 读取
             string prev = LastOperationCodeSample;
             LastOperationCodeSample = sample;
-            if (prev != sample && OnDebug != null)
-                OnDebug("  [OpResp] " + sample);
+            if (prev == sample) return;
+
+            if (OnDebug != null) OnDebug("  [OpResp] " + sample);
+
+            // P0-1 复核：取证行必须落盘。旧实现只走 OnDebug → UI（面板未展开时根本看不到），
+            // events.log 里没有任何 [OpResp] 行 —— 注释要求的「从 events.log 取 opCode」实际不可能完成，
+            // 导致 JoinResponse 白名单永远填不上、身份主路径永久禁用。
+            try
+            {
+                string logPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "events.log");
+                System.IO.File.AppendAllText(logPath,
+                    DateTime.Now.ToString("HH:mm:ss.fff") + " [OpResp] " + sample + Environment.NewLine);
+            }
+            catch { /* 取证日志写失败不影响解析 */ }
         }
 
         private static int ReadInt32BE(byte[] d, int o)

@@ -2067,7 +2067,84 @@ static class LogicTests
         // ───────────────── M4 三级筛选：元数据分类树 + 查价键 ─────────────────
         RunTaxonomyTests();
 
+        // ───────────────── 复核 P0：限流器窗口滚动必须自动唤醒排队者（不依赖外部 Release） ─────────────────
+        RunRateLimiterWakeTests();
+
+        // ───────────────── 复核 P0：JoinResponse 码值可配置（0=禁用，越界回落 0） ─────────────────
+        RunJoinResponseConfigTests();
+
         Console.WriteLine("passed=" + _pass + " failed=" + _fail);
         return _fail == 0 ? 0 : 1;
+    }
+
+    // ───────────────── 复核 P0：JoinResponse 码值可配置（0=禁用，越界回落 0） ─────────────────
+    // 背景：P0-1 把判定收紧为「精确码等值」，但权威码未取证时白名单为 null → 身份主路径永久禁用。
+    // 收口方式：实机取证后把码值写进 settings.json，启动时注入；0 = 保持禁用（绝不猜值）。
+    static void RunJoinResponseConfigTests()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "ac-settings-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var s = new AppSettings { JoinResponseOperationCode = 37 };
+            SettingsStore.Save(path, s);
+            Eq("P0 JoinResponse：取证码值可从 settings.json 读回", SettingsStore.Load(path).JoinResponseOperationCode, 37);
+
+            s.JoinResponseOperationCode = 300;
+            SettingsStore.Save(path, s);
+            Eq("P0 JoinResponse：越界码值回落 0（禁用，不放宽白名单）",
+                SettingsStore.Load(path).JoinResponseOperationCode, 0);
+
+            s.JoinResponseOperationCode = -1;
+            SettingsStore.Save(path, s);
+            Eq("P0 JoinResponse：负值回落 0（禁用）",
+                SettingsStore.Load(path).JoinResponseOperationCode, 0);
+        }
+        finally
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
+        }
+    }
+
+    sealed class NoopDisposable : IDisposable { public void Dispose() { } }
+
+    // ───────────────── 复核 P0：限流器窗口滚动必须自动唤醒排队者 ─────────────────
+    // 旧实现只在 Acquire/Release 事件里 Pump，窗口用满后若没有新事件，排队者永久挂起
+    // （真实触发：市场页大查询 79 批，第 61 批卡死，UI 停在「回源 60/79 批」）。
+    static void RunRateLimiterWakeTests()
+    {
+        var clockNow = new DateTimeOffset(2026, 11, 9, 0, 0, 0, TimeSpan.Zero);
+        var wakes = new List<(TimeSpan Delay, Action Callback)>();
+        Func<TimeSpan, Action, IDisposable> recorder = delegate (TimeSpan delay, Action callback)
+        {
+            wakes.Add((delay, callback));
+            return new NoopDisposable();
+        };
+
+        // 1) 窗口未满：立即放行，且不得安排任何定时器
+        var noQueue = new MarketRateLimiter(60, () => clockNow, recorder);
+        Check("P0 限流器：窗口有空位时立即放行", noQueue.AcquireAsync(false).IsCompleted, "应已完成");
+        Eq("P0 限流器：无排队时不安排定时器", wakes.Count, 0);
+
+        // 2) 窗口用满 + 第 61 个请求排队：必须自己安排一次唤醒（而不是等外部 Release）
+        var limiter = new MarketRateLimiter(60, () => clockNow, recorder);
+        for (int i = 0; i < 60; i++)
+        {
+            var t = limiter.AcquireAsync(i % 2 == 0);
+            Check("P0 限流器：窗口内第 " + (i + 1) + " 个名额立即放行", t.IsCompleted, "应已完成");
+        }
+        var queued = limiter.AcquireAsync(true);
+        Check("P0 限流器：第 61 个请求进入排队", !queued.IsCompleted, "不应已完成");
+        Check("P0 限流器：排队时自己安排唤醒（不依赖外部 Release）", wakes.Count == 1, "wakes=" + wakes.Count);
+        Check("P0 限流器：唤醒延迟 = 最早名额到期时间（≈60s）",
+            wakes.Count == 1 && wakes[0].Delay.TotalSeconds > 59 && wakes[0].Delay.TotalSeconds <= 60,
+            wakes.Count == 1 ? "delay=" + wakes[0].Delay.TotalSeconds : "无唤醒");
+
+        // 3) 真实场景：没有任何新请求/Release，只有时间流逝 → 定时器到点必须放出名额
+        clockNow = clockNow.AddSeconds(61);
+        wakes[0].Callback();
+        Check("P0 限流器：时钟越过窗口后唤醒排队者（修复前永久挂起）", queued.IsCompleted, "应已完成");
+
+        // 4) 队列清空后不得再安排新的唤醒
+        Eq("P0 限流器：队列清空后不再重复安排唤醒", wakes.Count, 1);
     }
 }
