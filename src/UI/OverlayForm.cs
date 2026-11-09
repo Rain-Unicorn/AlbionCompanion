@@ -4,10 +4,17 @@ using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 using AlbionCompanion.Core;
 using AlbionCompanion.Core.Income;
+using AlbionCompanion.Core.Trade;
 
 namespace AlbionCompanion.UI
 {
-    /// <summary>常驻置顶的紧凑悬浮条，单击展开详细面板。</summary>
+    /// <summary>
+    /// 常驻置顶的紧凑悬浮条（352×92），单击展开详细面板。
+    /// 双模式（跑商规范 §5/§8.9）：
+    /// ① 默认「收益」模式 —— 与既有实现完全一致的本次会话收益展示；
+    /// ② 跑商导航激活时切换「路线」模式 —— 与主窗导航卡**共用同一个 NavigationState**
+    ///    （静态单例），下一步只改状态，悬浮条与主窗各自订阅 Changed 重绘，不推不拉。
+    /// </summary>
     public class OverlayForm : Form
     {
         private readonly Runtime _rt;
@@ -60,6 +67,9 @@ namespace AlbionCompanion.UI
                 ApplySettings();
                 Invalidate();
             };
+
+            // 单一状态源：导航状态变化时悬浮条自己重绘（不靠主窗推送）
+            NavigationState.Shared.Changed += OnNavigationChanged;
 
             BuildMenu();
         }
@@ -114,6 +124,12 @@ namespace AlbionCompanion.UI
             if (handler != null) handler(this, EventArgs.Empty);
         }
 
+        private void OnNavigationChanged(object sender, EventArgs e)
+        {
+            if (IsDisposed) return;
+            Invalidate();
+        }
+
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
@@ -154,6 +170,22 @@ namespace AlbionCompanion.UI
             var r = new Rectangle(0, 0, Width - 1, Height - 1);
             Th.FillRound(g, r, 18, Color.FromArgb(21, 24, 30));
             Th.StrokeRound(g, new Rectangle(1, 1, Width - 3, Height - 3), 17, Th.Line);
+
+            // 双模式：导航激活时显示路线，否则保持原「本次会话收益」展示不变
+            var nav = NavigationState.Shared;
+            if (nav.IsActive)
+            {
+                PaintNavigation(g, nav);
+            }
+            else
+            {
+                PaintIncome(g);
+            }
+        }
+
+        /// <summary>原收益展示（保持不变，避免破坏既有收益口径）。</summary>
+        private void PaintIncome(Graphics g)
+        {
             Th.FillRound(g, new Rectangle(12, 22, 3, Height - 44), 1, Th.Accent);
 
             TextRenderer.DrawText(g, "收益", _capFont, new Point(26, 16), Th.Sub,
@@ -189,6 +221,45 @@ namespace AlbionCompanion.UI
                 Th.Sub, TextFormatFlags.NoPrefix);
         }
 
+        /// <summary>路线模式（与主窗导航卡共用 NavigationState.Shared）。</summary>
+        private void PaintNavigation(Graphics g, NavigationState nav)
+        {
+            bool red = nav.IsCurrentRed;
+            Color accent = red ? Th.Bad : Th.Accent;
+
+            // 三处告警之一：左侧竖条
+            Th.FillRound(g, new Rectangle(12, 22, 3, Height - 44), 1, accent);
+
+            string kicker = "路线 · " + (string.IsNullOrEmpty(nav.FormLabel) ? "导航" : nav.FormLabel);
+            TextRenderer.DrawText(g, kicker, _capFont, new Point(26, 16),
+                red ? Th.Bad : Th.Sub, TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+
+            TextRenderer.DrawText(g, nav.Title, _bigFont, new Rectangle(24, 30, 156, 28), Th.Text,
+                TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+
+            TextRenderer.DrawText(g, nav.CurrentText, _lineFont,
+                new Rectangle(26, 60, 158, 18), red ? Th.Bad : Th.Sub,
+                TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(g, nav.IsCurrentRed ? "⚠ 红区" : nav.ProgressText, _hintFont,
+                new Rectangle(26, Height - 22, 156, 16), red ? Th.Bad : Th.Sub,
+                TextFormatFlags.NoPrefix);
+
+            using (var pen = new Pen(Th.Line))
+            {
+                g.DrawLine(pen, 188, 20, 188, Height - 20);
+            }
+
+            TextRenderer.DrawText(g, nav.ProgressText, _lineFont, new Point(204, 14), Th.Text,
+                TextFormatFlags.NoPrefix);
+            TextRenderer.DrawText(g, nav.NextHint, _hintFont,
+                new Rectangle(204, 38, 140, 16), red ? Th.Bad : Th.Sub,
+                TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(g,
+                nav.Arrived ? "导航完成" : "剩余预估 " + Th.Money(nav.EstimatedProfit) + " 银",
+                _hintFont, new Point(204, Height - 22), red ? Th.Bad : Th.Accent,
+                TextFormatFlags.NoPrefix);
+        }
+
         protected override void OnSizeChanged(EventArgs e)
         {
             base.OnSizeChanged(e);
@@ -204,6 +275,21 @@ namespace AlbionCompanion.UI
                 return;
             }
             base.OnFormClosing(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                try { NavigationState.Shared.Changed -= OnNavigationChanged; } catch (ObjectDisposedException) { }
+                _timer.Stop();
+                _timer.Dispose();
+                _capFont.Dispose();
+                _bigFont.Dispose();
+                _lineFont.Dispose();
+                _hintFont.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 }
