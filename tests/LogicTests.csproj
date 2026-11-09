@@ -24,6 +24,7 @@
     <Compile Include="Tests.Income.cs" />
     <Compile Include="Tests.Combat.cs" />
     <Compile Include="Tests.Gathering.cs" />
+    <Compile Include="Tests.Trade.cs" />
     <Compile Include="..\src\GlobalUsings.cs" />
 
     <!-- 待测的 Core 层；OcrHelper 依赖 System.Drawing/WinForms，排除 -->

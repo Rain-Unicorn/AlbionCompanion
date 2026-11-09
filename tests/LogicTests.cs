@@ -110,8 +110,10 @@ static class LogicTests
         Eq("C8/A 判不出类型 → Unit", unknown.Kind, TargetKind.Unit);
 
         // --- 本地玩家自己（IsSelf=true）→ 玩家侧 ---- ---
+        // 战斗线修复：本人目标不能显示成「未知玩家」（那会和路人不明混为一谈），
+        // 统一走身份状态机的展示名（确认前「我（识别中）」/ 确认后真名）。
         var self = TargetNameResolver.Resolve(4242, true, objectNames, mobNames, playerNames);
-        Eq("C8/A 本地玩家未解析 → 未知玩家", self.DisplayName, "未知玩家");
+        Eq("C8/A 本地玩家 → 身份展示名", self.DisplayName, LocalPlayerIdentity.DisplaySelfName);
         Check("C8/A 本地玩家文案不含 ObjectId", !self.DisplayName.Contains("4242"), self.DisplayName);
 
         // --- 已解析：名字字典命中，ObjectId 不进文案 ---
@@ -727,14 +729,15 @@ static class LogicTests
         Eq("A10 持久化行数", loadedDb.Rows.Count, 2);
         Eq("A10 持久化卖价", loadedDb.Find("T4_BAG", "Caerleon", 1).SellMin, 7500L);
 
-        // A11 跑商套利：卖税8% + 创建费2.5%
-        // 卖价 10000 → 净收 10000*(1-0.08-0.025)=8950
-        // 买价 6000（挂收购单）→ 成本 6000*(1+0.025)=6150
-        // 单件净利 = 8950 - 6150 = 2800
+        // A11 跑商套利（复核修正：买卖角色按《跑商模块设计规范》§7）
+        // 正确语义：出发城按 sell_price_min 吃单买入；目的城按 buy_price_max 卖出。
+        // 单件净利 = buy_price_max × (1 − 销售税) − sell_price_min
+        //   Caerleon 买 6000 → Bridgewatch 卖 10000：10000×0.92 − 6000 = 3200
+        // 旧实现把「买价最高的城」当进货地（买卖接反），会产出「从黑市进货」式的幻影路线。
         var arbQuotes = new List<MarketQuote>
         {
-            new MarketQuote { ItemId = "T4_BAG", City = "Caerleon", Quality = 1, SellMin = 10000, BuyMax = 2000 },
-            new MarketQuote { ItemId = "T4_BAG", City = "Bridgewatch", Quality = 1, SellMin = 15000, BuyMax = 6000 },
+            new MarketQuote { ItemId = "T4_BAG", City = "Caerleon", Quality = 1, SellMin = 6000, BuyMax = 2000 },
+            new MarketQuote { ItemId = "T4_BAG", City = "Bridgewatch", Quality = 1, SellMin = 15000, BuyMax = 10000 },
             new MarketQuote { ItemId = "T4_FOOD", City = "Caerleon", Quality = 1, SellMin = 5000, BuyMax = 4800 },
             new MarketQuote { ItemId = "T4_FOOD", City = "Bridgewatch", Quality = 1, SellMin = 5200, BuyMax = 4700 },
         };
@@ -742,11 +745,11 @@ static class LogicTests
         Check("A11 出一条有效路线", routes.Count == 1, "count=" + routes.Count);
         if (routes.Count == 1)
         {
-            Eq("A11 买价取最高收购", routes[0].BuyPrice, 6000L);
-            Eq("A11 卖价取最低挂卖", routes[0].SellPrice, 10000L);
-            Eq("A11 单件净利", routes[0].NetProfit, 2800L);
-            Check("A11 卖城=Caerleon", routes[0].SellCity == "Caerleon", routes[0].SellCity);
-            Check("A11 买城=Bridgewatch", routes[0].BuyCity == "Bridgewatch", routes[0].BuyCity);
+            Eq("A11 出发城按 sell_price_min 吃单买入", routes[0].BuyPrice, 6000L);
+            Eq("A11 目的城按 buy_price_max 卖出", routes[0].SellPrice, 10000L);
+            Eq("A11 单件净利（税后卖入 − 吃单成本）", routes[0].NetProfit, 3200L);
+            Check("A11 出发城=Caerleon（吃单买入）", routes[0].BuyCity == "Caerleon", routes[0].BuyCity);
+            Check("A11 目的城=Bridgewatch（按收购单卖出）", routes[0].SellCity == "Bridgewatch", routes[0].SellCity);
         }
 
         // 同城里没有差价路线
@@ -768,7 +771,7 @@ static class LogicTests
             var arbNow = new DateTimeOffset(2026, 11, 9, 6, 40, 0, TimeSpan.Zero);
             int dropped;
 
-            // ① 卖侧陈旧：SellMin=9000 但 SellMinDate=arbNow-30d。唯一能赚钱的卖城是死价，
+            // ① 出发城买价陈旧：SellMin=9000 但 SellMinDate=arbNow-30d。唯一能买的城是死价，
             //    该物品必须不产出任何路线（巡检明确要求的复验用例）。
             var staleSell = new List<MarketQuote>
             {
@@ -780,10 +783,10 @@ static class LogicTests
                                   BuyMax = 6000, BuyMaxDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss") },
             };
             var staleSellRoutes = Arbitrage.Compute(staleSell, 0.08, 0.025, 0, arbNow, out dropped);
-            Eq("A13 陈旧卖价（arbNow-30d）不产出路线", staleSellRoutes.Count, 0);
-            Eq("A13 陈旧卖价计入 droppedStale", dropped, 1);
+            Eq("A13 陈旧出发城买价（arbNow-30d）不产出路线", staleSellRoutes.Count, 0);
+            Eq("A13 陈旧出发城买价计入 droppedStale", dropped, 1);
 
-            // ② 买侧陈旧：BuyMax 很高但 BuyMaxDate=arbNow-30d，同样不得选为买城
+            // ② 目的城卖价陈旧：BuyMax 很高但 BuyMaxDate=arbNow-30d，同样不得选为卖城
             var staleBuy = new List<MarketQuote>
             {
                 new MarketQuote { ItemId = "T4_STALEBUY", City = "Caerleon", Quality = 1,
@@ -794,65 +797,67 @@ static class LogicTests
                                   BuyMax = 6000,  BuyMaxDate = arbNow.AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ss") },
             };
             var staleBuyRoutes = Arbitrage.Compute(staleBuy, 0.08, 0.025, 0, arbNow, out dropped);
-            Eq("A13 陈旧买价（arbNow-30d）不产出路线", staleBuyRoutes.Count, 0);
-            Eq("A13 陈旧买价计入 droppedStale", dropped, 1);
+            Eq("A13 陈旧目的城卖价（arbNow-30d）不产出路线", staleBuyRoutes.Count, 0);
+            Eq("A13 陈旧目的城卖价计入 droppedStale", dropped, 1);
 
             // ③ 边界：恰好 24h 内（arbNow-23h）仍算新鲜，必须正常出路线
+            //    新语义：出发城 SellMin=6000 买入、目的城 BuyMax=10000 卖出 → 净利 3200
             var freshEdge = new List<MarketQuote>
             {
                 new MarketQuote { ItemId = "T4_EDGE", City = "Caerleon", Quality = 1,
-                                  SellMin = 10000, SellMinDate = arbNow.AddHours(-23).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  SellMin = 6000, SellMinDate = arbNow.AddHours(-23).ToString("yyyy-MM-ddTHH:mm:ss"),
                                   BuyMax = 0,      BuyMaxDate = "" },
                 new MarketQuote { ItemId = "T4_EDGE", City = "Bridgewatch", Quality = 1,
                                   SellMin = 0,     SellMinDate = "",
-                                  BuyMax = 6000,   BuyMaxDate = arbNow.AddHours(-23).ToString("yyyy-MM-ddTHH:mm:ss") },
+                                  BuyMax = 10000,  BuyMaxDate = arbNow.AddHours(-23).ToString("yyyy-MM-ddTHH:mm:ss") },
             };
             var freshEdgeRoutes = Arbitrage.Compute(freshEdge, 0.08, 0.025, 0, arbNow, out dropped);
             Eq("A13 23h 内报价仍新鲜：出路线", freshEdgeRoutes.Count, 1);
             Eq("A13 23h 内报价不产生剔除计数", dropped, 0);
 
-            // ④ 边界：恰好超过 24h（arbNow-25h）必须剔除
+            // ④ 边界：恰好超过 24h（arbNow-25h）必须剔除（出发城买价陈旧 → 没有可买货源）
             var staleEdge = new List<MarketQuote>
             {
                 new MarketQuote { ItemId = "T4_EDGE2", City = "Caerleon", Quality = 1,
-                                  SellMin = 10000, SellMinDate = arbNow.AddHours(-25).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  SellMin = 6000, SellMinDate = arbNow.AddHours(-25).ToString("yyyy-MM-ddTHH:mm:ss"),
                                   BuyMax = 0,      BuyMaxDate = "" },
                 new MarketQuote { ItemId = "T4_EDGE2", City = "Bridgewatch", Quality = 1,
                                   SellMin = 0,     SellMinDate = "",
-                                  BuyMax = 6000,   BuyMaxDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss") },
+                                  BuyMax = 10000,  BuyMaxDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss") },
             };
             var staleEdgeRoutes = Arbitrage.Compute(staleEdge, 0.08, 0.025, 0, arbNow, out dropped);
-            Eq("A13 25h 卖价被剔除：不出路线", staleEdgeRoutes.Count, 0);
-            Eq("A13 25h 卖价计入剔除计数", dropped, 1);
+            Eq("A13 25h 出发城买价被剔除：不出路线", staleEdgeRoutes.Count, 0);
+            Eq("A13 25h 出发城买价计入剔除计数", dropped, 1);
 
-            // ⑤ 陈旧卖价存在、但另有新鲜卖城：必须挑新鲜那个，而不是被死价带偏
+            // ⑤ 陈旧出发城存在、但另有新鲜出发城：必须挑新鲜那个，而不是被死价带偏
+            //    Caerleon 买价陈旧 → 跳过；Martlock 买 6000 新鲜 → 卖出 Bridgewatch 10000 → 净利 3200
             var preferFresh = new List<MarketQuote>
             {
                 new MarketQuote { ItemId = "T4_MIX", City = "Caerleon", Quality = 1,
                                   SellMin = 8000,  SellMinDate = arbNow.AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ss"),
                                   BuyMax = 0,      BuyMaxDate = "" },
                 new MarketQuote { ItemId = "T4_MIX", City = "Martlock", Quality = 1,
-                                  SellMin = 10000, SellMinDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss"),
+                                  SellMin = 6000,  SellMinDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss"),
                                   BuyMax = 0,      BuyMaxDate = "" },
                 new MarketQuote { ItemId = "T4_MIX", City = "Bridgewatch", Quality = 1,
                                   SellMin = 0,     SellMinDate = "",
-                                  BuyMax = 6000,   BuyMaxDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss") },
+                                  BuyMax = 10000,  BuyMaxDate = arbNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm:ss") },
             };
             var mixRoutes = Arbitrage.Compute(preferFresh, 0.08, 0.025, 0, arbNow, out dropped);
             Eq("A13 混合场景：仍按新鲜价出 1 条路线", mixRoutes.Count, 1);
             if (mixRoutes.Count == 1)
-                Check("A13 混合场景：卖城取新鲜城 Martlock 而非死价城 Caerleon",
-                      mixRoutes[0].SellCity == "Martlock", mixRoutes[0].SellCity);
-            Eq("A13 混合场景：陈旧卖价计入剔除计数", dropped, 1);
+                Check("A13 混合场景：出发城取新鲜城 Martlock 而非死价城 Caerleon",
+                      mixRoutes[0].BuyCity == "Martlock", mixRoutes[0].BuyCity);
+            Eq("A13 混合场景：陈旧买价计入剔除计数", dropped, 1);
 
             // ⑥ 无时间戳（空串 / 0001 哨兵）不判陈旧 —— 与 MarketClient.IsSellStale 既有口径一致，
-            //    避免把「CSV 无日期列」的历史本地库整行清空（A11 的四条无日期报价必须继续有效）
+            //    避免把「CSV 无日期列」的历史本地库整行清空（A11 的无日期报价必须继续有效）
             var noDate = new List<MarketQuote>
             {
                 new MarketQuote { ItemId = "T4_NODATE", City = "Caerleon", Quality = 1,
-                                  SellMin = 10000, SellMinDate = "", BuyMax = 0, BuyMaxDate = "" },
+                                  SellMin = 6000, SellMinDate = "", BuyMax = 0, BuyMaxDate = "" },
                 new MarketQuote { ItemId = "T4_NODATE", City = "Bridgewatch", Quality = 1,
-                                  SellMin = 0, SellMinDate = "", BuyMax = 6000,
+                                  SellMin = 0, SellMinDate = "", BuyMax = 10000,
                                   BuyMaxDate = "0001-01-01T00:00:00" },
             };
             var noDateRoutes = Arbitrage.Compute(noDate, 0.08, 0.025, 0, arbNow, out dropped);
@@ -2084,6 +2089,7 @@ static class LogicTests
         CombatModuleTests.Run();
         GatheringModuleTests.Run();
         MarketModuleTests.Run();
+        TradeModuleTests.Run();
 
         // ───────────────── 复核 P0：JoinResponse 码值可配置（0=禁用，越界回落 0） ─────────────────
         RunJoinResponseConfigTests();
