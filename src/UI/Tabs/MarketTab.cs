@@ -415,6 +415,17 @@ namespace AlbionCompanion.UI.Tabs
             var targets = CurrentTargets(out qualities);
             if (targets == null || targets.Count == 0)
             {
+                // M5 vs M9 的分界：三级是否已选满。
+                // 选满了却拿不到查询键 = 这个组合在物品表里查不到（MarketQueryPlanner.Build 的
+                // family/variant 为空分支），此时说「未选物品」就是文案说谎——用户明明选满了。
+                if (_tree.IsComplete)
+                {
+                    _card.SetMessage("选中的组合在物品表里查不到",
+                        "「" + (_tree.Family == null ? "该物品" : _tree.Family.Family)
+                        + " T" + _tree.Tier + "」没有对应的物品条目。可按物品 ID 重试（如 T5_2H_BOW@2），或换一个阶级 / 附魔", false);
+                    _selection.Text = "组合不存在";
+                    return;
+                }
                 _card.SetNotSelected();
                 _selection.Text = "未选物品";
                 return;
@@ -636,6 +647,11 @@ namespace AlbionCompanion.UI.Tabs
         private readonly Font _chipFont = Th.F(8f);
         private readonly Font _pathFont = Th.F(8f);
         private readonly System.Windows.Forms.Timer _hoverTimer;
+        // 设计 §8：「MouseLeave 用另一个 300ms _closeTimer」，不能复用 240ms 的悬停迟滞定时器。
+        // 为什么要延时：三列之间有 8px 间隙，指针从一列挪到另一列必然短暂离开控件，
+        // 立即清悬停态会让二级/三级在跨列时抖掉。
+        private readonly System.Windows.Forms.Timer _closeTimer;
+        private const int CloseDelayMs = 300;
 
         private List<ItemCategory> _cats = new List<ItemCategory>();
         private List<ItemSubCategory> _subs = new List<ItemSubCategory>();
@@ -670,6 +686,10 @@ namespace AlbionCompanion.UI.Tabs
             _hoverTimer = new System.Windows.Forms.Timer();
             _hoverTimer.Interval = 240; // 悬停迟滞（规范：240ms）
             _hoverTimer.Tick += delegate { OnHoverTick(); };
+
+            _closeTimer = new System.Windows.Forms.Timer();
+            _closeTimer.Interval = CloseDelayMs; // 延时关闭（规范：300ms，独立于 240ms 迟滞）
+            _closeTimer.Tick += delegate { OnCloseTick(); };
         }
 
         // ── 公共读取 ──────────────────────────────────────────────────────
@@ -748,7 +768,10 @@ namespace AlbionCompanion.UI.Tabs
             _tier = _enchant = 0;
             _scroll[0] = _scroll[1] = _scroll[2] = 0;
             _hoverPendingRow = -1;
+            // ClearInternal 也会在 Dispose 路径被调用：两个定时器都要停，否则残留回调会
+            // 去碰已释放的控件（设计 §8 明确点出这个坑）
             if (_hoverTimer != null) _hoverTimer.Stop();
+            if (_closeTimer != null) _closeTimer.Stop();
         }
 
         // ── 选择逻辑（切换上级必须清空下级，再重算，再重绘）────────────────
@@ -1086,6 +1109,8 @@ namespace AlbionCompanion.UI.Tabs
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            // 指针已进入控件：撤销待关闭（跨列 8px 间隙时靠这个把悬停态留住）
+            if (_closeTimer.Enabled) _closeTimer.Stop();
             int col = ColumnAt(e.X);
             int row = RowAt(col, e.Y);
             if (col != _hoverCol || row != _hoverRow)
@@ -1107,12 +1132,34 @@ namespace AlbionCompanion.UI.Tabs
             }
         }
 
+        /// <summary>
+        /// 指针离开：不立刻清悬停态，改为启动 300ms 延时关闭（设计 §8）。
+        /// 240ms 的 _hoverTimer 是「悬停多久才展开」，语义不同，不能复用——复用会让
+        /// 一次跨列移动同时改写「该展开哪一行」和「该不该关掉」，两个意图互相覆盖。
+        /// </summary>
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
+            _hoverTimer.Stop();
+            _hoverPendingRow = -1;
+            _closeTimer.Stop();
+            _closeTimer.Start();
+        }
+
+        /// <summary>
+        /// 延时到点：**必须复核指针确实不在控件内**再清。
+        /// 只信 MouseLeave 是不够的——快速移出再移回时，Tick 与 MouseEnter 的顺序由消息泵决定，
+        /// 不复核就会把刚移回来的悬停态清掉，正是那个「抖一下」的观感来源。
+        /// </summary>
+        private void OnCloseTick()
+        {
+            _closeTimer.Stop();
+            if (IsDisposed || !IsHandleCreated) return;
+            // Cursor.Position 是屏幕坐标，PointToClient 换成客户区坐标再判
+            if (ClientRectangle.Contains(PointToClient(Cursor.Position))) return;
+            if (_hoverCol < 0 && _hoverRow < 0 && _hoverPendingRow < 0) return;
             _hoverCol = _hoverRow = -1;
             _hoverPendingRow = -1;
-            _hoverTimer.Stop();
             Invalidate();
         }
 
@@ -1282,6 +1329,7 @@ namespace AlbionCompanion.UI.Tabs
             if (disposing)
             {
                 if (_hoverTimer != null) { _hoverTimer.Stop(); _hoverTimer.Dispose(); }
+                if (_closeTimer != null) { _closeTimer.Stop(); _closeTimer.Dispose(); }
                 _headFont.Dispose();
                 _kickerFont.Dispose();
                 _colHeadFont.Dispose();
