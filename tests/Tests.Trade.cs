@@ -129,7 +129,10 @@ static class TradeModuleTests
         DateTimeOffset now;
         BuildDemoFixture(out rows, out meta, out depth, out now);
 
-        var routes = Arbitrage.Compute(rows, F2P, 0.025, 0);
+        // 夹具时间是写死的 2026-11-10T01:00Z，必须把同一个 now 传给 Compute：
+        // 无参重载取 DateTimeOffset.UtcNow，会让夹具在第 25 小时后被 24h 陈旧规则整体剔除（T1 三条断言随运行日期变红）。
+        int droppedStale;
+        var routes = Arbitrage.Compute(rows, F2P, 0.025, 0, now, out droppedStale);
         LogicTests.Eq("T1 演示数据 9 条有效路线（买卖角色已修正）", routes.Count, 9);
 
         Route spear = null;
