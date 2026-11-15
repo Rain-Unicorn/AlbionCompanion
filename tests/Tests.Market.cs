@@ -22,6 +22,9 @@ static class MarketModuleTests
         RunQuoteModelTests();
         RunMarketDbTests();
         RunClockTests();
+        RunCardStateMatrixTests();
+        RunZeroHttpFilterTests();
+        RunM9CombinationTests();
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -552,5 +555,170 @@ static class MarketModuleTests
             Math.Abs((b - wall).TotalMinutes) < 5, "clock=" + b.ToString("O") + " wall=" + wall.ToString("O"));
         LogicTests.Eq("时钟: 时效档按单调 now 判定",
             QuoteTableModel.Classify(TimeSpan.FromMinutes(10)), QuoteFreshness.Fresh);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 10) 报价卡九态矩阵（M1–M9）逐态核对
+    //     基准是 CardState 枚举：枚举里没有的状态 = 代码无法表达 = 没落地。
+    //     九态与枚举不是一对一（M1/M2 共用 Rows，M6 由 UI 显式设置而非由数据推导），
+    //     所以这条只验「枚举能表达 + StateOf 判得对」，UI 落点见提交报告。
+    // ─────────────────────────────────────────────────────────────
+    static void RunCardStateMatrixTests()
+    {
+        var names = Enum.GetNames(typeof(QuoteTableModel.CardState));
+        LogicTests.Eq("九态: CardState 成员数 = 6", names.Length, 6);
+        foreach (var n in new[] { "Rows", "AllSellEmpty", "NoListingAtAll", "NotSelected", "Loading", "NoDataAtAll" })
+            LogicTests.Check("九态: 枚举含 " + n, Array.IndexOf(names, n) >= 0, string.Join("/", names));
+
+        // 固定时间：不依赖真实当前时间（否则超 24h 必红）
+        var now = new DateTimeOffset(2026, 11, 9, 12, 0, 0, TimeSpan.Zero);
+        int qu;
+        var q1 = new MarketQuote
+        {
+            ItemId = "T4_BAG", City = "Bridgewatch", Quality = 1,
+            SellMin = 8420, SellMinDate = now.AddMinutes(-5).ToString("yyyy-MM-ddTHH:mm:ss"),
+            BuyMax = 9150, BuyMaxDate = now.AddMinutes(-5).ToString("yyyy-MM-ddTHH:mm:ss"),
+            SellMinPresent = true, BuyMaxPresent = true, SellHasData = true
+        };
+        var rows1 = QuoteTableModel.Build(new[] { q1 }, new[] { "Bridgewatch" }, now, out qu);
+        LogicTests.Eq("九态 M1/M2: 有价 → Rows",
+            QuoteTableModel.StateOf(rows1), QuoteTableModel.CardState.Rows);
+
+        // M4：有城但每格都无价 → NoListingAtAll（Build 会按城市补行，所以不是空集合）
+        var rows4 = QuoteTableModel.Build(new MarketQuote[0], new[] { "Bridgewatch" }, now, out qu);
+        LogicTests.Eq("九态 M4: 有城但全无价 → NoListingAtAll",
+            QuoteTableModel.StateOf(rows4), QuoteTableModel.CardState.NoListingAtAll);
+
+        // M8：连行都没有 → NoDataAtAll
+        LogicTests.Eq("九态 M8: 无任何行 → NoDataAtAll",
+            QuoteTableModel.StateOf(new List<QuoteViewRow>()), QuoteTableModel.CardState.NoDataAtAll);
+
+        // M6 由 UI 显式设置，不由数据推导，不能污染数据态判定
+        LogicTests.Check("九态 M6: StateOf 不会从数据推导出 Loading",
+            QuoteTableModel.StateOf(rows1) != QuoteTableModel.CardState.Loading, "ok");
+        // M6 骨架高度按城市数算（六城 248 / 七城 274），与九态里的空态高度分开
+        LogicTests.Eq("九态 M6: 六城骨架高 248", QuoteTableModel.PreferredCardHeight(6), 248);
+        LogicTests.Eq("九态 M6: 七城骨架高 274", QuoteTableModel.PreferredCardHeight(7), 274);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 11) 零 HTTP 三段断言
+    //     用 MarketDataService 构造函数本就公开的 fetchUrl 接缝装计数器。
+    //     不能 new 一个 HttpClient 换进 MarketClient——HttpClient 是 private static readonly，
+    //     换不进去，那样测出来的 0 毫无意义（这条就是「不自欺」的关键）。
+    //     结构刻意做成「①0 → ②+1 → ③0」：只断言 0 的话，计数器没接上也会得到 0，
+    //     必须先有一次真回源证明计数器在工作，第三步的 0 才算证据。
+    // ─────────────────────────────────────────────────────────────
+    static void RunZeroHttpFilterTests()
+    {
+        int calls = 0;
+        var fixedNow = new DateTimeOffset(2026, 11, 9, 12, 0, 0, TimeSpan.Zero);
+        string Body()
+        {
+            return "[{\"item_id\":\"T4_BAG\",\"city\":\"Bridgewatch\",\"quality\":1,"
+                 + "\"sell_price_min\":8420,\"sell_price_min_date\":\"2026-11-09T11:55:00\","
+                 + "\"buy_price_max\":9150,\"buy_price_max_date\":\"2026-11-09T11:55:00\"}]";
+        }
+
+        var svc = new MarketDataService(
+            fetchUrl: (url, ct) => { Interlocked.Increment(ref calls); return Task.FromResult(Body()); },
+            clock: () => fixedNow);
+
+        var items = new[] { "T4_BAG" };
+        var cities = new[] { "Bridgewatch" };
+
+        // ① 冷缓存跑完整筛选交互（= 渲染路径只读快照），出网必须 0
+        for (int i = 0; i < 5; i++)
+        {
+            var snap = svc.SnapshotPricingEntries();
+            var quotes = snap.Where(e => e.Quote != null && e.Quote.ItemId == "T4_BAG").ToList();
+            LogicTests.Check("零HTTP①: 冷缓存筛选第 " + (i + 1) + " 次不出网", calls == 0, "calls=" + calls);
+            LogicTests.Check("零HTTP①: 冷缓存无行可渲染（未查询态）", quotes.Count == 0, "rows=" + quotes.Count);
+        }
+        LogicTests.Eq("零HTTP①: 冷缓存累计出网 = 0", calls, 0);
+
+        // ② 故意发一次 GetPricesAsync，计数必须 +1 —— 证明计数器真接上了
+        int before = calls;
+        var got = svc.GetPricesAsync(items, cities, MarketQueryPurpose.ManualQuery,
+            new[] { 1 }, CancellationToken.None).GetAwaiter().GetResult();
+        LogicTests.Check("零HTTP②: 一次 GetPricesAsync 出网次数 +1", calls == before + 1,
+            "before=" + before + " after=" + calls);
+        LogicTests.Check("零HTTP②: 回源带回该城报价", got.Count > 0, "rows=" + got.Count);
+        LogicTests.Eq("零HTTP②: 缓存已写入 1 条", svc.SnapshotPricingEntries().Count, 1);
+
+        // ③ 暖缓存再跑筛选，增量必须 0
+        int afterWarm = calls;
+        for (int i = 0; i < 5; i++)
+        {
+            var snap = svc.SnapshotPricingEntries();
+            LogicTests.Check("零HTTP③: 暖缓存筛选第 " + (i + 1) + " 次不出网",
+                calls == afterWarm, "delta=" + (calls - afterWarm));
+        }
+        // 换城市筛选（缓存里没有该城）也只是快照过滤，不出网
+        var other = svc.SnapshotPricingEntries().Where(e => e.Quote != null && e.Quote.City == "Thetford").ToList();
+        LogicTests.Check("零HTTP③: 换城市筛选不出网", calls == afterWarm && other.Count == 0,
+            "delta=" + (calls - afterWarm) + " rows=" + other.Count);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 12) M9「选满但组合不存在」判据
+    //     用 IsComplete（不是「键为空」）区分 M5 与 M9：
+    //     M5 未选满 → 提示「请先选择物品」；M9 已选满但组合不存在 → 提示「该分类下没有这件物品」。
+    //     若只用「键为空」，两者会被并成同一文案，就是「选满了却说没选」。
+    // ─────────────────────────────────────────────────────────────
+    static void RunM9CombinationTests()
+    {
+        var tax = new ItemTaxonomy();
+        var cat = new ItemCategory { Key = "head", DisplayName = "头部护甲" };
+        var sub = new ItemSubCategory { Key = "cloth_helmet", DisplayName = "布甲风帽" };
+        var fam = new ItemFamily { Family = "HEAD_CLOTH_SET1", DisplayName = "学士风帽" };
+        fam.Variants.Add(new ItemVariant
+        {
+            BaseId = "T5_HEAD_CLOTH_SET1", UniqueName = "T5_HEAD_CLOTH_SET1@1",
+            Tier = 5, Enchant = 1, DisplayName = "专家级学士风帽"
+        });
+        sub.Families.Add(fam);
+        cat.SubCategories.Add(sub);
+        tax.Categories.Add(cat);
+
+        // M5：只选一级 → 未选满，键也空
+        var sel5 = new MarketSelection { CategoryKey = "head", Tier = 0 };
+        LogicTests.Check("M5 未选满: IsComplete=false", !sel5.IsComplete, "ok");
+        var key5 = MarketQueryPlanner.Build(tax, sel5);
+        LogicTests.Check("M5 未选满: 空键（不发请求）", key5.IsEmpty, key5.Signature);
+        // 关键：M5 的判据必须是 IsComplete=false，据此走「请先选择物品」
+        LogicTests.Check("M5 判据: 未选满时不能误判成 M9", !sel5.IsComplete, "走 M5 文案");
+
+        // M9-a：三级选满但族在物品表里不存在 → IsComplete=true 且键为空
+        var sel9 = new MarketSelection
+        {
+            CategoryKey = "head", SubCategoryKey = "cloth_helmet",
+            Family = "HEAD_PLATE_SET1", Tier = 5, Enchant = 1
+        };
+        var key9 = MarketQueryPlanner.Build(tax, sel9);
+        LogicTests.Check("M9-a 选满: IsComplete=true", sel9.IsComplete, "ok");
+        LogicTests.Check("M9-a 组合不存在: 空键", key9.IsEmpty, key9.Signature);
+        LogicTests.Check("M9-a 判据: 选满+空键 ⇒ 走 M9 文案而非「未选物品」",
+            sel9.IsComplete && key9.IsEmpty, "IsComplete=true & IsEmpty=true");
+
+        // M9-b：族在、但该阶级/附魔变体不存在
+        var sel9b = new MarketSelection
+        {
+            CategoryKey = "head", SubCategoryKey = "cloth_helmet",
+            Family = "HEAD_CLOTH_SET1", Tier = 8, Enchant = 3
+        };
+        var key9b = MarketQueryPlanner.Build(tax, sel9b);
+        LogicTests.Check("M9-b 族在变体不在: 空键", key9b.IsEmpty, key9b.Signature);
+        LogicTests.Check("M9-b 该情形同样已选满", sel9b.IsComplete, "ok");
+
+        // 正路对照：存在的组合必须出非空键，否则上面的空键断言是假阳性
+        var ok = new MarketSelection
+        {
+            CategoryKey = "head", SubCategoryKey = "cloth_helmet",
+            Family = "HEAD_CLOTH_SET1", Tier = 5, Enchant = 1
+        };
+        var keyOk = MarketQueryPlanner.Build(tax, ok);
+        LogicTests.Check("M9 对照: 存在的组合出非空键", !keyOk.IsEmpty, keyOk.Signature);
+        LogicTests.Eq("M9 对照: uniqueName 带附魔后缀", keyOk.UniqueNames[0], "T5_HEAD_CLOTH_SET1@1");
     }
 }
