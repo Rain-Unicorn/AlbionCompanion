@@ -357,12 +357,31 @@ namespace AlbionCompanion.Core
                 {
                     try
                     {
-                        long pickerId = Convert.ToInt64(evt.Parameters[0]);
-                        long yieldPreTax = Convert.ToInt64(evt.Parameters[3]);
+                        // P1-3：p0/p3 必须走 TryGetValue——原先直接索引 evt.Parameters[0]，
+                        // 缺 p0 时抛 KeyNotFoundException，被本段外层 catch {} 吞掉，
+                        // 结果「这一笔银币凭空消失，且连一行日志都没有」。
+                        // 缺关键参数时必须留下可观测记录再跳过（宁可少记一笔，不可静默吞掉）。
+                        if (!evt.Parameters.TryGetValue(0, out var p0Obj) || !evt.Parameters.TryGetValue(3, out var p3Obj))
+                        {
+                            ReportStatus("[收益] evt=62 缺关键参数（p0=" + (evt.Parameters.ContainsKey(0) ? "有" : "缺")
+                                + " p3=" + (evt.Parameters.ContainsKey(3) ? "有" : "缺")
+                                + "），该笔银币未入账。原始参数：" + DescribeParams(evt.Parameters));
+                            // 用 continue 而不是 return：本例该笔不入账，但不能连累同一 payload 里的后续事件
+                            continue;
+                        }
+                        long pickerId = Convert.ToInt64(p0Obj);
+                        long yieldPreTax = Convert.ToInt64(p3Obj);
                         long clusterTax = evt.Parameters.TryGetValue(4, out var ct) ? Convert.ToInt64(ct) : 0;
                         long guildTax = evt.Parameters.TryGetValue(5, out var gt) ? Convert.ToInt64(gt) : 0;
                         long alliancePenalty = evt.Parameters.TryGetValue(6, out var ap) ? Convert.ToInt64(ap) : 0;
                         long afterTaxRaw = Math.Max(0, yieldPreTax - clusterTax - guildTax - alliancePenalty);
+
+                        // P2（界面自洽）：Before - Tax == After 必须恒成立。
+                        // 原先三段各自整除再相加，`Before - Tax` 与 `After` 会因舍入差几个单位。
+                        // 改口径：先各自换成显示单位再相减——After 由 Before 减 Tax 得出，而不是第二次独立除法。
+                        long silverBeforeTax = yieldPreTax / 10000;
+                        long taxPaid = (clusterTax + guildTax + alliancePenalty) / 10000;
+                        long silverAfterTax = Math.Max(0, silverBeforeTax - taxPaid);
 
                         // 税率/FixPoint 计算逻辑保持不变；身份裁决用原始 FixPoint 值（余额严格比对）
                         var disposition = LocalPlayerIdentity.OnTakeSilver(pickerId, afterTaxRaw);
@@ -379,9 +398,9 @@ namespace AlbionCompanion.Core
                                 Source = IncomeSource.SilverPickup,
                                 SourceLabel = "拾取银币",
                                 PickerId = pickerId,
-                                SilverBeforeTax = yieldPreTax / 10000,
-                                TaxPaid = (clusterTax + guildTax + alliancePenalty) / 10000,
-                                SilverAfterTax = afterTaxRaw / 10000,
+                                SilverBeforeTax = silverBeforeTax,
+                                TaxPaid = taxPaid,
+                                SilverAfterTax = silverAfterTax,
                                 AttributionNote = p8note ?? ""
                             };
                             if (disposition == TakeSilverDisposition.CountAsMine)
@@ -400,7 +419,15 @@ namespace AlbionCompanion.Core
                 {
                     try
                     {
-                        long selfId = Convert.ToInt64(evt.Parameters[0]);
+                        // P1-3（同 P1-3 的 evt=62 同类问题，派发点名 :403）：p0 直接索引改为 TryGetValue。
+                        // 缺 p0 时 Convert.ToInt64(null) 抛异常，被下面 catch {} 吞掉 →
+                        // 「本人银币入袋」这条最权威的身份证据静默丢失，身份永远停在 Unknown。
+                        if (!evt.Parameters.TryGetValue(0, out var p0Obj278))
+                        {
+                            ReportStatus("[身份] evt=278 缺 p0（ObjectId），本事件未用于身份识别。原始参数：" + DescribeParams(evt.Parameters));
+                            continue;
+                        }
+                        long selfId = Convert.ToInt64(p0Obj278);
                         string? selfName = evt.Parameters.TryGetValue(2, out var nm278) ? nm278 as string : null;
                         bool wasConfirmed = LocalPlayerIdentity.State == IdentityState.Confirmed;
                         LocalPlayerIdentity.OnSelfSilverGained(selfId, selfName);
@@ -602,12 +629,19 @@ namespace AlbionCompanion.Core
                             UpdatePlayerLastSeen(target);
 
                             // R2/C4：causer 存在性单独判定（参数缺失 ≠ 显式 0），不再默认 causer=0
-                            bool hasCauserParam = evt.Parameters.ContainsKey(6);
+                            bool hasCauserParam = evt.Parameters.TryGetValue(6, out var causerObj);
                             long causer = 0;
                             if (hasCauserParam)
                             {
-                                causer = Convert.ToInt64(evt.Parameters[6]);
-                                UpdatePlayerLastSeen(causer);
+                                // 同类索引风险顺手修：p6 声明了却取不到值时 Convert.ToInt64(null) 会抛，
+                                // 被外层 catch {} 吞掉 → 这一笔伤害整条丢失。取不到就当「无 causer」处理。
+                                try { causer = Convert.ToInt64(causerObj); }
+                                catch
+                                {
+                                    ReportStatus("[战斗] evt=6 p6 存在但无法解析为 ObjectId，按无 causer 处理。原始参数：" + DescribeParams(evt.Parameters));
+                                    hasCauserParam = false;
+                                }
+                                if (hasCauserParam) UpdatePlayerLastSeen(causer);
                             }
 
                             // 统一 causer 解析（伤害/治疗共用，消除原两段复制粘贴分叉）：
@@ -630,10 +664,12 @@ namespace AlbionCompanion.Core
                                     {
                                         Time = DateTime.Now,
                                         Target = targetName,
-                                        Damage = (int)damage,
+                                        Damage = damage,
                                         Type = "damage",
                                         CauserName = ci.DisplayName
                                     });
+                                    // P2：CombatEntry.Damage 本就是 long，去掉了原来的 (int)damage 强转
+                                    // （超 2^31 的累计伤害会被截断，且与 DamageTracker.RecordDamage(long) 口径不一致）
 
                                     // P1-5：读真实 p3（NewHealthValue）；缺失传 -1 表示未知，
                                     // 禁止再用硬编码 0 冒充「刚好打死」（那会让每次命中都被记为最后一击）
@@ -649,7 +685,7 @@ namespace AlbionCompanion.Core
                                     {
                                         Time = DateTime.Now,
                                         Target = targetName,
-                                        Damage = (int)heal,
+                                        Damage = heal,
                                         Type = "heal",
                                         CauserName = ci.DisplayName
                                     });
@@ -815,13 +851,17 @@ namespace AlbionCompanion.Core
                     }
                     catch { }
                 }
-                // 237 = PartyDisbanded (队伍解散) - 预估事件码，未实机验证
-                // R7/C6：状态迁入 PartyState；参数布局必须打印原始值以便实机确认（§7.3）
+                // 237 = **疑似** PartyDisbanded - 事件码与语义均未实机验证
+                // P1-4：按设计 §9.6「第一批不接 237」，退回「只打日志不改状态」。
+                // 证据强度判断：HANDOFF.md 对该码自陈「预估，未实际抓到验证」，并写明兜底方案
+                // 「若实机发现 237 不是解散，改为只打日志」；全仓库/全历史无 events.log 抓包记录可佐证；
+                // 设计 §9.6 明令第一批不接。⇒ 证据弱，取「只打日志」这一支，不做「保持接入 + 补测试」。
+                // 代价明写：真解散时不再自动清空名单（会残留旧成员直到下一次 230 全量重建或用户手动处理），
+                // 但反过来「战斗中 237 若另有语义（如某个按 tick 下发的队伍同步帧）会打着打着把队友全清掉」
+                // 是用户可见的错误，代价更不对称。等 V5 抓到真实 237 参数再恢复接入并补测试。
                 else if (evt.GameEventCode == 237)
                 {
-                    ReportStatus("[队伍] evt=237 参数：" + DescribeParams(evt.Parameters));
-                    PartyState.OnPartyDisbanded();
-                    GameEvents.FireUpdate();
+                    ReportStatus("[队伍] evt=237 参数（未确认事件码，仅取证不改状态）：" + DescribeParams(evt.Parameters));
                 }
                 // 239 = PartyPlayerUpdated - 参数语义未完全确认（HANDOFF：p0=名字, p1=True, p3=5）
                 // 保守处理：不新增成员不改 id，仅刷新 lastSeen（§7.3）

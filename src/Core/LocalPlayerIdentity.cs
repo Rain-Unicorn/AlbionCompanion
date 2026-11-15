@@ -51,6 +51,14 @@ namespace AlbionCompanion.Core
         private static long _accSinceMoney;            // 自上一条 evt=81 以来候选拾取累计（原始 FixPoint，余额比对窗口）
         private static long? _lastBalance;             // evt=81 银币余额基线（原始 FixPoint）
 
+        // P0-1：身份待复验（可逆兜底）状态。冲突时不再清空已累计伤害，改为保留 + 冻结 + 打标记。
+        private static bool _identityReviewPending;
+        private static long? _identityReviewOldId;
+        private static long? _identityReviewNewId;
+        private static string? _identityReviewOldName;
+        private static string? _identityReviewNewName;
+        private static string? _identityReviewNote;
+
         /// <summary>
         /// P0-3：候选有效期。候选自首次拾取起 10 分钟未被任何权威证据（JoinResponse/evt=81/evt=278/手选名）确认，
         /// 即回 Unknown 让下一次拾取重新起候选——修复「队友先捡 → 候选锁死在他身上 → 我捡的银币全被 Ignore」。
@@ -93,6 +101,26 @@ namespace AlbionCompanion.Core
 
         public static string? ManualName { get { lock (_gate) { return _manualName; } } }
 
+        // ---- P0-1：待复验状态读取（UI 据此显示「身份待复验」并给出三个出口按钮）----
+
+        /// <summary>P0-1：是否处于「身份待复验」——冲突已发生但已累计伤害被保留并冻结。</summary>
+        public static bool IdentityReviewPending { get { lock (_gate) { return _identityReviewPending; } } }
+
+        /// <summary>P0-1：待复验记录的旧 ObjectId（冲突前确认的身份）。</summary>
+        public static long? IdentityReviewOldId { get { lock (_gate) { return _identityReviewOldId; } } }
+
+        /// <summary>P0-1：待复验记录的新 ObjectId（冲突那条权威证据给出的身份）。</summary>
+        public static long? IdentityReviewNewId { get { lock (_gate) { return _identityReviewNewId; } } }
+
+        /// <summary>P0-1：待复验记录的旧 / 新角色名（可为空）。</summary>
+        public static string? IdentityReviewOldName { get { lock (_gate) { return _identityReviewOldName; } } }
+
+        /// <summary>P0-1：待复验记录的新角色名（可为空）。</summary>
+        public static string? IdentityReviewNewName { get { lock (_gate) { return _identityReviewNewName; } } }
+
+        /// <summary>P0-1：给用户看的复验说明（「为什么这段数据停住了、下一步选什么」）。</summary>
+        public static string? IdentityReviewNote { get { lock (_gate) { return _identityReviewNote; } } }
+
         /// <summary>
         /// 「我」的展示名（R2 负键空间 key=0 的显示名）：已确认且有名字用真名，
         /// 否则「我（识别中）」——不占用「未知玩家」语义。
@@ -126,13 +154,64 @@ namespace AlbionCompanion.Core
                 long? oldCandidate = _candidateId;
                 long? oldConfirmed = _confirmedId;
                 string? oldName = _confirmedName;
+                bool resolvedFromReview = false;
 
-                if (_state == IdentityState.Confirmed && _confirmedId != null && _confirmedId != objectId)
+                // ---- P0-1 权威反证自动解冻：**必须排在冲突分支之前** ----
+                // 如果服务器把身份确认回「冲突前的那个旧 id」，说明上一条冲突响应是误判，
+                // 此时应自动解冻并并入，不需要用户干预。
+                // 为什么顺序不能反：冲突分支一执行，_confirmedId 就被覆盖成新 id，
+                // 之后 (Confirmed && _confirmedId != objectId) 依然成立 → 永远进不了这个解冻分支。
+                if (_identityReviewPending && _identityReviewOldId != null
+                    && _identityReviewOldId == objectId
+                    && (oldConfirmed == null || oldConfirmed == objectId || _identityReviewNewId == oldConfirmed))
                 {
-                    Log("[身份冲突] JoinResponse ObjectId=" + objectId + " 与已确认 " + _confirmedId + " 不同，按服务器权威覆盖");
-                    // R2/C4（设计 §4.4 RemovePlayer）：旧 key=0 的累计是按旧 id 归因的，权威纠正后视为脏数据清掉
-                    GameEvents.DamageTracker.RemovePlayer(0);
+                    GameEvents.DamageTracker.ResolveQuarantineKeep(0);
+                    _identityReviewPending = false;
+                    _identityReviewOldId = null;
+                    _identityReviewNewId = null;
+                    _identityReviewOldName = null;
+                    _identityReviewNewName = null;
+                    _identityReviewNote = null;
+                    resolvedFromReview = true;
+                    Log("[身份] JoinResponse 把身份确认回 ObjectId=" + objectId
+                        + "（与冲突前一致），上一条冲突判定为误判：已累计伤害解冻并保留，待复验解除");
                 }
+
+                // resolvedFromReview 时跳过冲突分支：此时「旧 id ≠ 当前 id」恰恰是正常的回退纠正，
+                // 再走一次冻结会立刻把刚解冻的键重新冻上，来回震荡。
+                if (!resolvedFromReview && _state == IdentityState.Confirmed && _confirmedId != null && _confirmedId != objectId)
+                {
+                    Log("[身份冲突] JoinResponse ObjectId=" + objectId + " 与已确认 " + _confirmedId + " 不同，按服务器权威覆盖；"
+                        + "已累计伤害保留并冻结（不再累加、不清零），待复验：旧 ObjectId=" + _confirmedId + " → 新 ObjectId=" + objectId);
+
+                    // P0-1（设计 §4.4 RemovePlayer 的可逆替代）：冲突时**不清空** key=0 的累计。
+                    // 原语义「旧 key=0 的累计是按旧 id 归因的，权威纠正后视为脏数据清掉」有一个致命前提：
+                    // 眼前这条 JoinResponse 一定是对的。而 P0-1 事故恰恰是这个前提会破——
+                    // 错判一次响应就把整场真实累计永久清零，DamageTracker 没有任何回滚手段。
+                    // 两个错误的代价不对称：清空错了不可恢复；保留错了最多数字偏大、可被后续权威证据覆盖。
+                    bool firstFreeze = GameEvents.DamageTracker.QuarantineKey(
+                        0, "IdentityConflict:" + oldConfirmed + "->" + objectId);
+                    if (!firstFreeze)
+                    {
+                        // 已是冻结态（同一会话内的第二次及以后的冲突）：
+                        // **旧 id 一旦记下就不许再被覆盖**——此处 oldConfirmed 是上一条冲突响应
+                        // 覆盖后的「新 id」，不是真正的原始角色 id；拿它盖旧 id 会把
+                        // 「该拆给谁」的那一行弄丢，拆分出口就分错了行。
+                        Log("[身份冲突] key=0 已处于冻结态，追加一条冲突证据（新 id=" + objectId
+                            + "），保留原始旧 id=" + _identityReviewOldId);
+                    }
+                    _identityReviewPending = true;
+                    _identityReviewOldId ??= oldConfirmed;   // 只为空时填充，绝不覆盖
+                    _identityReviewNewId = objectId;         // 新 id 永远取最近一条权威证据
+                    _identityReviewOldName ??= oldName;
+                    _identityReviewNewName = name ?? _identityReviewNewName;
+                    _identityReviewNote = "身份冲突：旧 ObjectId=" + _identityReviewOldId + " → 新 ObjectId=" + objectId
+                        + "。已累计伤害已保留并冻结（新伤害进影子桶，可见值不再增长）。"
+                        + "请在战斗页选择：确认仍是同一角色（并入）/ 确认真换了角色（拆分到旧角色行）/ 丢弃这段数据。";
+                }
+                // 注：冻结期间再来一条**不同 id** 的权威响应必然落到上面的冲突分支（此时 _confirmedId
+                // 已被上一次冲突覆盖，`_confirmedId != objectId` 仍成立），不需要单独分支；
+                // 该分支只执行一次「首次冻结」，其余走幂等路径追加证据而不覆盖原始旧 id 与冻结态。
 
                 ConfirmCore(objectId.Value, name, ConfirmSource.JoinResponse, resolvePending: true);
 
@@ -460,7 +539,83 @@ namespace AlbionCompanion.Core
                 _candidateTtlExpiries = 0;
                 _accSinceMoney = 0;
                 _lastBalance = null;
+                // P0-1：待复验标记与冻结态一并复位（否则测试隔离会把上一个用例的冻结带进下一个）
+                _identityReviewPending = false;
+                _identityReviewOldId = null;
+                _identityReviewNewId = null;
+                _identityReviewOldName = null;
+                _identityReviewNewName = null;
+                _identityReviewNote = null;
+                GameEvents.DamageTracker.ResetQuarantine();
             }
+        }
+
+        // ---- P0-1：三个显式出口（UI / 用户裁决；状态标记与冻结态必须同步收尾）----
+
+        /// <summary>
+        /// P0-1 出口 A（自动解冻之外的显式版）：确认「还是同一角色」——
+        /// key=0 的影子桶并入可见累计、解除冻结、清掉待复验标记。
+        /// </summary>
+        public static bool ResolveIdentityReviewKeep()
+        {
+            lock (_gate)
+            {
+                bool un = GameEvents.DamageTracker.ResolveQuarantineKeep(0);
+                ClearReviewLocked();
+                if (un) Log("[身份] 待复验裁决：同一角色 → 已累计伤害保留并解冻，影子桶已并入");
+                return un;
+            }
+        }
+
+        /// <summary>
+        /// P0-1 出口 B：确认真换了角色——把 key=0 上的历史账搬到旧 ObjectId 那行，
+        /// key=0 只留冻结期的新账。谁都不丢，只是各归各位。
+        /// 旧 id 未知（例如冲突前根本没有已确认 id）时退化为「保留并解冻」并记日志。
+        /// </summary>
+        public static bool ResolveIdentityReviewSplitRoles()
+        {
+            lock (_gate)
+            {
+                long? oldId = _identityReviewOldId;
+                if (oldId == null)
+                {
+                    bool kept = GameEvents.DamageTracker.ResolveQuarantineKeep(0);
+                    ClearReviewLocked();
+                    Log("[身份] 待复验裁决：要求拆分但冲突前没有已知旧 ObjectId，退化为保留并解冻");
+                    return kept;
+                }
+                bool split = GameEvents.DamageTracker.SplitQuarantine(
+                    0, oldId.Value, _identityReviewOldName, _confirmedName ?? _identityReviewNewName);
+                ClearReviewLocked();
+                if (split)
+                    Log("[身份] 待复验裁决：确认为换角色 → 历史账已归位到旧 ObjectId=" + oldId.Value + "，key=0 只保留新角色的新账");
+                return split;
+            }
+        }
+
+        /// <summary>
+        /// P0-1 出口 C：用户明确认定这段是脏数据——**唯一真正的删除路径**。
+        /// </summary>
+        public static bool DiscardIdentityReview()
+        {
+            lock (_gate)
+            {
+                bool dropped = GameEvents.DamageTracker.DiscardQuarantine(0);
+                ClearReviewLocked();
+                Log("[身份] 待复验裁决：用户判定为脏数据 → key=0 的累计与影子桶已丢弃（唯一删除路径，显式触发）");
+                return dropped;
+            }
+        }
+
+        /// <summary>清掉待复验标记（调用方必须已持有 _gate）。</summary>
+        private static void ClearReviewLocked()
+        {
+            _identityReviewPending = false;
+            _identityReviewOldId = null;
+            _identityReviewNewId = null;
+            _identityReviewOldName = null;
+            _identityReviewNewName = null;
+            _identityReviewNote = null;
         }
 
         // ---- 内部 ----

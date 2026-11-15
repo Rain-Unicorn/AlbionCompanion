@@ -1122,12 +1122,123 @@ static class LogicTests
             Eq("T-01 冲突场景：自己的累计伤害未被打回 0", GameEvents.DamageTracker.GetTotals(
                   AlbionCompanion.Core.DamageMeter.DamageStatsTracker.DamageFilter.All).TotalDamage, 1000L);
 
-            // 对照：真 Join 码换身份时，冲突清零逻辑本身仍生效（证明清零点是被「错误确认」引爆、不是被删掉了）
+            // ---- P0-1：真 Join 换 id 时，累计伤害**不再被清**（旧断言「仍被清」已随语义同步改写）----
+            // 旧用例断言的是被否定的旧行为（设计 §4.4「冲突即视为脏数据清掉」），P0-1 起改为
+            // 「保留 + 冻结 + 待复验」。这条用例现在是整条线的行为锚点：
+            // 冲突发生 → 数字**仍是 1000**（不清零）→ 冻结态 → 新伤害只进影子桶。
             long id3; string name3;
             LocalPlayerIdentity.OnJoinResponse(2002, "NewMe");
-            Eq("T-01 对照：真 Join 换 id 时 key=0 仍被清（设计 §4.4 语义保留）",
-               GameEvents.DamageTracker.GetTotals(
-                   AlbionCompanion.Core.DamageMeter.DamageStatsTracker.DamageFilter.All).TotalDamage, 0L);
+
+            var d0 = AlbionCompanion.Core.DamageMeter.DamageStatsTracker.DamageFilter.All;
+            Eq("P0-1 用例1：真 Join 换 id 后 key=0 累计伤害**仍是 1000**（不再清零）",
+               GameEvents.DamageTracker.GetTotals(d0).TotalDamage, 1000L);
+            Eq("P0-1 用例1：身份按服务器权威覆盖为新 id 2002", GameEvents.LocalPlayerObjectId, 2002L);
+            Check("P0-1 用例1：IdentityReviewPending 已置位", LocalPlayerIdentity.IdentityReviewPending, "pending=false");
+            Eq("P0-1 用例1：待复验记录旧 id = 1001", LocalPlayerIdentity.IdentityReviewOldId, 1001L);
+            Eq("P0-1 用例1：待复验记录新 id = 2002", LocalPlayerIdentity.IdentityReviewNewId, 2002L);
+            Check("P0-1 用例1：key=0 已进入冻结态 IsQuarantined(0)", GameEvents.DamageTracker.IsQuarantined(0), "IsQuarantined=false");
+            Check("P0-1 用例1：冻结原因可读", GameEvents.DamageTracker.QuarantineReason(0) != null, "reason=null");
+
+            // ---- P0-1 用例2：冻结期新伤害只进影子桶，可见值不动 ----
+            GameEvents.DamageTracker.RecordDamage(0, "NewMe", 5002, 300, -1, true);
+            GameEvents.DamageTracker.RecordHeal(0, "NewMe", 200);
+            Eq("P0-1 用例2：冻结期可见累计仍为 1000（新伤害不进可见值）",
+               GameEvents.DamageTracker.GetTotals(d0).TotalDamage, 1000L);
+            Eq("P0-1 用例2：影子桶伤害 = 300", GameEvents.DamageTracker.GetPendingTotals(0).Damage, 300L);
+            Eq("P0-1 用例2：影子桶治疗 = 200", GameEvents.DamageTracker.GetPendingTotals(0).Healing, 200L);
+
+            // ---- P0-1 用例3：权威反证自动解冻（服务器把身份确认回冲突前旧 id）----
+            // 这条同时验证「自动解冻必须排在冲突分支之前」——排在后面就永远解不了冻。
+            LocalPlayerIdentity.OnJoinResponse(1001, "Me");
+            Check("P0-1 用例3：回退旧 id 后待复验自动解除", !LocalPlayerIdentity.IdentityReviewPending, "pending=true");
+            Check("P0-1 用例3：回退旧 id 后 key=0 自动解冻", !GameEvents.DamageTracker.IsQuarantined(0), "still quarantined");
+            Eq("P0-1 用例3：解冻后影子桶并入可见值 → 1000+300 = 1300",
+               GameEvents.DamageTracker.GetTotals(d0).TotalDamage, 1300L);
+            Eq("P0-1 用例3：解冻后影子桶已清空", GameEvents.DamageTracker.GetPendingTotals(0).Damage, 0L);
+            Eq("P0-1 用例3：身份回到 1001", GameEvents.LocalPlayerObjectId, 1001L);
+
+            // ---- P0-1 用例4：冻结期收到第三条不同 id → 保持冻结，不替用户拍板 ----
+            LocalPlayerIdentity.Reset();
+            GameEvents.ResetAll();
+            LocalPlayerIdentity.OnJoinResponse(1001, "Me");
+            GameEvents.DamageTracker.RecordDamage(0, "Me", 5001, 800, -1, true);
+            LocalPlayerIdentity.OnJoinResponse(2002, "Other");
+            LocalPlayerIdentity.OnJoinResponse(3003, "Third");
+            Check("P0-1 用例4：第三条不同 id 时仍保持冻结（证据互斥不自动裁决）",
+                  GameEvents.DamageTracker.IsQuarantined(0), "unfrozen prematurely");
+            Eq("P0-1 用例4：累计伤害仍保留 800",
+               GameEvents.DamageTracker.GetTotals(d0).TotalDamage, 800L);
+            // 语义边界（写死在此，防以后被"顺手改成保留首个"）：NewId 表示**当前权威身份**，
+            // 随最近一条 JoinResponse 走（此时 _confirmedId 已被覆盖为 3003，UI 上显示"旧=1001 → 新=3003"
+            // 才与实际一致）。真正必须守住不被覆盖的是**旧 id**——它决定"该拆给谁"，一旦被上一条冲突
+            // 覆盖后的新 id 顶掉，拆分出口就会把历史账搬错行。
+            Eq("P0-1 用例4：NewId 随最新权威证据（当前身份 3003）",
+               LocalPlayerIdentity.IdentityReviewNewId, 3003L);
+            Eq("P0-1 用例4：**旧 id 仍是原始角色 1001**（未被上一条冲突的 2002 顶掉）",
+               LocalPlayerIdentity.IdentityReviewOldId, 1001L);
+            Eq("P0-1 用例4：当前身份 = 最新权威 3003", GameEvents.LocalPlayerObjectId, 3003L);
+
+            // ---- P0-1 用例5：出口 B 拆分角色——历史账归旧角色，key=0 只留新账 ----
+            LocalPlayerIdentity.Reset();
+            GameEvents.ResetAll();
+            LocalPlayerIdentity.OnJoinResponse(1001, "OldMe");
+            GameEvents.DamageTracker.RecordDamage(0, "OldMe", 5001, 800, -1, true);
+            LocalPlayerIdentity.OnJoinResponse(2002, "NewMe");          // 冲突 → 冻结，800 留着
+            GameEvents.DamageTracker.RecordDamage(0, "NewMe", 5002, 250, -1, true);   // 冻结期 → 影子 250
+            bool split = LocalPlayerIdentity.ResolveIdentityReviewSplitRoles();
+            Check("P0-1 用例5：拆分出口返回 true", split, "split=false");
+            Check("P0-1 用例5：拆分后 key=0 已解冻", !GameEvents.DamageTracker.IsQuarantined(0), "still quarantined");
+            Check("P0-1 用例5：拆分后待复验标记清除", !LocalPlayerIdentity.IdentityReviewPending, "pending=true");
+            Eq("P0-1 用例5：旧角色 1001 那行拿到历史账 800",
+               GameEvents.DamageTracker.GetTotalsForKey(1001L).TotalDamage, 800L);
+            // 注：这里必须按**单键**读——GetTotals 是全表合计，拆分后表里有两行（1001 的 800 + key=0 的 250），
+            // 用全表合计断言「key=0 只剩 250」永远不成立（会读到 1050）。
+            Eq("P0-1 用例5：key=0 只保留冻结期新账 250（不再含旧角色的 800）",
+               GameEvents.DamageTracker.GetTotalsForKey(0).TotalDamage, 250L);
+            Eq("P0-1 用例5：拆分后全表合计仍是 800+250=1050（谁都不丢）",
+               GameEvents.DamageTracker.GetTotals(d0).TotalDamage, 1050L);
+
+            // ---- P0-1 用例6：出口 A 显式保留（影子桶并入）----
+            LocalPlayerIdentity.Reset();
+            GameEvents.ResetAll();
+            LocalPlayerIdentity.OnJoinResponse(1001, "Me");
+            GameEvents.DamageTracker.RecordDamage(0, "Me", 5001, 600, -1, true);
+            LocalPlayerIdentity.OnJoinResponse(2002, "SameMe");
+            GameEvents.DamageTracker.RecordDamage(0, "SameMe", 5002, 100, -1, true);
+            bool kept = LocalPlayerIdentity.ResolveIdentityReviewKeep();
+            Check("P0-1 用例6：保留出口返回 true", kept, "keep=false");
+            Eq("P0-1 用例6：保留后 600+100 = 700", GameEvents.DamageTracker.GetTotals(d0).TotalDamage, 700L);
+            Check("P0-1 用例6：保留后待复验标记清除", !LocalPlayerIdentity.IdentityReviewPending, "pending=true");
+
+            // ---- P0-1 用例7：出口 C 丢弃（唯一真正的删除路径，必须由人显式触发）----
+            LocalPlayerIdentity.Reset();
+            GameEvents.ResetAll();
+            LocalPlayerIdentity.OnJoinResponse(1001, "Me");
+            GameEvents.DamageTracker.RecordDamage(0, "Me", 5001, 900, -1, true);
+            LocalPlayerIdentity.OnJoinResponse(2002, "Troll");
+            GameEvents.DamageTracker.RecordDamage(0, "Troll", 5002, 50, -1, true);
+            bool dropped = LocalPlayerIdentity.DiscardIdentityReview();
+            Check("P0-1 用例7：丢弃出口返回 true", dropped, "discard=false");
+            Eq("P0-1 用例7：丢弃后该键已从榜上消失（GetTotals 返回 0）",
+               GameEvents.DamageTracker.GetTotals(d0).TotalDamage, 0L);
+            Eq("P0-1 用例7：丢弃后影子桶一并清空", GameEvents.DamageTracker.GetPendingTotals(0).Damage, 0L);
+            Check("P0-1 用例7：丢弃后待复验标记清除", !LocalPlayerIdentity.IdentityReviewPending, "pending=true");
+
+            // ---- P0-1 用例8：Reset() 清掉待复验与冻结态（测试/会话隔离）----
+            LocalPlayerIdentity.Reset();
+            GameEvents.ResetAll();
+            LocalPlayerIdentity.OnJoinResponse(1001, "Me");
+            GameEvents.DamageTracker.RecordDamage(0, "Me", 5001, 700, -1, true);
+            LocalPlayerIdentity.OnJoinResponse(2002, "Other");
+            Check("P0-1 用例8 前置：已进入冻结", GameEvents.DamageTracker.IsQuarantined(0), "not quarantined");
+            LocalPlayerIdentity.Reset();
+            Check("P0-1 用例8：Reset 后待复验标记清除", !LocalPlayerIdentity.IdentityReviewPending, "pending=true");
+            Check("P0-1 用例8：Reset 后冻结态清除", !GameEvents.DamageTracker.IsQuarantined(0), "still quarantined");
+            Eq("P0-1 用例8：Reset 后影子桶清空", GameEvents.DamageTracker.GetPendingTotals(0).Damage, 0L);
+
+            // 复原：P0-1 组结束，回到干净态供后续用例使用
+            LocalPlayerIdentity.Reset();
+            GameEvents.ResetAll();
 
             // ---- 端到端：内核识别出的身份经 OnJoinResponse 写入状态机 ----
             LocalPlayerIdentity.Reset();

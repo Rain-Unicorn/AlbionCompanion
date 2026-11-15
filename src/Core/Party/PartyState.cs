@@ -114,6 +114,9 @@ namespace AlbionCompanion.Core.Party
             string[] names = ParseNames(namesObj);
             List<Guid> guids = ParseGuids(guidBytesObj);
             DateTime now = DateTime.UtcNow;
+            var notices = new List<string>();   // P1-5：锁内只攒文案，出锁统一广播
+            int countAtJoin = 0;
+            string[] namesAtJoin = Array.Empty<string>();
 
             lock (_gate)
             {
@@ -142,14 +145,20 @@ namespace AlbionCompanion.Core.Party
                 int bind = Math.Min(guids.Count, _members.Count);
                 for (int i = 0; i < bind; i++) _members[i].Guid = guids[i];
                 if (guids.Count > 0 && guids.Count != _members.Count)
-                    Status($"[队伍] GUID/名字数量不匹配 {guids.Count}/{_members.Count}");
+                    notices.Add($"[队伍] GUID/名字数量不匹配 {guids.Count}/{_members.Count}");
                 _leaderObjectId = 0;
                 _verified = true;      // 收到真实队伍事件，本会话名单可信
                 _verifiedReason = null;
                 _suppressed = false;   // 真实事件覆盖旧缓存，解除用户的手动抑制
+                countAtJoin = _members.Count;
+                namesAtJoin = _members.Where(m => !string.IsNullOrEmpty(m.Name)).Select(m => m.Name).ToArray();
                 SaveLocked();
             }
-            Status($"[队伍] 已加入队伍，成员 {_members.Count} 人：{string.Join(", ", GetMemberNames())}");
+            // P1-5：先出锁再广播——订阅方（ChatSniffer → 事件日志/UI）在持锁期间被同步回调
+            // 会把整条 party 状态机暴露在锁序倒置风险下。文案所需的数字/名单在锁内已取好快照，
+            // 出锁后只用快照拼串，不再回读活集合（否则数字与名单可能来自两个不同时刻）。
+            foreach (var n in notices) Status(n);
+            Status($"[队伍] 已加入队伍，成员 {countAtJoin} 人：{string.Join(", ", namesAtJoin)}");
         }
 
         /// <summary>evt=234 PartyPlayerJoined：p0=ObjectId，p1=GUID 字节。GUID 命中已有成员则补 id；未命中则新增 pendingName 等反查。</summary>
@@ -160,6 +169,7 @@ namespace AlbionCompanion.Core.Party
             Guid guid = ParseGuid(guidObj);
             DateTime now = DateTime.UtcNow;
             bool changed = false;
+            var notices = new List<string>();   // P1-5：锁内攒文案，出锁广播
 
             lock (_gate)
             {
@@ -174,7 +184,7 @@ namespace AlbionCompanion.Core.Party
                         m.LastSeenUtc = now;
                         if (!string.IsNullOrEmpty(m.Name)) m.Confidence = PartyConfidence.Confirmed;
                         changed = true;
-                        Status($"[队伍] 新成员 {m.Name}（ObjectId={id}）GUID 匹配成功");
+                        notices.Add($"[队伍] 新成员 {m.Name}（ObjectId={id}）GUID 匹配成功");
                     }
                 }
                 // ② 同 ObjectId 已在名单 → 只补 GUID
@@ -200,12 +210,13 @@ namespace AlbionCompanion.Core.Party
                         LastSeenUtc = now,
                     });
                     _pendingObjectIds[id] = new PendingSlot { Guid = guid, JoinSeenUtc = now };
-                    Status($"[队伍] 新成员加入（ObjectId={id}），等待名字反查");
+                    notices.Add($"[队伍] 新成员加入（ObjectId={id}），等待名字反查");
                 }
                 _verified = true;
                 _verifiedReason = null;
                 SaveLocked();
             }
+            foreach (var n in notices) Status(n);
         }
 
         /// <summary>evt=239 PartyPlayerUpdated：保守处理（§7.3）——不新增成员、不改 id，仅刷新 lastSeen；未知名字只记日志。</summary>
@@ -214,6 +225,7 @@ namespace AlbionCompanion.Core.Party
             string name = nameObj?.ToString() ?? "";
             if (string.IsNullOrEmpty(name)) return;
             DateTime now = DateTime.UtcNow;
+            bool unknown = false;
             lock (_gate)
             {
                 var hit = _members.FirstOrDefault(m => m.Name == name);
@@ -224,15 +236,18 @@ namespace AlbionCompanion.Core.Party
                 }
                 else
                 {
-                    Status($"[队伍] 未识别成员更新 {name}（不入名单，参数语义未验证）");
+                    unknown = true;
                 }
             }
+            // P1-5：出锁再广播（原本在锁内同步触发订阅方）
+            if (unknown) Status($"[队伍] 未识别成员更新 {name}（不入名单，参数语义未验证）");
         }
 
         /// <summary>evt=241 PartyLeaderChanged：只更新 leaderObjectId / 角色，不影响成员集合。p0 可为 ObjectId 或名字。</summary>
         public static void OnPartyLeaderChanged(object? p0)
         {
             if (p0 == null) { Status("[队伍] evt=241 无参数"); return; }
+            string? notice = null;
             lock (_gate)
             {
                 long id = 0; string? name = null;
@@ -247,14 +262,16 @@ namespace AlbionCompanion.Core.Party
                     foreach (var m in _members) m.Role = "member";
                     hit.Role = "leader";
                     _leaderObjectId = hit.ObjectId;
-                    Status($"[队伍] 队长变更为 {hit.Name}（ObjectId={hit.ObjectId}）");
+                    notice = $"[队伍] 队长变更为 {hit.Name}（ObjectId={hit.ObjectId}）";
                     SaveLocked();
                 }
                 else
                 {
-                    Status($"[队伍] evt=241 未能定位队长（p0={p0}），只记日志");
+                    notice = $"[队伍] evt=241 未能定位队长（p0={p0}），只记日志";
                 }
             }
+            // P1-5：出锁再广播
+            if (notice != null) Status(notice);
         }
 
         /// <summary>evt=243 PartySilverGained：队伍侧只刷成员活跃度；金额归收益模块（§8.3），PartyState 不碰钱。</summary>
@@ -272,7 +289,13 @@ namespace AlbionCompanion.Core.Party
             }
         }
 
-        /// <summary>evt=237 PartyDisbanded（事件码未验证，调用方须打印原始参数）。</summary>
+        /// <summary>
+        /// evt=237 PartyDisbanded（事件码与语义均未实机验证，调用方须打印原始参数）。
+        /// **当前无生产调用点**：P1-4 已按设计 §9.6 把该事件退回「只打日志不改状态」，
+        /// 本方法保留待 V5 抓到真实 237 语义后再恢复接入。
+        /// P2 修正：原先 <c>_verified = true</c> 与 <c>_verifiedReason = "DisbandedUnverified"</c>
+        /// 自相矛盾——解散后名单为空、且来源本身未验证，只能是 verified=false。
+        /// </summary>
         public static void OnPartyDisbanded()
         {
             lock (_gate)
@@ -280,10 +303,11 @@ namespace AlbionCompanion.Core.Party
                 _members.Clear();
                 _pendingObjectIds.Clear();
                 _leaderObjectId = 0;
-                _verified = true;
-                _verifiedReason = "DisbandedUnverified";
+                _verified = false;                          // 名单来源未验证 ⇒ verified 不能为 true
+                _verifiedReason = "PartyDisbandedUnverified";
                 SaveLocked();
             }
+            // 已在锁外（P1-5 口径）
             Status("[队伍] 队伍已解散（evt=237，事件码未验证）");
         }
 
@@ -293,10 +317,11 @@ namespace AlbionCompanion.Core.Party
             if (string.IsNullOrEmpty(name)) return;
             DateTime now = DateTime.UtcNow;
             bool changed = false;
+            var notices = new List<string>();   // P1-5：锁内攒文案，出锁广播
 
             lock (_gate)
             {
-                SweepPendingLocked(now);
+                SweepPendingLocked(now, notices);
 
                 // ① 该 id 在 pending 队列 → 用 GUID 定位成员补名字
                 if (_pendingObjectIds.TryGetValue(id, out var slot))
@@ -312,7 +337,7 @@ namespace AlbionCompanion.Core.Party
                         m.Confidence = PartyConfidence.Confirmed;
                         _pendingObjectIds.Remove(id);
                         changed = true;
-                        Status($"[队伍] 成员名字反查成功：{name}（ObjectId={id}）");
+                        notices.Add($"[队伍] 成员名字反查成功：{name}（ObjectId={id}）");
                     }
                 }
 
@@ -325,17 +350,18 @@ namespace AlbionCompanion.Core.Party
                         byName[0].ObjectId = id;
                         byName[0].Confidence = PartyConfidence.Confirmed;
                         changed = true;
-                        Status($"[队伍] 成员 ObjectId 反查成功：{name}（ObjectId={id}）");
+                        notices.Add($"[队伍] 成员 ObjectId 反查成功：{name}（ObjectId={id}）");
                     }
                     else if (byName.Count > 1)
                     {
-                        Status($"[队伍] 名字 {name} 有 {byName.Count} 个候选，保持 pending（宁可未知，不可错认）");
+                        notices.Add($"[队伍] 名字 {name} 有 {byName.Count} 个候选，保持 pending（宁可未知，不可错认）");
                     }
                     // ③ 零候选：可能是路人，忽略
                 }
 
                 if (changed) SaveLocked();
             }
+            foreach (var n in notices) Status(n);
         }
 
         // ---------------- 启动加载 / 抑制 / 测试钩子 ----------------
@@ -346,6 +372,7 @@ namespace AlbionCompanion.Core.Party
             SetCacheDir(dir);
             string path = Path.Combine(dir, "party-cache.json");
             var data = PartyCacheStore.Load(path);
+            int loadedCount = 0;
             lock (_gate)
             {
                 _members.Clear();
@@ -373,20 +400,20 @@ namespace AlbionCompanion.Core.Party
                     _verified = false;                      // 即使上会话已验证，重启后也不可信
                     _verifiedReason = "StaleFromPreviousSession";
                     _leaderObjectId = data.leaderObjectId;
-                    if (_members.Count > 0)
-                        Status($"[队伍] 载入上次会话名单 {_members.Count} 人（缓存未验证，进队后自动刷新）");
+                    if (_members.Count > 0) loadedCount = _members.Count;
                 }
             }
+            // P1-5：出锁再广播
+            if (loadedCount > 0)
+                Status($"[队伍] 载入上次会话名单 {loadedCount} 人（缓存未验证，进队后自动刷新）");
         }
 
         /// <summary>「本次不使用旧名单」按钮（§9.8 L1）：本次会话忽略旧缓存，直到真实队伍事件到来。</summary>
         public static void SuppressStaleCache()
         {
-            lock (_gate)
-            {
-                _suppressed = true;
-                Status("[队伍] 本次不使用旧名单，榜单显示全部玩家");
-            }
+            lock (_gate) _suppressed = true;
+            // P1-5：出锁再广播
+            Status("[队伍] 本次不使用旧名单，榜单显示全部玩家");
         }
 
         /// <summary>测试钩子：指定缓存目录（LoadOrRestore 内部也调用）。</summary>
@@ -416,7 +443,14 @@ namespace AlbionCompanion.Core.Party
         // ---------------- 内部 ----------------
 
         /// <summary>pending 超时清理（§7.4 规则 4）：超 10 分钟未绑定 → 移除，verified 降为 false。</summary>
-        private static void SweepPendingLocked(DateTime now)
+        /// <summary>
+        /// pending 超时清理（§7.4 规则 4）：超 10 分钟未绑定 → 移除，verified 降为 false。
+        /// P1-5：调用方必须已持有 <c>_gate</c>。文案不再直接 <see cref="Status"/>（那会在锁内同步回调订阅方），
+        /// 改为追加到 <paramref name="notices"/> 由调用方出锁后广播；
+        /// 传 null 表示「只要状态、不要广播」——属性 getter（<see cref="HasPendingMembers"/>）走这条，
+        /// 避免用户线程读一个属性就把订阅方拉进锁里跑。
+        /// </summary>
+        private static void SweepPendingLocked(DateTime now, List<string>? notices = null)
         {
             var expired = _pendingObjectIds.Where(kv => (now - kv.Value.JoinSeenUtc).TotalMinutes > 10).ToList();
             foreach (var kv in expired) _pendingObjectIds.Remove(kv.Key);
@@ -424,7 +458,7 @@ namespace AlbionCompanion.Core.Party
             {
                 _verified = false;
                 _verifiedReason = "UnresolvedMember";
-                Status($"[队伍] {expired.Count} 名队员 10 分钟内未能识别，名单降级为未验证");
+                notices?.Add($"[队伍] {expired.Count} 名队员 10 分钟内未能识别，名单降级为未验证");
             }
         }
 
