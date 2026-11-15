@@ -34,6 +34,20 @@ namespace AlbionCompanion.UI.Tabs
         private readonly List<CheckBox> _cityChecks = new List<CheckBox>();
         private readonly List<string> _cityNames = new List<string>();
         private readonly QuoteTable _card;
+        private readonly MarketLinkRow _linkRow;
+
+        // ── 纵向布局（设计 rev27 布局表 + 联动位）──
+        // 全部取 QuoteTableModel 的常量，不在这里另写一份数字：UI 与离线测试必须同源，
+        // 否则「卡片最高态会不会压到联动位」只能靠人眼，测试验不到。
+        // 规范布局表按报价卡 248 排预算；本实现 M3 提示行态要 282（多 34），
+        // 这 34px 从筛选卡让（336→290，三列仍 7/7/5 行），卡↔联动位留 6px。
+        private const int ContentH = QuoteTableModel.ContentHeight;
+        private const int TreeH = QuoteTableModel.FilterCardHeight;
+        private const int FilterLabelY = QuoteTableModel.FilterLabelTop;
+        private const int FilterControlY = QuoteTableModel.FilterControlTop;
+        private const int CardTop = QuoteTableModel.QuoteCardTop;
+        // 联动位贴内容区底：740 − 28 = 712；七城 M3 卡底 706，间距 6
+        private static readonly int LinkTop = QuoteTableModel.LinkRowTopOnPage();
 
         private readonly System.Windows.Forms.Timer _autoTimer;
 
@@ -98,46 +112,49 @@ namespace AlbionCompanion.UI.Tabs
                 if (e.KeyCode == Keys.Enter) StartQuery(false);
             };
 
-            // ── 亚服时效条（60..94）──
+            // ── 亚服时效条（56..90）──
+            // 规范 §3 说页头与时效条「无间距，同属页头带」，所以贴页头文字底落在 56。
             _freshStrip = new Panel();
-            _freshStrip.Location = new Point(0, 60);
-            _freshStrip.Size = new Size(620, 34);
+            _freshStrip.Location = new Point(0, QuoteTableModel.FreshStripTop);
+            _freshStrip.Size = new Size(620, QuoteTableModel.FreshStripHeight);
             _freshStrip.BackColor = Th.Bg;
             _freshStrip.Paint += delegate (object sender, PaintEventArgs e) { DrawFreshStrip(e.Graphics); };
             Controls.Add(_freshStrip);
 
-            // ── 三级联动筛选卡（100..400）：自绘面板，三列分区 + 悬停迟滞 + 键盘 ──
+            // ── 三级联动筛选卡（96..386）：自绘面板，三列分区 + 悬停迟滞 + 键盘 ──
+            // 高度取 MinFilterCardHeight 下限 290：规范表 336 是按报价卡 248 排的，
+            // M3 提示行态要 282，这 34px 从筛选卡让，三列可见行仍是 7/7/5。
             _tree = new MarketTreePanel();
-            _tree.Location = new Point(0, 100);
-            _tree.Size = new Size(620, 300);
+            _tree.Location = new Point(0, QuoteTableModel.FilterCardTop);
+            _tree.Size = new Size(620, TreeH);
             _tree.SelectionChanged += delegate { RenderCard(); };
             _tree.Controls.Add(_search);
             Controls.Add(_tree);
 
-            // ── 品质 / 城市筛选（404..446）──
-            CardText("品质", 14, 404, 120, 14, Th.Sub, 8f, false);
-            _fQuality = Ui.Dropdown(MarketQuality.DropdownItems(), 14, 420, 130, 24);
+            // ── 品质 / 城市筛选（386..410）──
+            CardText("品质", 14, FilterLabelY, 120, 14, Th.Sub, 8f, false);
+            _fQuality = Ui.Dropdown(MarketQuality.DropdownItems(), 14, FilterControlY, 130, 24);
             _fQuality.SelectedIndexChanged += delegate { if (!_suppressFilters) RenderCard(); };
             Controls.Add(_fQuality);
 
-            CardText("城市（可多选，含黑市）", 160, 404, 280, 14, Th.Sub, 8f, false);
+            CardText("城市（可多选，含黑市）", 160, FilterLabelY, 280, 14, Th.Sub, 8f, false);
             string[] shortNames = { "凯城", "桥望", "马丁", "塞福", "斯特", "林堡", "黑市" };
             for (int i = 0; i < MarketCities.All.Length; i++)
             {
                 var check = Ui.Check(i < shortNames.Length ? shortNames[i] : MarketCities.All[i],
-                                     160 + i * 62, 422, 60, true);
+                                     160 + i * 62, FilterControlY + 2, 60, true);
                 check.CheckedChanged += delegate { if (!_suppressFilters) RenderCard(); };
                 Controls.Add(check);
                 _cityChecks.Add(check);
                 _cityNames.Add(MarketCities.All[i]);
             }
 
-            _selection = CardText("", 450, 404, 160, 16, Th.Sub, 7.5f, false);
+            _selection = CardText("", 450, FilterLabelY, 160, 16, Th.Sub, 7.5f, false);
             _selection.TextAlign = ContentAlignment.MiddleRight;
 
-            // ── 六城报价卡（452..700；勾选黑市时 726）──
+            // ── 报价卡（436..710；勾选黑市时 710）+ 联动位（712..740）──
             _card = new QuoteTable();
-            _card.Location = new Point(0, 452);
+            _card.Location = new Point(0, CardTop);
             _card.Size = new Size(QuoteTable.CardWidth, QuoteTable.CardHeight);
             _card.RetryRequested += delegate { StartQuery(false); };
             // M3 提示行的「看 T4 / 看 T6」：只发请求，真正跳转由树的 SetTier 完成，
@@ -148,6 +165,14 @@ namespace AlbionCompanion.UI.Tabs
                 SetStatus("该方向没有相邻阶级", Th.Sub);
             };
             Controls.Add(_card);
+
+            // ── 联动位（设计 §3.5：620×28，与卡片同宽，落在卡片下方）──
+            // 标注位不是功能位：点击只弹「规划中」提示，不跳转、不展开（规范 §3.5 原文）。
+            _linkRow = new MarketLinkRow();
+            _linkRow.Location = new Point(0, QuoteTableModel.LinkRowTop(ContentH));
+            _linkRow.Size = new Size(QuoteTableModel.LinkRowWidth, QuoteTableModel.LinkRowHeight);
+            _linkRow.Click += delegate { SetStatus(_linkRow.LastHint, Th.Sub); };
+            Controls.Add(_linkRow);
 
             _autoTimer = new System.Windows.Forms.Timer();
             _autoTimer.Interval = 5 * 60 * 1000;
@@ -390,6 +415,14 @@ namespace AlbionCompanion.UI.Tabs
 
         private void RenderCard()
         {
+            RenderCardCore();
+            // 联动位状态只由报价卡状态决定（规范 §六：M6 加载中 / M8 无旧数据灰化，其余亮色）。
+            // 放在包一层而不是逐个 return 前各写一次——分支以后再加也不会漏掉灰化。
+            _linkRow.SetEnabled(_card.State);
+        }
+
+        private void RenderCardCore()
+        {
             _freshStrip.Invalidate();
             DateTimeOffset now = MarketClock.UtcNow;
             var cities = CheckedCities();
@@ -532,6 +565,7 @@ namespace AlbionCompanion.UI.Tabs
             // M6：进入查询即进加载态（按本次查询城市数给骨架行位）。
             // 刷新期间卡片不保留上一轮价格残影——用户会以为刷新没生效。
             _card.SetLoading(cities.Count);
+            _linkRow.SetEnabled(_card.State);   // M6 联动位灰化（这里不经 RenderCard，必须单独同步）
             _selection.Text = "查询中";
             SetStatus("正在回源 " + targets.Count + " 个物品 × " + cities.Count + " 城…", Th.Info);
 
@@ -631,11 +665,11 @@ namespace AlbionCompanion.UI.Tabs
     /// </summary>
     internal sealed class MarketTreePanel : Control
     {
-        private const int HeadH = 36;
-        private const int ColHeadH = 22;
-        private const int PathH = 28;
-        private const int RowH = 28;
-        private const int ChipsAreaH = 64;
+        private const int HeadH = QuoteTableModel.FilterHeadHeight;
+        private const int ColHeadH = QuoteTableModel.FilterColumnHeadHeight;
+        private const int PathH = QuoteTableModel.FilterPathHeight;
+        private const int RowH = QuoteTableModel.FilterRowHeight;
+        private const int ChipsAreaH = QuoteTableModel.FilterChipsHeight;
         private static readonly int[] ColX = { 16, 172, 356 };
         private static readonly int[] ColW = { 148, 176, 248 };
         private static readonly string[] ColTitles = { "一级分类", "二级分类", "三级 · 物品" };

@@ -651,4 +651,125 @@ namespace AlbionCompanion.UI.Controls
             base.Dispose(disposing);
         }
     }
+
+    /// <summary>
+    /// 联动位（设计 rev27 §3.5 / §七 / §六 状态矩阵「联动位」列）：620 × 28，落在报价卡下方。
+    ///
+    /// 它是**标注位，不是功能位**——规范原文「点击只弹一句 `该入口规划中，将与收益明细的物品行互链`，
+    /// 不跳转、不展开」。所以这里不接任何跳转逻辑，只画一条入口行 + 一个外链图标。
+    ///
+    /// 模块边界（用户原话「跑商相关不要放到市场模块，市场只是查价的」）：
+    /// 本控件只承载「入口 / 后续扩展」这一层，**不出现跨城价差、套利、税后净额、利润**——
+    /// 那些归跑商页。文案由 QuoteTableModel 的常量给出，避免 UI 里散落字符串。
+    ///
+    /// 状态：M6 加载中 / M8 无旧数据灰化（规范 §六），其余状态亮色。
+    /// </summary>
+    public class MarketLinkRow : Control
+    {
+        private readonly Font _titleFont = Th.F(8.5f);
+        private readonly Font _badgeFont = Th.F(7.5f);
+
+        private bool _enabled = true;
+        private bool _hover;
+        private string _hint = QuoteTableModel.LinkRowClickHint;
+
+        /// <summary>点击提示最近一次的文本（供调用方弹提示；也让「点了有反应」可被离线断言）。</summary>
+        public string LastHint { get { return _hint; } }
+
+        public MarketLinkRow()
+        {
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint
+                     | ControlStyles.ResizeRedraw | ControlStyles.OptimizedDoubleBuffer, true);
+            BackColor = Th.Bg;
+            Size = new Size(QuoteTableModel.LinkRowWidth, QuoteTableModel.LinkRowHeight);
+            Cursor = Cursors.Hand;
+        }
+
+        /// <summary>按报价卡状态灰化/点亮（规范 §六：M6 / M8 灰化）。</summary>
+        public void SetEnabled(QuoteTableModel.CardState cardState)
+        {
+            bool enabled = QuoteTableModel.LinkRowEnabled(cardState);
+            if (_enabled == enabled) return;
+            _enabled = enabled;
+            Cursor = _enabled ? Cursors.Hand : Cursors.Default;
+            if (!_enabled) _hover = false;
+            Invalidate();
+        }
+
+        /// <summary>当前是否亮色（供状态断言）。</summary>
+        public bool EnabledByState { get { return _enabled; } }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            if (_enabled) { _hover = true; Invalidate(); }
+            base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            if (_hover) { _hover = false; Invalidate(); }
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            g.Clear(Th.Bg);
+            int w = ClientSize.Width > 0 ? ClientSize.Width : QuoteTableModel.LinkRowWidth;
+
+            // 灰化态用次要色，亮色态用主文字 + 悬停转 accent（悬停才轻反馈，不改变「标注位」的性质）
+            Color titleColor = !_enabled ? Th.Sub : (_hover ? Th.Accent : Th.Text);
+            Color subColor = Th.Sub;
+
+            var titleRect = new Rectangle(0, 0, 300, QuoteTableModel.LinkRowHeight);
+            TextRenderer.DrawText(g, QuoteTableModel.LinkRowTitle, _titleFont, titleRect, titleColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+                | TextFormatFlags.EndEllipsis);
+
+            // 右端：16×16 外链图标 + 「后续扩展」标注（规范 §3.5 右端构成）
+            int iconSize = 16;
+            var iconRect = new Rectangle(w - 16 - iconSize, (QuoteTableModel.LinkRowHeight - iconSize) / 2,
+                iconSize, iconSize);
+            DrawExternalIcon(g, iconRect, _enabled ? Th.Sub : Th.Sub);
+            TextRenderer.DrawText(g, QuoteTableModel.LinkRowBadge, _badgeFont,
+                new Rectangle(iconRect.X - 8 - 64, 0, 64, QuoteTableModel.LinkRowHeight), subColor,
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
+
+        /// <summary>16×16 外链图标：方框 + 右上出角箭头（不用字体图标，避免缺字形画出豆腐块）。</summary>
+        private static void DrawExternalIcon(Graphics g, Rectangle r, Color color)
+        {
+            using (var pen = new Pen(color))
+            {
+                int box = 11;
+                var boxRect = new Rectangle(r.X, r.Y + r.Height - box, box, box);
+                g.DrawRectangle(pen, boxRect);
+
+                // 出角箭头：从方框右上引出到图标右上角
+                int ax = r.Right - 1, ay = r.Y + 1;
+                g.DrawLine(pen, boxRect.Right - 1, boxRect.Y, ax, ay);
+                g.DrawLine(pen, ax - 5, ay, ax, ay);
+                g.DrawLine(pen, ax, ay, ax, ay + 5);
+            }
+        }
+
+        protected override void OnClick(EventArgs e)
+        {
+            // 规范 §3.5：点击只弹一句规划中文案，不跳转、不展开。
+            if (_enabled) _hint = QuoteTableModel.LinkRowClickHint;
+            base.OnClick(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _titleFont.Dispose();
+                _badgeFont.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
 }

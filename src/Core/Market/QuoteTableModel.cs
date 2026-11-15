@@ -108,6 +108,122 @@ namespace AlbionCompanion.Core
         /// <summary>M3 提示行高（设计 §5.3：36px，比底注高 8，装得下两个动作按钮）。</summary>
         public const int HintHeight = 36;
 
+        // ── 联动位几何（设计 §3.5：620 × 28，卡片下方，宽度与卡片一致）──
+        // 同样放 Core：位置和尺寸是「可算的事」，能在离线测试里验，UI 只按它绘制。
+        /// <summary>联动位宽 = 报价卡卡宽（规范 §3.5「宽度与卡片一致」）。</summary>
+        public const int LinkRowWidth = 620;
+        /// <summary>联动位高（规范 §3.5 与布局表 y=708 行均为 28）。</summary>
+        public const int LinkRowHeight = 28;
+        /// <summary>联动位文案左段（规范 §3.5）。只写入口名，不含任何算账内容。</summary>
+        public const string LinkRowTitle = "收益明细 · 物品价值估算";
+        /// <summary>联动位右段标注（规范 §3.5「后续扩展」）。</summary>
+        public const string LinkRowBadge = "后续扩展";
+        /// <summary>点击提示（规范 §3.5「点击只弹一句」，不跳转、不展开）。</summary>
+        public const string LinkRowClickHint = "该入口规划中，将与收益明细的物品行互链";
+
+        /// <summary>
+        /// 联动位是否可用（设计 §六 状态矩阵「联动位」列）。
+        /// M6 加载中 / M8 无旧数据时灰化——这两种状态下用户既没有价、也没有可回看的旧价，
+        /// 把一个「后续扩展」入口留在亮色，等于让他在此态下点一个更没意义的东西。
+        /// M3 的 36px 提示行比底注高 8，卡底比常规低 8，所以联动位要按卡片实际高度让位（见 LinkRowTop）。
+        /// </summary>
+        public static bool LinkRowEnabled(CardState state)
+        {
+            return state != CardState.Loading && state != CardState.NoDataAtAll;
+        }
+
+        /// <summary>
+        /// 联动位顶部 y（相对市场页内容区）。
+        /// 规范布局表把内容区按 736 算（联动位 y=708，卡底 700 + 8 间距）；
+        /// 本面板可绘高度是 740（PanelForm 830 − 页头 52 − 页脚 38），
+        /// 所以联动位贴内容区底边：740 − 28 = 712，与规范同一相对位置（距底 0、距卡 8）。
+        /// 卡片自身高度由 PreferredCardHeight / HintCardHeight 给出，这里只校验它不压到联动位。
+        /// </summary>
+        public static int LinkRowTop(int contentHeight)
+        {
+            int h = contentHeight <= 0 ? 740 : contentHeight;
+            return h - LinkRowHeight;
+        }
+
+        /// <summary>
+        /// 卡片底边到联动位顶部的可用间距。返回值 ≥ 0 才排得下。
+        /// 七城（含黑市）卡高 274 时最容易挤：这条让「城市多勾一个」不会静默把联动位盖掉。
+        /// </summary>
+        public static int LinkRowGap(int contentHeight, int cardTop, int cardHeight)
+        {
+            return LinkRowTop(contentHeight) - (cardTop + cardHeight);
+        }
+
+        /// <summary>当前帧卡片最高能到多少（任何数据态 × 任何城市数都要过得去）。</summary>
+        public static int MaxCardHeight()
+        {
+            // M3 提示行比底注高 8，是最高的一档；七城含黑市行数最多，两者组合最挤。
+            return HintCardHeight(7);
+        }
+
+        // ── 市场页纵向布局（设计 rev27 布局表 + 联动位）──
+        // 放 Core 的理由：这些位置之间有硬约束（卡片最高态不能压到联动位），
+        // 写成可算的常量才能在离线测试里验；UI 只按它们摆放控件，不另写一份数字。
+        /// <summary>市场页可绘内容区高 = PanelForm 830 − 页头 52 − 页脚 38。</summary>
+        public const int ContentHeight = 740;
+        /// <summary>
+        /// 亚服时效条顶。规范 §3 说「页头与时效条之间无间距（同属页头带）」，
+        /// 所以它紧贴页头文字底（缓存计数 40..55）落在 56。
+        /// </summary>
+        public const int FreshStripTop = 56;
+        /// <summary>时效条高（实装 34；规范表写 36，差额让给下方筛选卡间距）。</summary>
+        public const int FreshStripHeight = 34;
+        /// <summary>筛选卡顶 = 时效条底 90 + 6。</summary>
+        public const int FilterCardTop = FreshStripTop + FreshStripHeight + 6;
+        /// <summary>
+        /// 筛选卡高取 MinFilterCardHeight() 的下限 290（三列仍 7/7/5 行）。
+        /// 不能照规范表写 336：规范按「报价卡 248」排纵向预算，本实现 M3 提示行态要 282，
+        /// 多出的 34px 只能从筛选卡里让——再让就掉到 6 行，可见行数会回退。
+        /// </summary>
+        public const int FilterCardHeight = 290;
+        /// <summary>筛选卡底 + 品质/城市标签行（高 14）。</summary>
+        public const int FilterLabelTop = FilterCardTop + FilterCardHeight;
+        /// <summary>标签行高 14 + 控件行（高 24）。</summary>
+        public const int FilterControlTop = FilterLabelTop + 14;
+        /// <summary>控件行高 24 + 报价卡顶。控制行与卡片紧贴，让出的空间给卡↔联动位间距。</summary>
+        public const int QuoteCardTop = FilterControlTop + 24;
+
+        // 筛选卡内部几何（MarketTreePanel 与这里必须一致，否则可见行数会算错）
+        /// <summary>筛选卡头高。</summary>
+        public const int FilterHeadHeight = 36;
+        /// <summary>筛选三列列头高。</summary>
+        public const int FilterColumnHeadHeight = 22;
+        /// <summary>筛选卡路径条高。</summary>
+        public const int FilterPathHeight = 28;
+        /// <summary>筛选行列高。</summary>
+        public const int FilterRowHeight = 28;
+        /// <summary>三级列 chip 区高。</summary>
+        public const int FilterChipsHeight = 64;
+
+        /// <summary>筛选卡至少要多高，才能保住三列各 7 / 7 / 5 行可见（规范 §3.3 的 8 行下限去掉第 9 行露边）。</summary>
+        public static int MinFilterCardHeight(int minRowsCol0And1 = 7, int minRowsCol2 = 5)
+        {
+            int bodyAll = minRowsCol0And1 * FilterRowHeight;
+            int bodyCol2 = minRowsCol2 * FilterRowHeight + FilterChipsHeight;
+            int body = Math.Max(bodyAll, bodyCol2);
+            return FilterHeadHeight + FilterColumnHeadHeight + body + FilterPathHeight;
+        }
+
+        /// <summary>按给定卡高，各列能显示的行数（col 2 要减掉 chip 区）。</summary>
+        public static int FilterVisibleRows(int cardHeight, int col)
+        {
+            int body = Math.Max(0, cardHeight - FilterHeadHeight - FilterColumnHeadHeight - FilterPathHeight);
+            return Math.Max(1, (col == 2 ? body - FilterChipsHeight : body) / FilterRowHeight);
+        }
+
+        /// <summary>
+        /// 联动位顶（= 内容区底 − 28）。UI 与测试都从这里取，避免两处各写 712。
+        /// </summary>
+        public static int LinkRowTopOnPage()
+        {
+            return LinkRowTop(ContentHeight);
+        }
+
         /// <summary>
         /// 城市行数变化时卡片应有的高度（六城 = 248，七城含黑市 = 274，M6 骨架同理）。
         /// cityCount ≤ 0 回落六城：城市一个都没勾时不该把卡压成 0 高。

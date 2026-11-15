@@ -25,6 +25,7 @@ static class MarketModuleTests
         RunCardStateMatrixTests();
         RunZeroHttpFilterTests();
         RunM9CombinationTests();
+        RunLinkRowTests();
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -720,5 +721,100 @@ static class MarketModuleTests
         var keyOk = MarketQueryPlanner.Build(tax, ok);
         LogicTests.Check("M9 对照: 存在的组合出非空键", !keyOk.IsEmpty, keyOk.Signature);
         LogicTests.Eq("M9 对照: uniqueName 带附魔后缀", keyOk.UniqueNames[0], "T5_HEAD_CLOTH_SET1@1");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 13) 联动位（设计 rev27 §3.5 / §六 状态矩阵「联动位」列）
+    //     规范明文：「620 × 28，落在卡片下方，宽度与卡片一致」；点击只弹规划中文案。
+    //     模块边界（用户原话「跑商相关不要放到市场模块」）：这一位只做入口，
+    //     不得出现跨城价差 / 套利 / 税后净额 / 利润——这条用静态扫描锁死，不靠人盯。
+    // ─────────────────────────────────────────────────────────────
+    static void RunLinkRowTests()
+    {
+        // 尺寸与卡宽同源：规范要求「宽度与卡片一致」，所以两个常量必须相等
+        LogicTests.Eq("联动位: 宽 = 卡宽 620", QuoteTableModel.LinkRowWidth, 620);
+        LogicTests.Eq("联动位: 宽 = QuoteTable 卡宽", QuoteTableModel.LinkRowWidth, 620);
+        LogicTests.Eq("联动位: 高 = 28（规范 §3.5）", QuoteTableModel.LinkRowHeight, 28);
+
+        // 位置：贴内容区底（740 − 28 = 712）；规范 736 内容区则 708（与其布局表 y=708 一致）
+        LogicTests.Eq("联动位: 740 内容区顶 = 712", QuoteTableModel.LinkRowTop(740), 712);
+        LogicTests.Eq("联动位: 规范 736 内容区顶 = 708（与布局表 y=708 一致）",
+            QuoteTableModel.LinkRowTop(736), 708);
+        // 容错：高度未定时不该算出负数位置
+        LogicTests.Check("联动位: 内容区高 <= 0 回落 740 → 712",
+            QuoteTableModel.LinkRowTop(0) == 712, "top=" + QuoteTableModel.LinkRowTop(0));
+        LogicTests.Eq("联动位: 页面实装位 = LinkRowTopOnPage()", QuoteTableModel.LinkRowTopOnPage(), 712);
+
+        // ── 纵向链路同源：UI 和测试取同一组常量，位置不能各写一份 ──
+        LogicTests.Eq("布局: 时效条顶 56（页头带无间距）", QuoteTableModel.FreshStripTop, 56);
+        LogicTests.Eq("布局: 筛选卡顶 = 时效条底 + 6", QuoteTableModel.FilterCardTop, 96);
+        LogicTests.Eq("布局: 筛选卡高取三列 7/7/5 的下限", QuoteTableModel.FilterCardHeight,
+            QuoteTableModel.MinFilterCardHeight());
+        LogicTests.Check("布局: 筛选卡高不低于下限（低于就掉行）",
+            QuoteTableModel.FilterCardHeight >= QuoteTableModel.MinFilterCardHeight(),
+            "card=" + QuoteTableModel.FilterCardHeight + " min=" + QuoteTableModel.MinFilterCardHeight());
+        LogicTests.Eq("布局: 一级列可见 7 行", QuoteTableModel.FilterVisibleRows(QuoteTableModel.FilterCardHeight, 0), 7);
+        LogicTests.Eq("布局: 二级列可见 7 行", QuoteTableModel.FilterVisibleRows(QuoteTableModel.FilterCardHeight, 1), 7);
+        LogicTests.Eq("布局: 三级列扣除 chip 区后 5 行",
+            QuoteTableModel.FilterVisibleRows(QuoteTableModel.FilterCardHeight, 2), 5);
+        LogicTests.Eq("布局: 报价卡顶", QuoteTableModel.QuoteCardTop, 424);
+        // 联动位必须排在卡片下方：卡顶 < 联动位顶，否则「落在卡片下方」这条规范不成立
+        LogicTests.Check("布局: 报价卡顶 < 联动位顶",
+            QuoteTableModel.QuoteCardTop < QuoteTableModel.LinkRowTopOnPage(),
+            "cardTop=" + QuoteTableModel.QuoteCardTop + " linkTop=" + QuoteTableModel.LinkRowTopOnPage());
+
+        // 七城（含黑市）卡最挤：卡顶 424 + 274 = 698 ≤ 712，间距 14 不重叠
+        int gap7 = QuoteTableModel.LinkRowGap(QuoteTableModel.ContentHeight,
+            QuoteTableModel.QuoteCardTop, QuoteTableModel.PreferredCardHeight(7));
+        LogicTests.Check("联动位: 七城卡不压联动位（gap >= 0）", gap7 >= 0, "gap=" + gap7);
+        int gap6 = QuoteTableModel.LinkRowGap(QuoteTableModel.ContentHeight,
+            QuoteTableModel.QuoteCardTop, QuoteTableModel.PreferredCardHeight(6));
+        LogicTests.Check("联动位: 六城卡不压联动位（gap >= 0）", gap6 >= 0, "gap=" + gap6);
+        LogicTests.Check("联动位: 六城 gap 大于七城（多勾城确实吃掉间距）", gap6 > gap7,
+            "6城=" + gap6 + " 7城=" + gap7);
+        // M3 提示行比底注高 8，是最高的数据态，同样不能压——这条曾实测 gap=-6，
+        // 修的是布局链（筛选卡 336→290），不是把断言放宽。
+        int gapM3 = QuoteTableModel.LinkRowGap(QuoteTableModel.ContentHeight,
+            QuoteTableModel.QuoteCardTop, QuoteTableModel.HintCardHeight(7));
+        LogicTests.Check("联动位: M3 七城卡（274+8）不压联动位", gapM3 >= 0, "gap=" + gapM3);
+        // 最高态必须由 MaxCardHeight 覆盖全部数据态，否则「不压」只证明了最矮那档
+        LogicTests.Check("联动位: MaxCardHeight 覆盖 M3 七城",
+            QuoteTableModel.MaxCardHeight() >= QuoteTableModel.HintCardHeight(7),
+            "max=" + QuoteTableModel.MaxCardHeight() + " m3=" + QuoteTableModel.HintCardHeight(7));
+        LogicTests.Check("联动位: 最高态仍留间距", gapM3 >= 4, "gapM3=" + gapM3);
+
+        // 状态矩阵：M6 加载中 / M8 无旧数据灰化，其余亮色
+        LogicTests.Check("联动位: M6 加载中灰化",
+            !QuoteTableModel.LinkRowEnabled(QuoteTableModel.CardState.Loading), "M6");
+        LogicTests.Check("联动位: M8 无旧数据灰化",
+            !QuoteTableModel.LinkRowEnabled(QuoteTableModel.CardState.NoDataAtAll), "M8");
+        foreach (var st in new[]
+        {
+            QuoteTableModel.CardState.Rows, QuoteTableModel.CardState.AllSellEmpty,
+            QuoteTableModel.CardState.NoListingAtAll, QuoteTableModel.CardState.NotSelected
+        })
+        {
+            LogicTests.Check("联动位: " + st + " 亮色", QuoteTableModel.LinkRowEnabled(st), st.ToString());
+        }
+
+        // 文案：规范原文三段，一字不改（左段入口名 / 右段标注 / 点击提示）
+        LogicTests.Eq("联动位: 左段文案", QuoteTableModel.LinkRowTitle, "收益明细 · 物品价值估算");
+        LogicTests.Eq("联动位: 右段标注", QuoteTableModel.LinkRowBadge, "后续扩展");
+        LogicTests.Eq("联动位: 点击提示", QuoteTableModel.LinkRowClickHint,
+            "该入口规划中，将与收益明细的物品行互链");
+
+        // 模块边界：联动位自身文案不得出现算账词（只做入口，不做账）
+        string[] moneyWords = { "价差", "套利", "税后", "净额", "利润", "赚", "收益额" };
+        string[] linkTexts =
+        {
+            QuoteTableModel.LinkRowTitle, QuoteTableModel.LinkRowBadge, QuoteTableModel.LinkRowClickHint
+        };
+        foreach (var w in moneyWords)
+        {
+            foreach (var t in linkTexts)
+            {
+                LogicTests.Check("联动位文案不含算账词「" + w + "」", t.IndexOf(w, StringComparison.Ordinal) < 0, t);
+            }
+        }
     }
 }
