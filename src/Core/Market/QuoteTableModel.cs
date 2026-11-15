@@ -99,6 +99,23 @@ namespace AlbionCompanion.Core
         public static readonly TimeSpan AgingWindow = TimeSpan.FromMinutes(30);
         public static readonly TimeSpan StaleWindow = TimeSpan.FromHours(24);
 
+        // ── 卡片几何（设计 §3.4：卡头 40 + 表头 24 + N×26 + 底注 28；卡宽 620 减两侧 16）──
+        // 放在 Core 是为了让「卡片该多高」这件可算的事能用离线测试验，控件只做绘制。
+        public const int CardHeadHeight = 40;
+        public const int ColumnHeadHeight = 24;
+        public const int RowHeight = 26;
+        public const int FooterHeight = 28;
+
+        /// <summary>
+        /// 城市行数变化时卡片应有的高度（六城 = 248，七城含黑市 = 274，M6 骨架同理）。
+        /// cityCount ≤ 0 回落六城：城市一个都没勾时不该把卡压成 0 高。
+        /// </summary>
+        public static int PreferredCardHeight(int cityCount)
+        {
+            int rows = cityCount <= 0 ? 6 : cityCount;
+            return CardHeadHeight + ColumnHeadHeight + rows * RowHeight + FooterHeight;
+        }
+
         /// <summary>报价卡整体状态（设计 §六 九态里与报价卡直接相关的几个）。</summary>
         public enum CardState
         {
@@ -111,7 +128,12 @@ namespace AlbionCompanion.Core
             /// <summary>M5：三级未选满，不渲染任何行。</summary>
             NotSelected,
             /// <summary>M8：取不到数据且无旧数据。</summary>
-            NoDataAtAll
+            NoDataAtAll,
+            /// <summary>
+            /// M6：查询在途。骨架占位（灰条，不转圈），**不保留上一次价格的残影**——
+            /// 留着旧值会让人以为刷新没生效（设计 §六 M6 硬规则）。
+            /// </summary>
+            Loading
         }
 
         /// <summary>时效档判定（纯函数）。</summary>

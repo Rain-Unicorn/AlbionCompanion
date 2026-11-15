@@ -20,20 +20,21 @@ namespace AlbionCompanion.UI.Controls
     public class QuoteTable : Control
     {
         // ── 布局（设计 §3.4：卡头 40 + 表头 24 + N×26 + 底注 28；卡宽 620 减两侧 16 = 588）
+        // 几何常量与 PreferredCardHeight 的权威定义在 QuoteTableModel（Core，可用离线测试验），
+        // 这里只做别名，避免两处各写一份数字后走样。
         public const int CardWidth = 620;
         /// <summary>空态/未选态的基础卡高（按六城行位预留）。有数据时用 <see cref="PreferredHeight"/> 动态加高。</summary>
         public const int CardHeight = 248;
-        private const int HeadHeight = 40;
-        private const int ColumnHeadHeight = 24;
-        private const int RowHeight = 26;
-        private const int FooterHeight = 28;
+        private const int HeadHeight = QuoteTableModel.CardHeadHeight;
+        private const int ColumnHeadHeight = QuoteTableModel.ColumnHeadHeight;
+        private const int RowHeight = QuoteTableModel.RowHeight;
+        private const int FooterHeight = QuoteTableModel.FooterHeight;
         private const int PadX = 16;
 
         /// <summary>城市行数变化时卡片应有的高度（7 城 = 274，六城 = 248）。</summary>
         public static int PreferredHeight(int cityCount)
         {
-            int rows = cityCount <= 0 ? 6 : cityCount;
-            return HeadHeight + ColumnHeadHeight + rows * RowHeight + FooterHeight;
+            return QuoteTableModel.PreferredCardHeight(cityCount);
         }
 
         // 四列权重（设计规范 §三）：城市 120 / 买入 180 / 卖出 180 / 数据时间 108 = 588
@@ -64,6 +65,7 @@ namespace AlbionCompanion.UI.Controls
         private bool _showRetry;
         private string? _warnBar;     // M7：刷新失败但有旧数据
         private int _hoverRow = -1;
+        private int _loadingCities = 6;  // M6：骨架按本次查询的城市数给占位行位
 
         public event EventHandler? RetryRequested;
         public event EventHandler? AdjacentTierRequested;
@@ -118,6 +120,24 @@ namespace AlbionCompanion.UI.Controls
             _emptyDetail = "点击「查询行情」回源各城报价";
             _showRetry = true;
             Height = CardHeight;
+            Invalidate();
+        }
+
+        /// <summary>
+        /// M6：查询在途。骨架占位（6 行灰条，不转圈），**不保留上一次价格的残影**——
+        /// 留着旧值会让人以为刷新没生效（设计 §六 M6 硬规则「加载中不显示旧值的残影」）。
+        /// 卡片高度按本次查询的城市数给出占位行位，查询结束后无论成败都由调用方退出本态。
+        /// </summary>
+        public void SetLoading(int cityCount)
+        {
+            _rows = new List<QuoteViewRow>();
+            _state = QuoteTableModel.CardState.Loading;
+            _emptyTitle = "查询中";
+            _emptyDetail = "";
+            _showRetry = false;
+            _warnBar = null;
+            _loadingCities = cityCount <= 0 ? 6 : cityCount;
+            Height = PreferredHeight(_loadingCities);
             Invalidate();
         }
 
@@ -193,6 +213,8 @@ namespace AlbionCompanion.UI.Controls
                 if (_state == QuoteTableModel.CardState.Rows
                     || _state == QuoteTableModel.CardState.AllSellEmpty)
                     return PreferredHeight(_rows.Count);
+                if (_state == QuoteTableModel.CardState.Loading)
+                    return PreferredHeight(_loadingCities);
                 return CardHeight;
             }
         }
@@ -220,6 +242,9 @@ namespace AlbionCompanion.UI.Controls
 
             switch (_state)
             {
+                case QuoteTableModel.CardState.Loading:
+                    DrawSkeleton(g, w);
+                    break;
                 case QuoteTableModel.CardState.NotSelected:
                 case QuoteTableModel.CardState.NoDataAtAll:
                 case QuoteTableModel.CardState.NoListingAtAll:
@@ -237,23 +262,22 @@ namespace AlbionCompanion.UI.Controls
                 TextFormatFlags.NoPadding);
             TextRenderer.DrawText(g, "CITY QUOTES", _kickerFont, new Point(PadX + 68, 16), Th.Sub,
                 TextFormatFlags.NoPadding);
-            // 右端「6 城 · 亚服」——注意这里不写数据时间：时间必须逐城各自算
-            TextRenderer.DrawText(g, _headRight, _headFont,
-                new Rectangle(w - PadX - 120, 14, 120, 16), Th.Sub,
+            // 右端「6 城 · 亚服」——注意这里不写数据时间：时间必须逐城各自算。
+            // M6 期间改写「查询中…」：刷新在途是唯一可说的状态，报旧城市数没有意义。
+            string headRight = _state == QuoteTableModel.CardState.Loading
+                ? "查询中…" : (_headRight ?? "6 城 · 亚服");
+            TextRenderer.DrawText(g, headRight, _headFont,
+                new Rectangle(w - PadX - 120, 14, 120, 16),
+                _state == QuoteTableModel.CardState.Loading ? Th.Accent : Th.Sub,
                 TextFormatFlags.Right | TextFormatFlags.NoPadding);
         }
 
-        private void DrawWarnBar(Graphics g, int w)
+        /// <summary>
+        /// 表头四列（M6 骨架与有数据时同构）：列头保持可读，用户才知道这卡还是报价卡，
+        /// 只是数据在来的路上——整卡一起灰掉会让人以为控件坏了。
+        /// </summary>
+        private void DrawTableHead(Graphics g, int w)
         {
-            var r = new Rectangle(PadX, HeadHeight, w - PadX * 2, 32);
-            using (var br = new SolidBrush(WarnBarBg)) g.FillRectangle(br, r);
-            TextRenderer.DrawText(g, _warnBar, _footFont, new Rectangle(r.X + 8, r.Y, r.Width - 16, 32),
-                Th.Accent, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-        }
-
-        private void DrawTable(Graphics g, int w)
-        {
-            // 表头 24
             var headRect = new Rectangle(PadX, HeadHeight, w - PadX * 2, ColumnHeadHeight);
             int x = PadX;
             string[] titles = { "城市", "↓ 买入", "↑ 卖出", "数据时间" };
@@ -268,6 +292,49 @@ namespace AlbionCompanion.UI.Controls
             }
             using (var pen = new Pen(Th.Line))
                 g.DrawLine(pen, PadX, headRect.Bottom, w - PadX, headRect.Bottom);
+        }
+
+        /// <summary>
+        /// M6 骨架：按本次查询的城市数铺灰条，**不转圈、不画假城市名、不画假价格**。
+        /// 假名字/假数字会被读成真行情——这正是「加载中不显示旧值的残影」要防的另一半。
+        /// 底注区在骨架期间留空：没有任何可比价格，写「六城均无可比价格」会是错的结论。
+        /// </summary>
+        private void DrawSkeleton(Graphics g, int w)
+        {
+            DrawTableHead(g, w);
+
+            int top = RowsTop;
+            // 灰条宽度按各列内容性质预估（城市窄、买卖价中等、时间最短），只用几何关系
+            int[] barWidths = { 60, 64, 64, 44 };
+            for (int i = 0; i < _loadingCities; i++)
+            {
+                var rect = new Rectangle(PadX, top + i * RowHeight, w - PadX * 2, RowHeight);
+                using (var br = new SolidBrush(i % 2 == 0 ? ZebraBg : ZebraBg2))
+                    g.FillRectangle(br, rect);
+
+                int cx = rect.X;
+                for (int c = 0; c < 4; c++)
+                {
+                    int bw = barWidths[c];
+                    int bx = c == 0 ? cx + 2 : cx + ColumnWidths[c] - bw - 4;
+                    var bar = new Rectangle(bx, rect.Y + (RowHeight - 9) / 2, bw, 9);
+                    using (var br = new SolidBrush(Th.Line)) g.FillRectangle(br, bar);
+                    cx += ColumnWidths[c];
+                }
+            }
+        }
+
+        private void DrawWarnBar(Graphics g, int w)
+        {
+            var r = new Rectangle(PadX, HeadHeight, w - PadX * 2, 32);
+            using (var br = new SolidBrush(WarnBarBg)) g.FillRectangle(br, r);
+            TextRenderer.DrawText(g, _warnBar, _footFont, new Rectangle(r.X + 8, r.Y, r.Width - 16, 32),
+                Th.Accent, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
+
+        private void DrawTable(Graphics g, int w)
+        {
+            DrawTableHead(g, w);
 
             int top = RowsTop;
             for (int i = 0; i < _rows.Count; i++)

@@ -395,6 +395,15 @@ namespace AlbionCompanion.UI.Tabs
                 return;
             }
 
+            // M6：查询在途时卡片必须是骨架，不能被下面的快照渲染覆盖成旧数据。
+            // 刷新期间切筛选/切城市也会走到这里——保持加载态，查询结束由调用方退出。
+            if (_refreshing)
+            {
+                _card.SetLoading(cities.Count);
+                _selection.Text = "查询中";
+                return;
+            }
+
             List<int> qualities;
             var targets = CurrentTargets(out qualities);
             if (targets == null || targets.Count == 0)
@@ -495,6 +504,10 @@ namespace AlbionCompanion.UI.Tabs
             UpdateQueryCountLabel();
             _refreshing = true;
             _refresh.Enabled = !automatic;
+            // M6：进入查询即进加载态（按本次查询城市数给骨架行位）。
+            // 刷新期间卡片不保留上一轮价格残影——用户会以为刷新没生效。
+            _card.SetLoading(cities.Count);
+            _selection.Text = "查询中";
             SetStatus("正在回源 " + targets.Count + " 个物品 × " + cities.Count + " 城…", Th.Info);
 
             var targetCopy = new List<string>(targets);
@@ -538,6 +551,8 @@ namespace AlbionCompanion.UI.Tabs
                         _refreshing = false;
                         _refresh.Enabled = true;
                         SetStatus("查询已取消", Th.Sub);
+                        // M6 出口：取消也是终止，卡片必须退出加载态（用缓存快照兜底）
+                        RenderCard();
                     }));
                 }
                 catch (Exception ex)

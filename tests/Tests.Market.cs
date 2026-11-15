@@ -364,6 +364,18 @@ static class MarketModuleTests
         };
         LogicTests.Eq("整卡状态: 整件无挂单 = NoListingAtAll（M4）",
             QuoteTableModel.StateOf(new[] { noListingRow }), QuoteTableModel.CardState.NoListingAtAll);
+
+        // ⑥ M6 加载态：状态枚举必须独立于其余八态（不能用 NoDataAtAll 冒充，
+        //    否则「查询在途」与「取不到数据」在 UI 上分不开，用户会以为查询失败）。
+        LogicTests.Check("整卡状态: M6 Loading 是独立枚举值",
+            QuoteTableModel.CardState.Loading != QuoteTableModel.CardState.NoDataAtAll
+            && QuoteTableModel.CardState.Loading != QuoteTableModel.CardState.Rows
+            && QuoteTableModel.CardState.Loading != QuoteTableModel.CardState.NotSelected,
+            "Loading 与既有状态枚举撞值");
+        // 骨架行位数 = 本次查询城市数；卡片高度按行位算，不随空态 CardHeight 走
+        LogicTests.Eq("整卡高度: M6 六城骨架 = 248", QuoteTableModel.PreferredCardHeight(6), 248);
+        LogicTests.Eq("整卡高度: M6 七城（含黑市）骨架 = 274", QuoteTableModel.PreferredCardHeight(7), 274);
+        LogicTests.Eq("整卡高度: M6 城市数 0 回落六城", QuoteTableModel.PreferredCardHeight(0), 248);
     }
 
     // ─────────────────────────────────────────────────────────────
