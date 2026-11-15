@@ -57,6 +57,19 @@ namespace AlbionCompanion.UI.Controls
             return value.ToString("0.#");
         }
 
+        /// <summary>
+        /// 报价年龄文案（逐行「时间」列）：分钟 → 「Nm」/<see langword="null"/> 语义为无时间戳。
+        /// 负数（-1）表示时间戳缺失，显示「无戳」——**绝不显示 0 分钟**，0 会被读成「刚更新」。
+        /// ≥60 分钟折算成小时（1 位小数），便于一眼看出报价有多旧。
+        /// </summary>
+        public static string AgeLabel(int ageMinutes)
+        {
+            if (ageMinutes < 0) return "无戳";
+            if (ageMinutes < 60) return ageMinutes + "m";
+            double hours = ageMinutes / 60.0d;
+            return hours.ToString("0.0") + "h";
+        }
+
         public static string TierChip(string itemId)
         {
             int tier = ItemCatalog.TierOf(itemId);
@@ -196,10 +209,18 @@ namespace AlbionCompanion.UI.Controls
         private const int MissingAreaHeight = 92;
 
         private static readonly string[] HeadersNormal =
-            { "物品", "出发城", "吃单成本", "卖入所得", "单件净利", "每kg", "深度", "单趟" };
+            { "物品", "出发城", "吃单成本", "卖入所得", "单件净利", "比值", "每kg", "深度", "单趟", "时间" };
         private static readonly string[] HeadersLoop =
-            { "物品", "路线", "吃单成本", "卖入所得", "单件净利", "每kg", "深度", "单趟" };
-        private static readonly int[] ColumnWidths = { 132, 86, 62, 62, 62, 58, 46, 80 };
+            { "物品", "路线", "吃单成本", "卖入所得", "单件净利", "比值", "每kg", "深度", "单趟", "时间" };
+
+        /// <summary>
+        /// 列宽基准（共 10 列）。总和 584 = 620 宽面板的可用内容区（620 − 2×Pad16 − 2）。
+        /// 实际绘制时按面板宽度等比缩放（见 <see cref="BuildColumns"/>），窄窗不截断列。
+        /// 新增「比值」「时间」两列是规范 §3 显示要素：比值对照 1.087/1.042 门槛，时间是逐行报价时间戳。
+        /// </summary>
+        private static readonly int[] BaseColumnWidths = { 100, 64, 58, 58, 58, 46, 52, 40, 66, 42 };
+
+        private readonly int[] _cols = new int[BaseColumnWidths.Length];
 
         public TradeBoard Board;
         public TradeRouteMode Mode = TradeRouteMode.BlackMarket;
@@ -324,6 +345,7 @@ namespace AlbionCompanion.UI.Controls
 
             DrawSortPills(g);
             if (Mode == TradeRouteMode.RoyalLoop) DrawDestinationPills(g);
+            BuildColumns();
             DrawTableHeader(g);
             DrawRows(g);
             DrawMissingSection(g);
@@ -381,14 +403,35 @@ namespace AlbionCompanion.UI.Controls
             int x = Pad;
             for (int i = 0; i < headers.Length; i++)
             {
-                var rect = new Rectangle(x, _tableHeaderY, ColumnWidths[i], 20);
+                var rect = new Rectangle(x, _tableHeaderY, _cols[i], 20);
                 TextRenderer.DrawText(g, headers[i], _head, rect, Th.Sub,
                     (i >= 2 ? TextFormatFlags.Right : TextFormatFlags.Left)
                     | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                x += ColumnWidths[i];
+                x += _cols[i];
             }
             using (var pen = new Pen(Th.Line))
                 g.DrawLine(pen, Pad, _tableHeaderY + 20, Width - Pad, _tableHeaderY + 20);
+        }
+
+        /// <summary>
+        /// 按面板可用宽度等比缩放列宽（基准 584），保证 10 列在窄窗也不互相压字。
+        /// 列宽是布局量、不是业务量，故留在 UI 层；比值/门槛本身在计算层。
+        /// </summary>
+        private void BuildColumns()
+        {
+            int total = 0;
+            for (int i = 0; i < BaseColumnWidths.Length; i++) total += BaseColumnWidths[i];
+            int avail = Math.Max(300, Width - Pad * 2 - 2);
+            int used = 0;
+            for (int i = 0; i < BaseColumnWidths.Length; i++)
+            {
+                if (i == BaseColumnWidths.Length - 1) _cols[i] = Math.Max(34, avail - used);
+                else
+                {
+                    _cols[i] = Math.Max(34, (int)Math.Floor(BaseColumnWidths[i] * (double)avail / total));
+                    used += _cols[i];
+                }
+            }
         }
 
         private void DrawRows(Graphics g)
@@ -465,39 +508,51 @@ namespace AlbionCompanion.UI.Controls
             string name = TradeFormat.ItemLabel(leg.ItemId, leg.DisplayName);
             string quality = leg.Quality > 1 ? " · " + TradeFormat.QualityName(leg.Quality) : "";
             TextRenderer.DrawText(g, name + quality, _rowFont,
-                new Rectangle(x, y + 2, ColumnWidths[0] - (x - rect.X) + 20, 20), Th.Text,
+                new Rectangle(x, y + 2, Math.Max(40, rect.Right - x - 4), 20), Th.Text,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix
                 | TextFormatFlags.EndEllipsis);
 
-            int colOriginX = rect.X + ColumnWidths[0];
+            int colOriginX = rect.X + _cols[0];
             string routeText = Mode == TradeRouteMode.RoyalLoop
                 ? TradeCities.Zh(leg.OriginCity) + "→" + TradeCities.Zh(leg.DestCity)
                 : TradeCities.Zh(leg.OriginCity);
             TextRenderer.DrawText(g, routeText, _small,
-                new Rectangle(colOriginX, y + 2, ColumnWidths[1], 20), Th.Sub,
+                new Rectangle(colOriginX, y + 2, _cols[1], 20), Th.Sub,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix
                 | TextFormatFlags.EndEllipsis);
 
-            // 下段：数值列（cost 橙 / income 青 / 净利 heal-dmg / 每kg / 深度 / 单趟）
-            int colX = rect.X + ColumnWidths[0] + ColumnWidths[1];
-            DrawRight(g, TradeFormat.Silver(leg.BuyUnit), colX, y + 20, ColumnWidths[2], TradeColors.Cost);
-            colX += ColumnWidths[2];
-            DrawRight(g, TradeFormat.Silver(leg.SellNet), colX, y + 20, ColumnWidths[3], TradeColors.Income);
-            colX += ColumnWidths[3];
-            DrawRight(g, TradeFormat.SilverSigned(leg.NetPerUnit), colX, y + 20, ColumnWidths[4],
+            // 下段：数值列（cost 橙 / income 青 / 净利 heal-dmg / 比值 / 每kg / 深度 / 单趟 / 时间）
+            int colX = rect.X + _cols[0] + _cols[1];
+            DrawRight(g, TradeFormat.Silver(leg.BuyUnit), colX, y + 20, _cols[2], TradeColors.Cost);
+            colX += _cols[2];
+            DrawRight(g, TradeFormat.Silver(leg.SellNet), colX, y + 20, _cols[3], TradeColors.Income);
+            colX += _cols[3];
+            DrawRight(g, TradeFormat.SilverSigned(leg.NetPerUnit), colX, y + 20, _cols[4],
                 leg.NetPerUnit >= 0 ? Th.Good : Th.Bad);
-            colX += ColumnWidths[4];
+            colX += _cols[4];
+
+            // 比值列（规范 §3 显示要素）：恰好等于门槛时仍算达标（门槛是「≥ 才不亏」的闭区间端点），
+            // 达标用 Good 色，未达标用 Accent 色提示「这条不赚」。
+            DrawRight(g, leg.PriceRatio > 0d ? leg.PriceRatio.ToString("0.000") : "—",
+                colX, y + 20, _cols[5], leg.MeetsThreshold ? Th.Good : Th.Accent);
+            colX += _cols[5];
+
             DrawRight(g, leg.PerKg.HasValue ? TradeFormat.SilverSigned((long)Math.Round(leg.PerKg.Value)) : "—",
-                colX, y + 20, ColumnWidths[5], leg.PerKg.HasValue ? Th.Text : Th.Sub);
-            colX += ColumnWidths[5];
+                colX, y + 20, _cols[6], leg.PerKg.HasValue ? Th.Text : Th.Sub);
+            colX += _cols[6];
             DrawRight(g, leg.DepthKnown ? leg.Depth.ToString("N0") : "—",
-                colX, y + 20, ColumnWidths[6], leg.DepthKnown ? Th.Text : Th.Sub);
-            colX += ColumnWidths[6];
+                colX, y + 20, _cols[7], leg.DepthKnown ? Th.Text : Th.Sub);
+            colX += _cols[7];
             // 深度未知时单趟不可算（不拿负重件数冒充承接量），显示 —；深度已知才给 net×件数
             long tripProfit = (leg.DepthKnown && WeightLimitKg > 0d)
                 ? leg.NetPerUnit * TradeEngine.PiecesFor(leg, WeightLimitKg) : 0L;
             DrawRight(g, tripProfit > 0L ? TradeFormat.Silver(tripProfit) : "—",
-                colX, y + 20, ColumnWidths[7], tripProfit > 0L ? Th.Accent : Th.Sub);
+                colX, y + 20, _cols[8], tripProfit > 0L ? Th.Accent : Th.Sub);
+            colX += _cols[8];
+            // 时间列：目的城（卖出侧）买单报价的年龄——净利由它决定，故显示它；
+            // 无时间戳显示「无戳」，绝不显示 0（那会被读成「刚更新」）。
+            DrawRight(g, TradeFormat.AgeLabel(leg.DestAgeMinutes),
+                colX, y + 20, _cols[9], leg.DestAgeMinutes >= 0 ? Th.Sub : Th.Accent);
         }
 
         private void DrawRight(Graphics g, string text, int x, int y, int w, Color color)
@@ -977,13 +1032,22 @@ namespace AlbionCompanion.UI.Controls
                     TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
 
                 // 风险三段并列：等级芯片 + 红区段数 + 后果
+                // 红区属性未知时不显示「0 段红区」（那会被读成「确认安全」），改标「红区待核实」。
                 var chipRect = new Rectangle(rect.Right - 150, rect.Y + 6, 62, 20);
-                using (var br = new SolidBrush(route.RedSegments > 0 ? TradeColors.RedZoneBg : TradeColors.WarnBg))
+                bool redKnown = route.RedKnown && route.RedSegments > 0;
+                using (var br = new SolidBrush(redKnown ? TradeColors.RedZoneBg : TradeColors.WarnBg))
                     g.FillRectangle(br, chipRect);
-                TextRenderer.DrawText(g, route.RiskLevel + " · " + route.RedSegments + " 段红区", _chip, chipRect,
-                    TradeColors.RiskColor(route.RiskLevel),
+                string chipText = route.RedKnown
+                    ? route.RiskLevel + " · " + route.RedSegments + " 段红区"
+                    : route.RiskLevel + " · 待核实";
+                TextRenderer.DrawText(g, chipText, _chip, chipRect,
+                    route.RedKnown ? TradeColors.RiskColor(route.RiskLevel) : Th.Sub,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                TextRenderer.DrawText(g, "耗时约 " + route.Minutes + " 分 · " + route.Steps.Count + " 段",
+                // 耗时未知不编造分钟数：显示「耗时未知 · N 段」。
+                string metaText = route.MinutesKnown
+                    ? "耗时约 " + route.Minutes + " 分 · " + route.Steps.Count + " 段"
+                    : "耗时未知 · " + route.Steps.Count + " 段";
+                TextRenderer.DrawText(g, metaText,
                     _small, new Rectangle(rect.Right - 150, rect.Y + 28, 138, 18), Th.Sub,
                     TextFormatFlags.Right | TextFormatFlags.NoPrefix);
             }
@@ -1012,6 +1076,7 @@ namespace AlbionCompanion.UI.Controls
             }
 
             bool red = nav.IsCurrentRed;
+            bool redUnknown = nav.IsCurrentRedUnknown;
             var card = new Rectangle(Pad, top, Width - Pad * 2, 180);
             using (var br = new SolidBrush(red ? TradeColors.RedZoneBg : Th.CardHi))
                 g.FillRectangle(br, card);
@@ -1044,8 +1109,15 @@ namespace AlbionCompanion.UI.Controls
 
             if (red)
             {
-                TextRenderer.DrawText(g, "⚠ 红区 · " + (nav.RiskNote ?? "此段为红区，被击倒将失去全部货物"),
+                TextRenderer.DrawText(g, "⚠ 红区 · " + (nav.RiskNote ?? TradeRouteCatalog.RedZoneNote),
                     _small, new Rectangle(card.X + 12, card.Y + 106, card.Width - 24, 18), Th.Bad,
+                    TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            }
+            else if (redUnknown)
+            {
+                // 拓扑未接入：不得显示成「安全」，明说本段红区属性未核实。
+                TextRenderer.DrawText(g, "红区属性未核实 · 进红区被击倒将失去全部货物",
+                    _small, new Rectangle(card.X + 12, card.Y + 106, card.Width - 24, 18), Th.Sub,
                     TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
             }
 
@@ -1086,7 +1158,7 @@ namespace AlbionCompanion.UI.Controls
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
 
-        /// <summary>八向罗盘 3×3（规范 §5：命中 accent 实底）。</summary>
+        /// <summary>八向罗盘 3×3（规范 §5：命中 accent 实底）。方位未知时全不高亮并标注。</summary>
         private void DrawCompass(Graphics g, Rectangle area, NavigationState nav)
         {
             string[,] dirs = { { "NW", "N", "NE" }, { "W", "", "E" }, { "SW", "S", "SE" } };
@@ -1105,15 +1177,22 @@ namespace AlbionCompanion.UI.Controls
                             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
                         continue;
                     }
-                    if (current == dir) Th.FillRound(g, rect, 5, Th.Accent);
+                    if (current.Length > 0 && current == dir) Th.FillRound(g, rect, 5, Th.Accent);
                     else
                     {
                         using (var br = new SolidBrush(Th.Card)) g.FillRectangle(br, rect);
                     }
                     TextRenderer.DrawText(g, dir, _chip, rect,
-                        current == dir ? Color.FromArgb(26, 21, 10) : Th.Sub,
+                        current.Length > 0 && current == dir ? Color.FromArgb(26, 21, 10) : Th.Sub,
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
                 }
+            }
+            // 方位未知时明说：罗盘全灰不是渲染故障，是拓扑数据未接入。
+            if (current.Length == 0)
+            {
+                TextRenderer.DrawText(g, "方位未知", _chip,
+                    new Rectangle(area.X, area.Bottom + 2, area.Width, 14), Th.Sub,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
             }
         }
 

@@ -180,6 +180,26 @@ namespace AlbionCompanion.Core.Trade
         /// <summary>回报率（%，对吃单成本）。</summary>
         public double ReturnPct;
 
+        /// <summary>
+        /// 卖价 / 买价比值 = buy_price_max ÷ sell_price_min（规范 §7 门槛对照用）。
+        /// 与 <see cref="Threshold"/> 比较：≥ 门槛才不亏（F2P 1.087 / Premium 1.042）。
+        /// </summary>
+        public double PriceRatio;
+
+        /// <summary>本腿适用的保本门槛（= 1/(1−销售税)；F2P 1.087 / Premium 1.042）。</summary>
+        public double Threshold;
+
+        /// <summary>比值是否达到保本门槛（UI 逐行用色判定，不在 UI 里重算门槛）。</summary>
+        public bool MeetsThreshold;
+
+        /// <summary>
+        /// 目的城买单报价的年龄（分钟）；-1 = 无时间戳。逐行显示「数据时间戳」用。
+        /// </summary>
+        public int DestAgeMinutes = -1;
+
+        /// <summary>出发城卖单报价的年龄（分钟）；-1 = 无时间戳。</summary>
+        public int OriginAgeMinutes = -1;
+
         /// <summary>物品重量 kg；未知为 null（绝不显示 0）。</summary>
         public double? WeightKg;
 
@@ -498,6 +518,10 @@ namespace AlbionCompanion.Core.Trade
                             depthValue = depth.DepthOf(itemId, quality, dest);
                             if (depthValue < 0L) depthValue = 0L;
                         }
+                        // 规范 §7 门槛对照：卖价/买价 ≥ 1/(1−销售税) 才不亏（F2P 1.087 / Premium 1.042）。
+                        // 比值与门槛都落在计算层，UI 只读字段，不重复算口径。
+                        double threshold = PathAThreshold(sellTax);
+                        double ratio = buyUnit > 0L ? (double)sellUnit / buyUnit : 0d;
                         var leg = new TradeLeg
                         {
                             ItemId = itemId,
@@ -510,6 +534,11 @@ namespace AlbionCompanion.Core.Trade
                             SellNet = sellNet,
                             NetPerUnit = net,
                             ReturnPct = buyUnit > 0L ? net * 100.0d / buyUnit : 0d,
+                            PriceRatio = ratio,
+                            Threshold = threshold,
+                            MeetsThreshold = ratio >= threshold,
+                            OriginAgeMinutes = AgeMinutes(originQuote != null ? originQuote.SellMinDate : "", now),
+                            DestAgeMinutes = AgeMinutes(destQuote != null ? destQuote.BuyMaxDate : "", now),
                             WeightKg = weight,
                             PerKg = weight.HasValue && weight.Value > 0d ? net / weight.Value : (double?)null,
                             Depth = depthValue,

@@ -9,9 +9,20 @@ namespace AlbionCompanion.Core.Trade
     {
         public string FromMap;
         public string ToMap;
-        /// <summary>出口八向（N/NE/E/SE/S/SW/W/NW），导航卡罗盘用。</summary>
+
+        /// <summary>
+        /// 出口八向（N/NE/E/SE/S/SW/W/NW），导航卡罗盘用。
+        /// **空串 = 方位未知**：地图拓扑数据来源未知（见 <see cref="TradeRouteCatalog"/>），
+        /// 当前实现一律给空串，不猜方位；罗盘全部不高亮并显式标注「方位未知」。
+        /// </summary>
         public string Direction;
+
+        /// <summary>本段是否红区；仅在 <see cref="RedKnown"/> 为 true 时才有意义。</summary>
         public bool RedZone;
+
+        /// <summary>红区属性是否已知（false = 不臆造，UI 显示「红区待核实」而不是「安全」）。</summary>
+        public bool RedKnown = true;
+
         public string Note;
     }
 
@@ -20,15 +31,27 @@ namespace AlbionCompanion.Core.Trade
     {
         public string OriginCity;
         public string DestCity;
-        /// <summary>走法标签：红区直穿 / 塞福绕行 / 走私者网络 / 官道直行 …</summary>
+
+        /// <summary>走法标签。当前一律「城市级骨架」——中间地图拓扑未接入，不编造走法名。</summary>
         public string FormLabel;
-        /// <summary>风险等级：高危 / 中危 / 低危（不折进收益，规范 §5）。</summary>
+
+        /// <summary>风险等级：高危 / 中危 / 低危 / **未知**（不折进收益，规范 §5）。</summary>
         public string RiskLevel;
-        /// <summary>红区段数。</summary>
+
+        /// <summary>红区段数；仅在 <see cref="RedKnown"/> 为 true 时才有意义。</summary>
         public int RedSegments;
+
+        /// <summary>红区属性是否已知（false = UI 显示「红区待核实」，不得显示成「安全」）。</summary>
+        public bool RedKnown = true;
+
         public string RiskNote;
-        /// <summary>静态路单的预估耗时（分钟）。</summary>
-        public int Minutes;
+
+        /// <summary>静态路单的预估耗时（分钟）；**负数 = 未知**，UI 显示「耗时未知」不编造数字。</summary>
+        public int Minutes = -1;
+
+        /// <summary>耗时是否已知（false 时不显示具体分钟数）。</summary>
+        public bool MinutesKnown;
+
         public List<NavigationStep> Steps = new List<NavigationStep>();
 
         public string Title
@@ -39,14 +62,36 @@ namespace AlbionCompanion.Core.Trade
 
     /// <summary>
     /// 静态路单目录（规范 §5：实时跟随未解锁前用静态路单，手动下一步）。
-    /// 只提供走法/方向/风险段这类确定性的路线骨架，不编造概率与收益；
     /// 收益由调用方传入的当前腿/装载方案决定，风险不折进收益。
     /// </summary>
+    /// <remarks>
+    /// **地图拓扑数据来源未知**：仓库内没有任何 portal / zone / 地图数据（`data/` 为空，
+    /// AODP 只提供 prices / history / gold 三端点，均不含拓扑），设计稿 §3.4 要求的
+    /// 「当前图 → 出口八向 → 下一图」五步路单因此**没有数据基础**。
+    /// 按规格「不许臆造地图拓扑、不许猜 zone id 对应关系」，本目录只给**城市级骨架**：
+    /// 只声明两件可从城市常量与交易数据确定的事——
+    /// ① 黑市位于凯尔莱恩（`Caerleon` 与 `Black Market` 是同城两个市场）；
+    /// ② 路线的起点城与终点城。
+    /// 中间地图名、出口方位、红区属性、耗时一律置**未知**（`Direction=""` / `RedKnown=false` /
+    /// `MinutesKnown=false`），由用户按「下一步」手动推进。接入真实拓扑后只需改本类的
+    /// <see cref="Candidates"/>，调用方（UI / 悬浮条）不感知。
+    /// </remarks>
     public static class TradeRouteCatalog
     {
-        private const string RedZoneNote = "此段为红区，被击倒将失去全部货物";
+        /// <summary>红区后果文案（唯一的既知事实：红区被击倒会掉货，与拓扑无关）。</summary>
+        public const string RedZoneNote = "此段为红区，被击倒将失去全部货物";
 
-        /// <summary>为一条腿生成候选路线：黑市 4 条、王城互跑 3 条、布雷西里恩 1 条提示路线。</summary>
+        /// <summary>走法标签：当前无中间地图数据，统一标为城市级骨架。</summary>
+        private const string CitySkeletonLabel = "城市级骨架";
+
+        /// <summary>风险等级：拓扑未知时不得标成高危/低危，只能标未知。</summary>
+        private const string UnknownRisk = "未知";
+
+        /// <summary>
+        /// 为一条腿生成候选路线。
+        /// 黑市腿 = 2 段城市级骨架（起点城 → 凯城 → 黑市）；王城互跑 / 布雷西里恩 = 1 段。
+        /// 每段的方向、红区属性、耗时均未知，不编造。
+        /// </summary>
         public static List<NavigationRoute> Candidates(string origin, string dest)
         {
             var list = new List<NavigationRoute>();
@@ -54,152 +99,70 @@ namespace AlbionCompanion.Core.Trade
 
             if (TradeCities.IsBlackMarket(dest))
             {
-                // 静态路单：走法标签/方向/红区段都是确定性骨架，风险不折进收益（规范 §5）
-                list.Add(BlackMarketRoute(origin, dest, "红区直穿", "高危", 18,
-                    "直穿红区走廊，路程最短、风险最高；被击倒将失去全部货物。",
-                    Step(origin, "红区走廊", "E", true),
-                    Step("红区走廊", "红区腹地", "SE", true),
-                    Step("红区腹地", TradeCities.Caerleon, "S", true),
-                    Step(TradeCities.Caerleon, dest, "E", false)));
-                list.Add(BlackMarketRoute(origin, dest, "塞福绕行", "中危", 26,
-                    "经塞福绕行，仅最后一段过红区关卡。",
-                    Step(origin, TradeCities.Thetford, "E", false),
-                    Step(TradeCities.Thetford, "红区关卡", "S", true),
-                    Step("红区关卡", TradeCities.Caerleon, "W", false),
-                    Step(TradeCities.Caerleon, dest, "E", false)));
-                list.Add(BlackMarketRoute(origin, dest, "走私者网络", "低危", 31,
-                    "走走私者网络，全程非红区，但路程最长。",
-                    Step(origin, "走私者隧道", "W", false),
-                    Step("走私者隧道", TradeCities.Caerleon, "S", false),
-                    Step(TradeCities.Caerleon, dest, "E", false)));
-                string royalTransfer = TransferCity(origin, TradeCities.Caerleon);
-                list.Add(BlackMarketRoute(origin, dest, "主城转运", "中危", 24,
-                    "经王城中转再进凯城，一段红区关卡。",
-                    Step(origin, royalTransfer, "N", false),
-                    Step(royalTransfer, "红区关卡", "E", true),
-                    Step("红区关卡", TradeCities.Caerleon, "S", false),
-                    Step(TradeCities.Caerleon, dest, "E", false)));
+                // 唯一的结构性事实：黑市在凯城，所以必须经过凯城一次。
+                list.Add(CityRoute(origin, dest,
+                    "城市级骨架：起点城 → 凯城 → 黑市。中间地图、出口方位、红区属性与耗时均未接入数据，需手动逐步推进。",
+                    Step(origin, TradeCities.Caerleon),
+                    Step(TradeCities.Caerleon, dest)));
                 return list;
             }
 
             if (string.Equals(dest, TradeCities.Brecilien, StringComparison.OrdinalIgnoreCase))
             {
-                list.Add(new NavigationRoute
-                {
-                    OriginCity = origin,
-                    DestCity = dest,
-                    FormLabel = "雾门通道",
-                    RiskLevel = "低危",
-                    RedSegments = 0,
-                    RiskNote = "布雷西里恩日均成交量约为黑市 1/10，只做可行性提示，不建议作为主力路线。",
-                    Minutes = 34,
-                    Steps = new List<NavigationStep>
-                    {
-                        Step(origin, dest, "S", false)
-                    }
-                });
+                list.Add(CityRoute(origin, dest,
+                    "布雷西里恩日均成交量约为黑市 1/10，只做可行性提示，不建议作为主力路线；中间地图与耗时未接入数据。",
+                    Step(origin, dest)));
                 return list;
             }
 
-            // 王城 ↔ 王城：官道直行 / 中转绕行 / 红区捷径
-            list.Add(new NavigationRoute
-            {
-                OriginCity = origin,
-                DestCity = dest,
-                FormLabel = "官道直行",
-                RiskLevel = "低危",
-                RedSegments = 0,
-                RiskNote = "全程非红区，可安全通行。",
-                Minutes = 16,
-                Steps = new List<NavigationStep>
-                {
-                    Step(origin, dest, "E", false)
-                }
-            });
-
-            string transfer = TransferCity(origin, dest);
-            list.Add(new NavigationRoute
-            {
-                OriginCity = origin,
-                DestCity = dest,
-                FormLabel = "绕行中转",
-                RiskLevel = "低危",
-                RedSegments = 0,
-                RiskNote = "经王城中转，全程非红区，多花一段路程。",
-                Minutes = 23,
-                Steps = new List<NavigationStep>
-                {
-                    Step(origin, transfer, "N", false),
-                    Step(transfer, dest, "SE", false)
-                }
-            });
-
-            list.Add(new NavigationRoute
-            {
-                OriginCity = origin,
-                DestCity = dest,
-                FormLabel = "红区捷径",
-                RiskLevel = "高危",
-                RedSegments = 1,
-                RiskNote = RedZoneNote,
-                Minutes = 13,
-                Steps = new List<NavigationStep>
-                {
-                    Step(origin, "红区走廊", "W", true),
-                    Step("红区走廊", dest, "S", true)
-                }
-            });
+            // 王城 ↔ 王城：城市级单段骨架
+            list.Add(CityRoute(origin, dest,
+                "城市级骨架：起点城 → 目的城。中间地图、出口方位、红区属性与耗时均未接入数据，需手动逐步推进。",
+                Step(origin, dest)));
             return list;
         }
 
-        private static NavigationRoute BlackMarketRoute(string origin, string dest, string form,
-            string risk, int minutes, string note, params NavigationStep[] steps)
+        /// <summary>组装一条「城市级骨架」路线：风险/耗时/方位全部标未知。</summary>
+        private static NavigationRoute CityRoute(string origin, string dest, string note,
+            params NavigationStep[] steps)
         {
             var route = new NavigationRoute
             {
                 OriginCity = origin,
                 DestCity = dest,
-                FormLabel = form,
-                RiskLevel = risk,
+                FormLabel = CitySkeletonLabel,
+                RiskLevel = UnknownRisk,
                 RedSegments = 0,
+                RedKnown = false,
                 RiskNote = note,
-                Minutes = minutes
+                Minutes = -1,
+                MinutesKnown = false
             };
             if (steps != null)
             {
                 for (int i = 0; i < steps.Length; i++)
                 {
                     route.Steps.Add(steps[i]);
-                    if (steps[i].RedZone) route.RedSegments++;
+                    if (steps[i].RedKnown && steps[i].RedZone) route.RedSegments++;
                 }
             }
-            if (route.RedSegments == 0)
-                route.RiskNote = note; // 低危路线保留走法说明
             return route;
         }
 
-        private static NavigationStep Step(string from, string to, string direction, bool red)
+        /// <summary>
+        /// 构造一段。方位留空（未知）、红区属性标未知——不猜 E/SE/S，不猜红区与否。
+        /// </summary>
+        private static NavigationStep Step(string from, string to)
         {
             return new NavigationStep
             {
                 FromMap = from,
                 ToMap = to,
-                Direction = direction,
-                RedZone = red,
-                Note = red ? RedZoneNote : ""
+                Direction = "",
+                RedZone = false,
+                RedKnown = false,
+                Note = ""
             };
-        }
-
-        private static string TransferCity(string origin, string dest)
-        {
-            for (int i = 0; i < TradeCities.Royal.Length; i++)
-            {
-                string city = TradeCities.Royal[i];
-                if (string.Equals(city, origin, StringComparison.OrdinalIgnoreCase)) continue;
-                if (string.Equals(city, dest, StringComparison.OrdinalIgnoreCase)) continue;
-                return city;
-            }
-            return TradeCities.Thetford;
         }
     }
 
@@ -223,6 +186,12 @@ namespace AlbionCompanion.Core.Trade
         public string RiskNote;
         public int RedSegments;
         public int Minutes;
+
+        /// <summary>红区属性是否已知（false = 全程显示「红区待核实」，不得显示成安全）。</summary>
+        public bool RedKnown = true;
+
+        /// <summary>耗时是否已知（false = 显示「耗时未知」，不编造分钟数）。</summary>
+        public bool MinutesKnown;
 
         public List<NavigationStep> Steps = new List<NavigationStep>();
 
@@ -265,14 +234,15 @@ namespace AlbionCompanion.Core.Trade
             }
         }
 
-        /// <summary>导航卡当前段文案：当前图 · 出口方位 → 下一图。</summary>
+        /// <summary>导航卡当前段文案：当前图 · 出口方位 → 下一图（方位未知时显式标注，不显示空方位）。</summary>
         public string CurrentText
         {
             get
             {
                 var step = CurrentStep;
                 if (step == null) return "";
-                return TradeCities.Zh(step.FromMap) + " · 出口 " + step.Direction + " → " + TradeCities.Zh(step.ToMap);
+                string dir = string.IsNullOrEmpty(step.Direction) ? "方位未知" : "出口 " + step.Direction;
+                return TradeCities.Zh(step.FromMap) + " · " + dir + " → " + TradeCities.Zh(step.ToMap);
             }
         }
 
@@ -286,7 +256,7 @@ namespace AlbionCompanion.Core.Trade
             }
         }
 
-        /// <summary>下一步提示：红区段必须给出后果，不写「可能/大概」。</summary>
+        /// <summary>下一步提示：红区段必须给出后果，不写「可能/大概」；方位未知时明说未知。</summary>
         public string NextHint
         {
             get
@@ -294,24 +264,38 @@ namespace AlbionCompanion.Core.Trade
                 if (!IsActive) return "";
                 if (Arrived) return "已抵达 " + TradeCities.Zh(DestCity) + "，导航完成";
                 var current = CurrentStep;
-                if (current != null && current.RedZone)
-                    return "红区：" + (string.IsNullOrEmpty(current.Note) ? "被击倒将失去全部货物" : current.Note);
+                // 红区只在「已知是红区」时才给后果；属性未知时不得假装安全，也不得假装红区。
+                if (current != null && current.RedKnown && current.RedZone)
+                    return "红区：" + (string.IsNullOrEmpty(current.Note)
+                        ? TradeRouteCatalog.RedZoneNote : current.Note);
                 if (HasNext)
                 {
                     var next = Steps[StepIndex + 1];
-                    return "下一步：离开 " + TradeCities.Zh(next.FromMap) + " 往 " + next.Direction;
+                    string dir = string.IsNullOrEmpty(next.Direction) ? "" : " 往 " + next.Direction;
+                    return "下一步：从 " + TradeCities.Zh(next.FromMap) + dir
+                           + " 前往 " + TradeCities.Zh(next.ToMap) + "（中间地图未接入，按游戏内路线走）";
                 }
                 return "按「下一步」完成本段";
             }
         }
 
-        /// <summary>当前段是否红区（导航卡/悬浮条/候选行三处同时变红用）。</summary>
+        /// <summary>当前段是否红区（导航卡/悬浮条/候选行三处同时变红用）。未知不算红。</summary>
         public bool IsCurrentRed
         {
             get
             {
                 var step = CurrentStep;
-                return step != null && step.RedZone;
+                return step != null && step.RedKnown && step.RedZone;
+            }
+        }
+
+        /// <summary>当前段红区属性是否未知（UI 据此显示「红区待核实」，避免把未知读成安全）。</summary>
+        public bool IsCurrentRedUnknown
+        {
+            get
+            {
+                var step = CurrentStep;
+                return step != null && !step.RedKnown;
             }
         }
 
@@ -324,7 +308,9 @@ namespace AlbionCompanion.Core.Trade
             RiskLevel = route.RiskLevel;
             RiskNote = route.RiskNote;
             RedSegments = route.RedSegments;
+            RedKnown = route.RedKnown;
             Minutes = route.Minutes;
+            MinutesKnown = route.MinutesKnown;
             Steps = new List<NavigationStep>(route.Steps);
             StepIndex = 0;
             Arrived = false;

@@ -879,6 +879,84 @@ static class LogicTests
                   !Arbitrage.IsQuoteDateStale("0001-01-01T00:00:00", arbNow), "expected fresh");
         }
 
+        // ---------------------------------------------------------------
+        // A14 品质分组：同 baseId 的 q1 / q3 必须各自成路线，禁止跨品质混组比价
+        // 缺陷原状（原规格第三节）：分组键是裸 baseId，q1 的卖价和 q3 的卖价被拿来比大小，
+        // 选出的「最优」是跨品质幻影路线。修复口径：分组键 = (ItemId, Quality)。
+        // 本组测试用同一 baseId、两个品质，验证「各自独立出路线且互不污染」。
+        // ---------------------------------------------------------------
+        {
+            // ① 核心反例：q1 便宜买、q3 高价卖。
+            //    若按裸 baseId 混组，会把「q1 买 + q3 卖」配成一条幻影路线（净利虚高）。
+            //    正确行为：q1、q3 各自成组 → q1 有自己的一条（买 q1 卖 q1），q3 同理，
+            //    绝不存在「买 q1 品质、卖 q3 品质」这种跨品质配对。
+            var mixQuality = new List<MarketQuote>
+            {
+                // Caerleon：q1 便宜（可买），q3 贵
+                new MarketQuote { ItemId = "T4_MIXQUAL", City = "Caerleon", Quality = 1, SellMin = 1000, BuyMax = 800 },
+                new MarketQuote { ItemId = "T4_MIXQUAL", City = "Caerleon", Quality = 3, SellMin = 9000, BuyMax = 8000 },
+                // Bridgewatch：q1 与 q3 都可卖
+                new MarketQuote { ItemId = "T4_MIXQUAL", City = "Bridgewatch", Quality = 1, SellMin = 5000, BuyMax = 4000 },
+                new MarketQuote { ItemId = "T4_MIXQUAL", City = "Bridgewatch", Quality = 3, SellMin = 20000, BuyMax = 18000 },
+            };
+            var mixRoutes = Arbitrage.Compute(mixQuality, 0.08, 0.025, 0);
+            Eq("A14 同 baseId 两品质 → 各自出 1 条 = 共 2 条路线", mixRoutes.Count, 2);
+
+            // 每个品质各一条，且 Quality 字段与路线内容自洽（买价/卖价都来自同品质）
+            bool q1Found = false, q3Found = false;
+            foreach (var r in mixRoutes)
+            {
+                if (r.Quality == 1)
+                {
+                    q1Found = true;
+                    Eq("A14 q1 路线买价取 q1 的 sell_min", r.BuyPrice, 1000L);
+                    Eq("A14 q1 路线卖价取 q1 的 buy_max", r.SellPrice, 4000L);
+                    // 4000×0.92 − 1000 = 2680
+                    Eq("A14 q1 单件净利按 q1 自身价算", r.NetProfit, 2680L);
+                }
+                if (r.Quality == 3)
+                {
+                    q3Found = true;
+                    Eq("A14 q3 路线买价取 q3 的 sell_min", r.BuyPrice, 9000L);
+                    Eq("A14 q3 路线卖价取 q3 的 buy_max", r.SellPrice, 18000L);
+                    // 18000×0.92 − 9000 = 7560
+                    Eq("A14 q3 单件净利按 q3 自身价算", r.NetProfit, 7560L);
+                }
+            }
+            Check("A14 两个品质都各自出路线（未被混组成一条）", q1Found && q3Found,
+                  "q1=" + q1Found + " q3=" + q3Found);
+
+            // ② 混组幻影的直接反证：不存在「买价来自 q1、卖价来自 q3」的路线。
+            //    若发生混组，会得到一条买 1000 / 卖 18000 的路线（净利 15560），
+            //    正确实现下任何一条路线的买价与卖价都必须来自同一品质。
+            bool phantom = false;
+            foreach (var r in mixRoutes)
+                if (r.BuyPrice == 1000L && r.SellPrice == 18000L) phantom = true;
+            Check("A14 不存在跨品质幻影路线（买 q1 + 卖 q3）", !phantom, "phantom route found");
+
+            // ③ 只有 q3 有价时，q1 不得凭 q3 的价产出路线（避免品质提升换来的假机会）
+            var onlyQ3 = new List<MarketQuote>
+            {
+                new MarketQuote { ItemId = "T4_ONLYQ3", City = "Caerleon", Quality = 1, SellMin = 0, BuyMax = 0 },
+                new MarketQuote { ItemId = "T4_ONLYQ3", City = "Caerleon", Quality = 3, SellMin = 9000, BuyMax = 0 },
+                new MarketQuote { ItemId = "T4_ONLYQ3", City = "Bridgewatch", Quality = 1, SellMin = 0, BuyMax = 0 },
+                new MarketQuote { ItemId = "T4_ONLYQ3", City = "Bridgewatch", Quality = 3, SellMin = 0, BuyMax = 18000 },
+            };
+            var onlyQ3Routes = Arbitrage.Compute(onlyQ3, 0.08, 0.025, 0);
+            Eq("A14 只有 q3 有价 → 只出 1 条（q3 自己）", onlyQ3Routes.Count, 1);
+            if (onlyQ3Routes.Count == 1)
+                Eq("A14 该路线品质为 q3", onlyQ3Routes[0].Quality, 3);
+
+            // ④ 对照：同品质跨城仍正常出路线（确认分组键没把品质维度做成「隔离一切」）
+            var sameQuality = new List<MarketQuote>
+            {
+                new MarketQuote { ItemId = "T4_SAMEQ", City = "Caerleon", Quality = 2, SellMin = 3000, BuyMax = 2000 },
+                new MarketQuote { ItemId = "T4_SAMEQ", City = "Bridgewatch", Quality = 2, SellMin = 12000, BuyMax = 10000 },
+            };
+            Eq("A14 同品质跨城对照：仍出 1 条路线",
+               Arbitrage.Compute(sameQuality, 0.08, 0.025, 0).Count, 1);
+        }
+
 
         // ---------------------------------------------------------------
         // T-16 R3 并发烟雾：4 线程各写 10 万条 + 1 线程并发 Snapshot 10 万次

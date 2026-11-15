@@ -487,10 +487,23 @@ static class TradeModuleTests
             LogicTests.Eq("T9 ③档目的城 = Brecilien", brecBoard.Legs[0].DestCity, TradeCities.Brecilien);
 
         var candidateRoutes = TradeRouteCatalog.Candidates("Lymhurst", TradeCities.BlackMarket);
-        LogicTests.Eq("T9 黑市腿候选路线 = 4 条", candidateRoutes.Count, 4);
+        LogicTests.Eq("T9 黑市腿候选路线 = 1 条（无拓扑数据，只给城市级骨架）", candidateRoutes.Count, 1);
         LogicTests.Eq("T9 首选路线标题（中文城市）", candidateRoutes[0].Title, "林堡 → 黑市");
-        LogicTests.Eq("T9 高危路线红区段数 = 3", candidateRoutes[0].RedSegments, 3);
-        LogicTests.Check("T9 低危路线无红区", candidateRoutes[2].RedSegments == 0, "expected 0 red segments");
+        // 地图拓扑数据来源未知：不得编造中间地图名、出口方位、红区属性与耗时。
+        LogicTests.Eq("T9 黑市骨架 = 起点城 → 凯城 → 黑市 两段", candidateRoutes[0].Steps.Count, 2);
+        LogicTests.Eq("T9 骨架首段从起点城出发", candidateRoutes[0].Steps[0].FromMap, "Lymhurst");
+        LogicTests.Eq("T9 骨架中段是凯城（黑市所在城）", candidateRoutes[0].Steps[0].ToMap, TradeCities.Caerleon);
+        LogicTests.Eq("T9 骨架末段终点是黑市", candidateRoutes[0].Steps[1].ToMap, TradeCities.BlackMarket);
+        LogicTests.Check("T9 不编造出口方位（Direction 为空）",
+            candidateRoutes[0].Steps[0].Direction == "" && candidateRoutes[0].Steps[1].Direction == "",
+            "expected empty direction");
+        LogicTests.Check("T9 不编造红区属性（RedKnown=false）",
+            !candidateRoutes[0].RedKnown && !candidateRoutes[0].Steps[0].RedKnown,
+            "expected RedKnown=false");
+        LogicTests.Check("T9 不编造耗时（MinutesKnown=false）",
+            !candidateRoutes[0].MinutesKnown && candidateRoutes[0].Minutes < 0, "expected unknown minutes");
+        LogicTests.Check("T9 风险等级标未知而非高危/低危",
+            candidateRoutes[0].RiskLevel == "未知", candidateRoutes[0].RiskLevel);
     }
 
     // ── 十、负重贪心不变量：件数 = min(负重件数, 深度) ──────────────────
@@ -569,13 +582,47 @@ static class TradeModuleTests
         LogicTests.Check("T11 激活导航", nav.IsActive, "expected active");
         LogicTests.Eq("T11 初始步骤 = 第 1 步", nav.StepIndex, 0);
         LogicTests.Eq("T11 进度文案", nav.ProgressText, "第 1 / " + route.Steps.Count + " 步");
-        LogicTests.Check("T11 当前段文案含出口八向与下一图",
-            nav.CurrentText.Contains("出口") && nav.CurrentText.Contains("→"), nav.CurrentText);
-        LogicTests.Check("T11 高危路线当前段为红区", nav.IsCurrentRed, "expected red current step");
-        LogicTests.Check("T11 红区提示给出后果（不写可能/大概）",
-            nav.NextHint.Contains("红区") && !nav.NextHint.Contains("可能"), nav.NextHint);
+        // 拓扑未接入：当前段文案必须仍能表达「当前图 → 下一图」，且方位显式标未知
+        LogicTests.Check("T11 当前段文案含当前图与下一图",
+            nav.CurrentText.Contains("→") && nav.CurrentText.Contains("林堡"), nav.CurrentText);
+        LogicTests.Check("T11 方位未知时文案明说「方位未知」而非空方位",
+            nav.CurrentText.Contains("方位未知"), nav.CurrentText);
+        // 红区属性未知时不得把未知读成红区，也不得读成安全
+        LogicTests.Check("T11 红区属性未知时 IsCurrentRed 为 false", !nav.IsCurrentRed, "expected not red");
+        LogicTests.Check("T11 红区属性未知可被 UI 识别（IsCurrentRedUnknown）",
+            nav.IsCurrentRedUnknown, "expected red unknown");
+        LogicTests.Check("T11 红区未知时提示不含「红区：」结论（不假装已知）",
+            !nav.NextHint.StartsWith("红区："), nav.NextHint);
         LogicTests.Eq("T11 预估收益来自装载方案", nav.EstimatedProfit, 816912L);
 
+        // 已知红区段的行为仍需保留（用构造数据直接验证，不依赖编造拓扑）
+        var redRoute = new NavigationRoute
+        {
+            OriginCity = "Lymhurst",
+            DestCity = TradeCities.BlackMarket,
+            FormLabel = "测试用红区段",
+            RiskLevel = "高危",
+            RedSegments = 1,
+            RedKnown = true,
+            RiskNote = TradeRouteCatalog.RedZoneNote,
+            Minutes = -1,
+            MinutesKnown = false,
+            Steps = new List<NavigationStep>
+            {
+                new NavigationStep { FromMap = "Lymhurst", ToMap = "X", Direction = "E",
+                                     RedZone = true, RedKnown = true, Note = "" },
+                new NavigationStep { FromMap = "X", ToMap = "Black Market", Direction = "S",
+                                     RedZone = false, RedKnown = true, Note = "" }
+            }
+        };
+        nav.Activate(redRoute, 1000, 1, 1.0);
+        LogicTests.Check("T11 已知红区段 IsCurrentRed 为 true", nav.IsCurrentRed, "expected red");
+        LogicTests.Check("T11 已知红区段提示给出后果且不写「可能」",
+            nav.NextHint.Contains("红区") && !nav.NextHint.Contains("可能"), nav.NextHint);
+        LogicTests.Check("T11 已知方位时 CurrentText 用「出口 E」格式",
+            nav.CurrentText.Contains("出口 E"), nav.CurrentText);
+
+        nav.Activate(route, 816912, 63, 149.1);
         nav.Next();
         LogicTests.Eq("T11 下一步两处同步用同一状态（StepIndex=1）", nav.StepIndex, 1);
         nav.Prev();
