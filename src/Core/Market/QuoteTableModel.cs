@@ -105,6 +105,8 @@ namespace AlbionCompanion.Core
         public const int ColumnHeadHeight = 24;
         public const int RowHeight = 26;
         public const int FooterHeight = 28;
+        /// <summary>M3 提示行高（设计 §5.3：36px，比底注高 8，装得下两个动作按钮）。</summary>
+        public const int HintHeight = 36;
 
         /// <summary>
         /// 城市行数变化时卡片应有的高度（六城 = 248，七城含黑市 = 274，M6 骨架同理）。
@@ -114,6 +116,32 @@ namespace AlbionCompanion.Core
         {
             int rows = cityCount <= 0 ? 6 : cityCount;
             return CardHeadHeight + ColumnHeadHeight + rows * RowHeight + FooterHeight;
+        }
+
+        /// <summary>
+        /// M3 卡片高度：底部 28px 底注换成 36px 提示行，所以比常规高 8px。
+        /// 这个 +8 必须由函数给出——控件里手写「248+8」一旦城市数变化就会算错。
+        /// </summary>
+        public static int HintCardHeight(int cityCount)
+        {
+            int rows = cityCount <= 0 ? 6 : cityCount;
+            return CardHeadHeight + ColumnHeadHeight + rows * RowHeight + HintHeight;
+        }
+
+        /// <summary>
+        /// 相邻阶级（设计 §5.3 的「看 T4 / 看 T6」）。返回 0 = 该方向没有相邻阶级。
+        /// 只在同一家族内按已排好序的阶级列表取前一/后一项：跨家族的阶级号没有可比性，
+        /// 跳过去等于换了一件物品；已是最低阶时不返回更低的那个，避免画一个点了没目的地的假按钮。
+        /// </summary>
+        public static int AdjacentTier(IReadOnlyList<int> tiers, int current, bool lower)
+        {
+            if (tiers == null || tiers.Count == 0 || current <= 0) return 0;
+            int idx = -1;
+            for (int i = 0; i < tiers.Count; i++) if (tiers[i] == current) { idx = i; break; }
+            if (idx < 0) return 0;
+            int next = lower ? idx - 1 : idx + 1;
+            if (next < 0 || next >= tiers.Count) return 0;
+            return tiers[next];
         }
 
         /// <summary>报价卡整体状态（设计 §六 九态里与报价卡直接相关的几个）。</summary>

@@ -70,6 +70,9 @@ namespace AlbionCompanion.UI.Controls
         public event EventHandler? RetryRequested;
         public event EventHandler? AdjacentTierRequested;
         private bool _wantAdjacent;
+        // M3 相邻阶级（设计 §5.3 的「看 T4 / 看 T6」）：0 = 该方向无可跳阶级，按钮不画
+        private int _adjLower;
+        private int _adjUpper;
 
         public QuoteTable()
         {
@@ -92,7 +95,10 @@ namespace AlbionCompanion.UI.Controls
             _state = QuoteTableModel.StateOf(_rows);
             _hoverRow = -1;
             _warnBar = null;
-            Height = PreferredHeight(_rows.Count);
+            // M3 用 36px 提示行（比底注高 8），高度必须与 CardHeightNow 同源
+            Height = _state == QuoteTableModel.CardState.AllSellEmpty
+                ? QuoteTableModel.HintCardHeight(_rows.Count)
+                : PreferredHeight(_rows.Count);
             Invalidate();
         }
 
@@ -210,9 +216,11 @@ namespace AlbionCompanion.UI.Controls
         {
             get
             {
-                if (_state == QuoteTableModel.CardState.Rows
-                    || _state == QuoteTableModel.CardState.AllSellEmpty)
+                if (_state == QuoteTableModel.CardState.Rows)
                     return PreferredHeight(_rows.Count);
+                // M3：底注换成 36px 提示行，卡高比常规多 8（高度由 Core 函数给，不在此手算）
+                if (_state == QuoteTableModel.CardState.AllSellEmpty)
+                    return QuoteTableModel.HintCardHeight(_rows.Count);
                 if (_state == QuoteTableModel.CardState.Loading)
                     return PreferredHeight(_loadingCities);
                 return CardHeight;
@@ -275,19 +283,27 @@ namespace AlbionCompanion.UI.Controls
         /// <summary>
         /// 表头四列（M6 骨架与有数据时同构）：列头保持可读，用户才知道这卡还是报价卡，
         /// 只是数据在来的路上——整卡一起灰掉会让人以为控件坏了。
+        /// M3 时卖列头追加「（亚服暂无收购单）」：整列 0 值必须在列头就说清原因，
+        /// 否则六行「暂无挂单」会被读成六次独立故障。
         /// </summary>
         private void DrawTableHead(Graphics g, int w)
         {
             var headRect = new Rectangle(PadX, HeadHeight, w - PadX * 2, ColumnHeadHeight);
+            bool sellEmpty = _state == QuoteTableModel.CardState.AllSellEmpty;
             int x = PadX;
-            string[] titles = { "城市", "↓ 买入", "↑ 卖出", "数据时间" };
+            string[] titles = { "城市", "↓ 买入", sellEmpty ? "↑ 卖出（亚服暂无收购单）" : "↑ 卖出", "数据时间" };
             bool[] right = { false, true, true, true };
             for (int c = 0; c < titles.Length; c++)
             {
+                // M3 卖列头要写备注，180 宽装不下「↑ 卖出（亚服暂无收购单）」——
+                // 卖列与时间列合并区右对齐，视觉上仍归在卖列尾
                 var cell = new Rectangle(x, headRect.Y, ColumnWidths[c], ColumnHeadHeight);
-                TextRenderer.DrawText(g, titles[c], _headFont, cell, Th.Sub,
+                if (sellEmpty && c == 2) cell.Width = ColumnWidths[2] + ColumnWidths[3];
+                TextRenderer.DrawText(g, titles[c], _headFont, cell,
+                    sellEmpty && c == 2 ? StaleTextColor : Th.Sub,
                     (right[c] ? TextFormatFlags.Right : TextFormatFlags.Left)
-                    | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                    | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+                    | TextFormatFlags.EndEllipsis);
                 x += ColumnWidths[c];
             }
             using (var pen = new Pen(Th.Line))
@@ -373,7 +389,85 @@ namespace AlbionCompanion.UI.Controls
                     | TextFormatFlags.EndEllipsis);
             }
 
-            DrawFooter(g, w, top + _rows.Count * RowHeight);
+            DrawFooterOrHint(g, w, top + _rows.Count * RowHeight);
+        }
+
+        /// <summary>底注 vs M3 提示行的分派：一个位置只放一种，避免 28px 底注把 36px 提示行挤掉。</summary>
+        private void DrawFooterOrHint(Graphics g, int w, int y)
+        {
+            if (_state == QuoteTableModel.CardState.AllSellEmpty) DrawSellEmptyHint(g, w, y);
+            else DrawFooter(g, w, y);
+        }
+
+        /// <summary>
+        /// M3 提示行（设计 §5.3）：六城卖出价全 0 = 亚服没人在挂收购单，卖不出去。
+        /// 版式：warn 12% 实色底 + 一句陈述结论的文案 + 右侧两个 76×22 动作按钮（看 T4 / 看 T6）。
+        ///
+        /// 为什么是「陈述结论」而不是「暂无数据显示」：用户要的是能不能卖，答案就是不能，
+        /// 含糊词会让人再去找别的页面确认。为什么必须给动作按钮：只说「卖不出去」是死路，
+        /// 相邻阶级可能有收购单，下一步必须是可点的。
+        /// </summary>
+        private void DrawSellEmptyHint(Graphics g, int w, int y)
+        {
+            var r = new Rectangle(PadX, y, w - PadX * 2, QuoteTableModel.HintHeight);
+            using (var pen = new Pen(Th.Line))
+                g.DrawLine(pen, r.X, r.Y, r.Right, r.Y);
+            using (var br = new SolidBrush(WarnBarBg)) g.FillRectangle(br, r);
+
+            // 只画真有目的地的按钮：T4 已在最低阶时画「看 T4」等于给一个点了没反应的假按钮。
+            var b1 = _adjLower > 0 ? AdjacentLowerRect(w, y) : Rectangle.Empty;
+            var b2 = _adjUpper > 0 ? AdjacentUpperRect(w, y) : Rectangle.Empty;
+            int buttonsLeft = b2.IsEmpty ? (b1.IsEmpty ? r.Right : b1.X) : b2.X;
+            // 文案区到按钮左侧留 8px，避免长文案压到按钮
+            var textRect = new Rectangle(r.X + 10, r.Y, buttonsLeft - r.X - 18, QuoteTableModel.HintHeight);
+            TextRenderer.DrawText(g,
+                "该物品在亚服暂无挂单，卖不出去。可看同系其他阶级是否有收购单。",
+                _footFont, textRect, Th.Accent,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding
+                | TextFormatFlags.EndEllipsis);
+
+            if (!b1.IsEmpty)
+            {
+                Th.StrokeRound(g, b1, 4, Th.Accent);
+                TextRenderer.DrawText(g, "看 T" + _adjLower, _footFont, b1, Th.Accent,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+            if (!b2.IsEmpty)
+            {
+                Th.StrokeRound(g, b2, 4, Th.Accent);
+                TextRenderer.DrawText(g, "看 T" + _adjUpper, _footFont, b2, Th.Accent,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            }
+        }
+
+        /// <summary>「看 T4」按钮矩形（低阶方向）：与绘制、命中检测共用一份几何。</summary>
+        private Rectangle AdjacentLowerRect(int w, int y)
+        {
+            return new Rectangle(w - PadX - 76 - 8 - 76, y + (QuoteTableModel.HintHeight - 22) / 2, 76, 22);
+        }
+
+        /// <summary>「看 T6」按钮矩形（高阶方向）。</summary>
+        private Rectangle AdjacentUpperRect(int w, int y)
+        {
+            return new Rectangle(w - PadX - 76, y + (QuoteTableModel.HintHeight - 22) / 2, 76, 22);
+        }
+
+        /// <summary>
+        /// 相邻阶级由外层（MarketTab）按当前家族的可用阶级下发：0 = 该方向没有相邻阶级。
+        /// 为什么不在这里写死 4 和 6：T4 已经是家族最低阶时，「看 T4」是一个点了没有目的地的按钮。
+        /// </summary>
+        public void SetAdjacentTiers(int lower, int upper)
+        {
+            if (_adjLower == lower && _adjUpper == upper) return;
+            _adjLower = lower;
+            _adjUpper = upper;
+            Invalidate();
+        }
+
+        /// <summary>M3 提示行顶部 y（= 表头下 + 行数 × 行高）。绘制与命中共用。</summary>
+        private int HintTop
+        {
+            get { return RowsTop + _rows.Count * RowHeight; }
         }
 
         /// <summary>
@@ -399,10 +493,15 @@ namespace AlbionCompanion.UI.Controls
                 return;
             }
 
+            // M3：卖列整列灰化（设计 §5.3）——六城都没收购单时，让卖列统一退成次要色，
+            // 视觉上「这一列今天没有内容」；买列保持正常亮度，两类信息不混。
+            bool sellDimmed = !isBuy && _state == QuoteTableModel.CardState.AllSellEmpty;
+
             // 卖出列全 0（M3）时整列灰化，文案陈述结论而不是含糊词
             string label = kind == QuoteCellKind.NoOrders ? "暂无挂单" : "无数据";
-            TextRenderer.DrawText(g, label, _headFont, cell,
-                kind == QuoteCellKind.NoOrders ? subColor : Th.Sub,
+            Color labelColor = sellDimmed ? StaleTextColor
+                : (kind == QuoteCellKind.NoOrders ? subColor : Th.Sub);
+            TextRenderer.DrawText(g, label, _headFont, cell, labelColor,
                 TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
 
@@ -514,6 +613,21 @@ namespace AlbionCompanion.UI.Controls
                 if ((b1.Contains(e.Location) || b2.Contains(e.Location)) && AdjacentTierRequested != null)
                 {
                     _wantAdjacent = b1.Contains(e.Location);
+                    AdjacentTierRequested(this, EventArgs.Empty);
+                }
+            }
+            else if (_state == QuoteTableModel.CardState.AllSellEmpty)
+            {
+                // M3 提示行的「看 T4 / 看 T6」必须真能点：只画不响应等于假按钮。
+                // 命中检测与绘制同源：只认当前真的存在的相邻阶级。
+                bool hasLower = _adjLower > 0, hasUpper = _adjUpper > 0;
+                var b1 = hasLower ? AdjacentLowerRect(w, HintTop) : Rectangle.Empty;
+                var b2 = hasUpper ? AdjacentUpperRect(w, HintTop) : Rectangle.Empty;
+                bool hitLower = hasLower && b1.Contains(e.Location);
+                bool hitUpper = hasUpper && b2.Contains(e.Location);
+                if ((hitLower || hitUpper) && AdjacentTierRequested != null)
+                {
+                    _wantAdjacent = hitLower;
                     AdjacentTierRequested(this, EventArgs.Empty);
                 }
             }

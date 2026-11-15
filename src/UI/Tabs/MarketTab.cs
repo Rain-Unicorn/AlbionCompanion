@@ -140,6 +140,13 @@ namespace AlbionCompanion.UI.Tabs
             _card.Location = new Point(0, 452);
             _card.Size = new Size(QuoteTable.CardWidth, QuoteTable.CardHeight);
             _card.RetryRequested += delegate { StartQuery(false); };
+            // M3 提示行的「看 T4 / 看 T6」：只发请求，真正跳转由树的 SetTier 完成，
+            // 跳完触发 SelectionChanged → RenderCard，卡片按新阶级重算（不在这里直接改树状态）。
+            _card.AdjacentTierRequested += delegate
+            {
+                if (_tree.JumpAdjacentTier(_card.LastAdjacentWasLower)) return;
+                SetStatus("该方向没有相邻阶级", Th.Sub);
+            };
             Controls.Add(_card);
 
             _autoTimer = new System.Windows.Forms.Timer();
@@ -434,6 +441,13 @@ namespace AlbionCompanion.UI.Tabs
             var rows = QuoteTableModel.Build(quotes, cities, now, out qualityUsed);
             if (rows.Count == 0) { _card.SetNoData(); return; }
 
+            // M3 相邻阶级先下发：卡片只在提示行那态才用，但要在 SetData 之前给，
+            // 保证同一帧里绘制和命中检测拿到的是同一组阶级（不是上一轮残留的 T4/T6）。
+            int adjLow, adjHigh;
+            _tree.AdjacentTier(true, out adjLow);
+            _tree.AdjacentTier(false, out adjHigh);
+            _card.SetAdjacentTiers(adjLow, adjHigh);
+
             _card.SetHeadRight(cities.Count + " 城 · 亚服");
             _card.SetData(rows, now);
             _selection.Text = "品质 " + MarketQuality.LabelOf(qualityUsed);
@@ -700,6 +714,28 @@ namespace AlbionCompanion.UI.Tabs
         {
             ClearInternal();
             RaiseChanged();
+        }
+
+        /// <summary>
+        /// 当前家族里 <c>Tier</c> 的相邻阶级（设计 §5.3 的「看 T4 / 看 T6」）。返回 false = 该方向没有相邻阶级。
+        /// 判据在 <see cref="QuoteTableModel.AdjacentTier"/>：同一套逻辑，UI 层不再各写一份。
+        /// </summary>
+        public bool AdjacentTier(bool lower, out int tier)
+        {
+            tier = QuoteTableModel.AdjacentTier(_tiers, _tier, lower);
+            return tier > 0;
+        }
+
+        /// <summary>
+        /// 跳到相邻阶级。返回 false = 该方向没有相邻阶级（按钮此时不该画出来，画了就是假按钮）。
+        /// </summary>
+        public bool JumpAdjacentTier(bool lower)
+        {
+            int tier;
+            if (!AdjacentTier(lower, out tier)) return false;
+            SetTier(tier, true);
+            EnsureVisible();
+            return true;
         }
 
         private void ClearInternal()

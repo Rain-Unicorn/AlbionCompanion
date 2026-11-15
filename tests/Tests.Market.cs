@@ -376,6 +376,53 @@ static class MarketModuleTests
         LogicTests.Eq("整卡高度: M6 六城骨架 = 248", QuoteTableModel.PreferredCardHeight(6), 248);
         LogicTests.Eq("整卡高度: M6 七城（含黑市）骨架 = 274", QuoteTableModel.PreferredCardHeight(7), 274);
         LogicTests.Eq("整卡高度: M6 城市数 0 回落六城", QuoteTableModel.PreferredCardHeight(0), 248);
+
+        // M3 提示行（设计 §5.3）：底部 28px 底注换成 36px 提示行 → 卡片比常规高 8。
+        // 这个高度必须由 Core 函数给，控件里手写 248+8 一旦城市数变化就会算错。
+        LogicTests.Eq("整卡高度: M3 六城提示行 = 256", QuoteTableModel.HintCardHeight(6), 256);
+        LogicTests.Eq("整卡高度: M3 七城提示行 = 282", QuoteTableModel.HintCardHeight(7), 282);
+        LogicTests.Eq("整卡高度: M3 比常规底注高 8",
+            QuoteTableModel.HintCardHeight(6) - QuoteTableModel.PreferredCardHeight(6),
+            QuoteTableModel.HintHeight - QuoteTableModel.FooterHeight);
+        // 0 价不当有效卖价：M3 的判据是「一个 Value 卖格都没有」，不是「卖价字段为 0」——
+        // 只要有一格卖价 > 0 就回落到 Rows，不能整卡灰化把真实收购单藏起来。
+        var mixedSellRow = new QuoteViewRow
+        {
+            City = "Caerleon", BuyKind = QuoteCellKind.Value, SellKind = QuoteCellKind.Value,
+            BuyPrice = 100, SellPrice = 1, BuyFreshness = QuoteFreshness.Fresh,
+            SellFreshness = QuoteFreshness.Fresh
+        };
+        LogicTests.Eq("M3 反例: 有一格卖价 > 0 就不进 AllSellEmpty",
+            QuoteTableModel.StateOf(new[] { sellEmptyRow, mixedSellRow }), QuoteTableModel.CardState.Rows);
+        // 0 价也不得被当成最低买入/最高卖出参与比较（底注极值的排除计数）
+        int excludedCount;
+        var extremes = QuoteTableModel.Extremes(new[]
+        {
+            new QuoteViewRow { City = "Caerleon", BuyKind = QuoteCellKind.NoOrders,
+                SellKind = QuoteCellKind.NoOrders },
+            new QuoteViewRow { City = "Bridgewatch", BuyKind = QuoteCellKind.Value,
+                SellKind = QuoteCellKind.NoOrders, BuyPrice = 500 }
+        }, out excludedCount);
+        LogicTests.Eq("M3: 0 价格不进最高卖出", extremes.MaxSell, 0L);
+        LogicTests.Check("M3: 0 价格计入被排除数", excludedCount > 0, "excluded=" + excludedCount);
+
+        // M3 提示行的「看 T4 / 看 T6」（设计 §5.3）：按钮必须指向真的存在的相邻阶级。
+        // 判据「该方向没有邻居就返回 0」，UI 据此决定不画按钮——画一个点了没目的地的按钮等于假按钮。
+        var tiers = new List<int> { 4, 5, 6, 7, 8 };
+        LogicTests.Eq("M3 相邻阶级: T5 的低阶方向 = T4", QuoteTableModel.AdjacentTier(tiers, 5, true), 4);
+        LogicTests.Eq("M3 相邻阶级: T5 的高阶方向 = T6", QuoteTableModel.AdjacentTier(tiers, 5, false), 6);
+        LogicTests.Eq("M3 相邻阶级: 已在最低阶 T4 时低阶方向无邻居 = 0",
+            QuoteTableModel.AdjacentTier(tiers, 4, true), 0);
+        LogicTests.Eq("M3 相邻阶级: 已在最高阶 T8 时高阶方向无邻居 = 0",
+            QuoteTableModel.AdjacentTier(tiers, 8, false), 0);
+        LogicTests.Eq("M3 相邻阶级: 未选满（tier=0）不给邻居",
+            QuoteTableModel.AdjacentTier(tiers, 0, true), 0);
+        LogicTests.Eq("M3 相邻阶级: 当前阶级不在列表里 = 0（不猜位置）",
+            QuoteTableModel.AdjacentTier(tiers, 3, true), 0);
+        // 家族只有两阶（如某些族的 T4/T5）时，中间态才不会生出跨阶空洞
+        LogicTests.Eq("M3 相邻阶级: 两阶家族 T4 高阶方向 = T5",
+            QuoteTableModel.AdjacentTier(new List<int> { 4, 5 }, 4, false), 5);
+        LogicTests.Eq("M3 相邻阶级: 空列表 = 0", QuoteTableModel.AdjacentTier(new List<int>(), 5, true), 0);
     }
 
     // ─────────────────────────────────────────────────────────────
