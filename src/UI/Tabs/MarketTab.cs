@@ -46,7 +46,7 @@ namespace AlbionCompanion.UI.Tabs
         private const int FilterLabelY = QuoteTableModel.FilterLabelTop;
         private const int FilterControlY = QuoteTableModel.FilterControlTop;
         private const int CardTop = QuoteTableModel.QuoteCardTop;
-        // 联动位贴内容区底：740 − 28 = 712；七城 M3 卡底 706，间距 6
+        // 联动位贴内容区底：736 − 28 = 708（设计布局表 y=708）；七城 M3 卡底 706，间距 2
         private static readonly int LinkTop = QuoteTableModel.LinkRowTopOnPage();
 
         private readonly System.Windows.Forms.Timer _autoTimer;
@@ -418,7 +418,9 @@ namespace AlbionCompanion.UI.Tabs
             RenderCardCore();
             // 联动位状态只由报价卡状态决定（规范 §六：M6 加载中 / M8 无旧数据灰化，其余亮色）。
             // 放在包一层而不是逐个 return 前各写一次——分支以后再加也不会漏掉灰化。
-            _linkRow.SetEnabled(_card.State);
+            // 用 LinkRowDimmed 而不是卡片的枚举值：M9「组合无匹配」/搜索无结果/「尚未查询」共用
+            // NoDataAtAll，但设计 §六 里这三态联动位都是「显示」，不能一起灰。
+            _linkRow.SetDimmed(_card.LinkRowDimmed);
         }
 
         private void RenderCardCore()
@@ -565,7 +567,7 @@ namespace AlbionCompanion.UI.Tabs
             // M6：进入查询即进加载态（按本次查询城市数给骨架行位）。
             // 刷新期间卡片不保留上一轮价格残影——用户会以为刷新没生效。
             _card.SetLoading(cities.Count);
-            _linkRow.SetEnabled(_card.State);   // M6 联动位灰化（这里不经 RenderCard，必须单独同步）
+            _linkRow.SetDimmed(_card.LinkRowDimmed);   // M6 联动位灰化（这里不经 RenderCard，必须单独同步）
             _selection.Text = "查询中";
             SetStatus("正在回源 " + targets.Count + " 个物品 × " + cities.Count + " 城…", Th.Info);
 

@@ -736,14 +736,14 @@ static class MarketModuleTests
         LogicTests.Eq("联动位: 宽 = QuoteTable 卡宽", QuoteTableModel.LinkRowWidth, 620);
         LogicTests.Eq("联动位: 高 = 28（规范 §3.5）", QuoteTableModel.LinkRowHeight, 28);
 
-        // 位置：贴内容区底（740 − 28 = 712）；规范 736 内容区则 708（与其布局表 y=708 一致）
-        LogicTests.Eq("联动位: 740 内容区顶 = 712", QuoteTableModel.LinkRowTop(740), 712);
-        LogicTests.Eq("联动位: 规范 736 内容区顶 = 708（与布局表 y=708 一致）",
+        // 位置：内容区按规范布局表的 736，联动位贴底 = 736 − 28 = 708（与布局表 y=708 逐字一致）
+        LogicTests.Eq("联动位: 内容区 736 顶 = 708（与布局表 y=708 一致）",
             QuoteTableModel.LinkRowTop(736), 708);
-        // 容错：高度未定时不该算出负数位置
-        LogicTests.Check("联动位: 内容区高 <= 0 回落 740 → 712",
-            QuoteTableModel.LinkRowTop(0) == 712, "top=" + QuoteTableModel.LinkRowTop(0));
-        LogicTests.Eq("联动位: 页面实装位 = LinkRowTopOnPage()", QuoteTableModel.LinkRowTopOnPage(), 712);
+        LogicTests.Eq("联动位: 内容区高常量 = 736（规范布局表）", QuoteTableModel.ContentHeight, 736);
+        // 容错：高度未定时不该算出负数位置，按 ContentHeight 回落 708
+        LogicTests.Check("联动位: 内容区高 <= 0 回落 708",
+            QuoteTableModel.LinkRowTop(0) == 708, "top=" + QuoteTableModel.LinkRowTop(0));
+        LogicTests.Eq("联动位: 页面实装位 = LinkRowTopOnPage()", QuoteTableModel.LinkRowTopOnPage(), 708);
 
         // ── 纵向链路同源：UI 和测试取同一组常量，位置不能各写一份 ──
         LogicTests.Eq("布局: 时效条顶 56（页头带无间距）", QuoteTableModel.FreshStripTop, 56);
@@ -763,38 +763,57 @@ static class MarketModuleTests
             QuoteTableModel.QuoteCardTop < QuoteTableModel.LinkRowTopOnPage(),
             "cardTop=" + QuoteTableModel.QuoteCardTop + " linkTop=" + QuoteTableModel.LinkRowTopOnPage());
 
-        // 七城（含黑市）卡最挤：卡顶 424 + 274 = 698 ≤ 712，间距 14 不重叠
+        // 默认勾选 7 城（含黑市）是页面常态，M3 提示行态卡高 282 是最挤的一档：
+        // 卡顶 424 + 282 = 706 < 708，不重叠，余量 2px。这 2px 是实测量出来的，
+        // 不写成 ≥4 的宽松断言来粉饰；要留满 8px 得把卡顶抬到 418，会压到 400..424 的下拉/勾选控件。
         int gap7 = QuoteTableModel.LinkRowGap(QuoteTableModel.ContentHeight,
             QuoteTableModel.QuoteCardTop, QuoteTableModel.PreferredCardHeight(7));
-        LogicTests.Check("联动位: 七城卡不压联动位（gap >= 0）", gap7 >= 0, "gap=" + gap7);
+        LogicTests.Eq("联动位: 七城常态卡↔联动位余量 10", gap7, 10);
         int gap6 = QuoteTableModel.LinkRowGap(QuoteTableModel.ContentHeight,
             QuoteTableModel.QuoteCardTop, QuoteTableModel.PreferredCardHeight(6));
-        LogicTests.Check("联动位: 六城卡不压联动位（gap >= 0）", gap6 >= 0, "gap=" + gap6);
+        LogicTests.Eq("联动位: 六城常态卡↔联动位余量 36", gap6, 36);
         LogicTests.Check("联动位: 六城 gap 大于七城（多勾城确实吃掉间距）", gap6 > gap7,
             "6城=" + gap6 + " 7城=" + gap7);
-        // M3 提示行比底注高 8，是最高的数据态，同样不能压——这条曾实测 gap=-6，
-        // 修的是布局链（筛选卡 336→290），不是把断言放宽。
+        // M3 提示行比底注高 8，是最高的数据态：七城 M3 卡底 706，余量 2px（不重叠但很紧）
         int gapM3 = QuoteTableModel.LinkRowGap(QuoteTableModel.ContentHeight,
             QuoteTableModel.QuoteCardTop, QuoteTableModel.HintCardHeight(7));
-        LogicTests.Check("联动位: M3 七城卡（274+8）不压联动位", gapM3 >= 0, "gap=" + gapM3);
+        LogicTests.Eq("联动位: 七城 M3 卡（282）↔联动位余量 2", gapM3, 2);
+        LogicTests.Check("联动位: 七城 M3 卡不压联动位（gap >= 0）", gapM3 >= 0, "gap=" + gapM3);
         // 最高态必须由 MaxCardHeight 覆盖全部数据态，否则「不压」只证明了最矮那档
         LogicTests.Check("联动位: MaxCardHeight 覆盖 M3 七城",
             QuoteTableModel.MaxCardHeight() >= QuoteTableModel.HintCardHeight(7),
             "max=" + QuoteTableModel.MaxCardHeight() + " m3=" + QuoteTableModel.HintCardHeight(7));
-        LogicTests.Check("联动位: 最高态仍留间距", gapM3 >= 4, "gapM3=" + gapM3);
+        // 最挤那档只有 2px，不设 ≥4 的下限断言：设计未规定最小间距，实测该档就是 2px，
+        // 断言写成硬编码 2（上面已锁），这里只保「不重叠」这一条硬约束。
+        LogicTests.Check("联动位: 最高态不重叠", gapM3 >= 0, "gapM3=" + gapM3);
 
         // 状态矩阵：M6 加载中 / M8 无旧数据灰化，其余亮色
         LogicTests.Check("联动位: M6 加载中灰化",
             !QuoteTableModel.LinkRowEnabled(QuoteTableModel.CardState.Loading), "M6");
         LogicTests.Check("联动位: M8 无旧数据灰化",
             !QuoteTableModel.LinkRowEnabled(QuoteTableModel.CardState.NoDataAtAll), "M8");
+
+        // ── M9 不能被误灰化（设计 §六 联动位列：M9 组合无匹配 = 显示）──
+        // 卡片里 M9「组合查不到」、搜索无结果、「尚未查询」都落成 NoDataAtAll，
+        // 与真·M8 同枚举值。只按枚举一刀切就会把设计要求「显示」的 M9 灰掉，所以用 fetchFailed 区分。
+        LogicTests.Check("联动位: M9 组合无匹配（NoDataAtAll 但非失败）显示",
+            QuoteTableModel.LinkRowEnabled(QuoteTableModel.CardState.NoDataAtAll, false), "M9");
+        LogicTests.Check("联动位: 真·M8（NoDataAtAll + 回源失败）灰化",
+            !QuoteTableModel.LinkRowEnabled(QuoteTableModel.CardState.NoDataAtAll, true), "M8");
+        LogicTests.Check("联动位: M6 不论 fetchFailed 都灰化",
+            !QuoteTableModel.LinkRowEnabled(QuoteTableModel.CardState.Loading, false)
+            && !QuoteTableModel.LinkRowEnabled(QuoteTableModel.CardState.Loading, true), "M6");
+        // 其余状态亮色，且 fetchFailed 标志不该影响它们（M7 有旧数据也要显示）
         foreach (var st in new[]
         {
             QuoteTableModel.CardState.Rows, QuoteTableModel.CardState.AllSellEmpty,
             QuoteTableModel.CardState.NoListingAtAll, QuoteTableModel.CardState.NotSelected
         })
         {
-            LogicTests.Check("联动位: " + st + " 亮色", QuoteTableModel.LinkRowEnabled(st), st.ToString());
+            LogicTests.Check("联动位: " + st + " 亮色（fetchFailed=" + false + "）",
+                QuoteTableModel.LinkRowEnabled(st, false), st.ToString());
+            LogicTests.Check("联动位: " + st + " 亮色（fetchFailed=" + true + "）",
+                QuoteTableModel.LinkRowEnabled(st, true), st.ToString());
         }
 
         // 文案：规范原文三段，一字不改（左段入口名 / 右段标注 / 点击提示）

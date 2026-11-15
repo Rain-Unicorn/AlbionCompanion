@@ -133,15 +133,30 @@ namespace AlbionCompanion.Core
         }
 
         /// <summary>
+        /// 联动位是否亮色（authoritative）。设计 §六 联动位列要求：
+        /// M6 加载中灰化、M8「失败且无旧数据」灰化，其余（含 M1–M5、M7、M9 组合无匹配）显示。
+        ///
+        /// 为什么不能只看枚举：M9「组合无匹配」、搜索无结果、「尚未查询」在卡片里都落成
+        /// CardState.NoDataAtAll，但它们不是 M8——按枚举一刀切会把设计要求「显示」的 M9 灰掉。
+        /// 所以 M8 由调用方给出的 fetchFailed 显式标志判定（真回源失败且无旧数据才是 M8）。
+        /// </summary>
+        public static bool LinkRowEnabled(CardState state, bool fetchFailed)
+        {
+            if (state == CardState.Loading) return false;
+            if (state == CardState.NoDataAtAll && fetchFailed) return false;
+            return true;
+        }
+
+        /// <summary>
         /// 联动位顶部 y（相对市场页内容区）。
-        /// 规范布局表把内容区按 736 算（联动位 y=708，卡底 700 + 8 间距）；
-        /// 本面板可绘高度是 740（PanelForm 830 − 页头 52 − 页脚 38），
-        /// 所以联动位贴内容区底边：740 − 28 = 712，与规范同一相对位置（距底 0、距卡 8）。
+        /// 内容区按规范布局表的 736 算：联动位 y=708，紧贴内容区底边（708 + 28 = 736）。
+        /// 不按 PanelForm 的 740 算——宿主面板 y=56、高 740 底边落到 796，
+        /// 而页脚带从 792 起画，最后 4px 压在页脚线上；736 才是真正可见的内容区高度。
         /// 卡片自身高度由 PreferredCardHeight / HintCardHeight 给出，这里只校验它不压到联动位。
         /// </summary>
         public static int LinkRowTop(int contentHeight)
         {
-            int h = contentHeight <= 0 ? 740 : contentHeight;
+            int h = contentHeight <= 0 ? ContentHeight : contentHeight;
             return h - LinkRowHeight;
         }
 
@@ -164,8 +179,12 @@ namespace AlbionCompanion.Core
         // ── 市场页纵向布局（设计 rev27 布局表 + 联动位）──
         // 放 Core 的理由：这些位置之间有硬约束（卡片最高态不能压到联动位），
         // 写成可算的常量才能在离线测试里验；UI 只按它们摆放控件，不另写一份数字。
-        /// <summary>市场页可绘内容区高 = PanelForm 830 − 页头 52 − 页脚 38。</summary>
-        public const int ContentHeight = 740;
+        /// <summary>
+        /// 市场页内容区高 = 规范布局表的 736（联动位 y=708，708+28 正好贴底）。
+        /// 不取 PanelForm 的 740：宿主面板 y=56、高 740，底边落到 796，
+        /// 而页脚带从 792 起画，最后 4px 会压在页脚上——736 才是真正可见的内容区高度。
+        /// </summary>
+        public const int ContentHeight = 736;
         /// <summary>
         /// 亚服时效条顶。规范 §3 说「页头与时效条之间无间距（同属页头带）」，
         /// 所以它紧贴页头文字底（缓存计数 40..55）落在 56。

@@ -64,6 +64,7 @@ namespace AlbionCompanion.UI.Controls
         private string? _emptyDetail = "检查网络或稍后重试";
         private bool _showRetry;
         private string? _warnBar;     // M7：刷新失败但有旧数据
+        private bool _fetchFailed;    // M8：本次回源失败且无旧数据（区分「取不到」与「组合不存在 / 搜索无结果」）
         private int _hoverRow = -1;
         private int _loadingCities = 6;  // M6：骨架按本次查询的城市数给占位行位
 
@@ -95,6 +96,7 @@ namespace AlbionCompanion.UI.Controls
             _state = QuoteTableModel.StateOf(_rows);
             _hoverRow = -1;
             _warnBar = null;
+            _fetchFailed = false;
             // M3 用 36px 提示行（比底注高 8），高度必须与 CardHeightNow 同源
             Height = _state == QuoteTableModel.CardState.AllSellEmpty
                 ? QuoteTableModel.HintCardHeight(_rows.Count)
@@ -107,6 +109,7 @@ namespace AlbionCompanion.UI.Controls
         {
             _rows = new List<QuoteViewRow>();
             _state = QuoteTableModel.CardState.NotSelected;
+            _fetchFailed = false;
             _emptyTitle = "↑ 请先选择物品";
             _emptyDetail = "在左侧选满一级 / 二级 / 三级与阶级后显示各城报价";
             _showRetry = false;
@@ -122,6 +125,7 @@ namespace AlbionCompanion.UI.Controls
         {
             _rows = new List<QuoteViewRow>();
             _state = QuoteTableModel.CardState.NoDataAtAll;
+            _fetchFailed = false;     // 「尚未查询」不是失败态，联动位仍显示
             _emptyTitle = "尚未查询该组合";
             _emptyDetail = "点击「查询行情」回源各城报价";
             _showRetry = true;
@@ -138,6 +142,7 @@ namespace AlbionCompanion.UI.Controls
         {
             _rows = new List<QuoteViewRow>();
             _state = QuoteTableModel.CardState.Loading;
+            _fetchFailed = false;
             _emptyTitle = "查询中";
             _emptyDetail = "";
             _showRetry = false;
@@ -152,6 +157,7 @@ namespace AlbionCompanion.UI.Controls
         {
             _rows = new List<QuoteViewRow>();
             _state = QuoteTableModel.CardState.NoDataAtAll;
+            _fetchFailed = true;      // 真·M8：联动位按设计 §六 灰化
             _emptyTitle = "取不到亚服数据";
             _emptyDetail = "检查网络或稍后重试";
             _showRetry = true;
@@ -162,11 +168,14 @@ namespace AlbionCompanion.UI.Controls
         /// <summary>
         /// 通用空态：搜索无结果 / 组合不存在等「不是网络失败」的提示。
         /// 明确写清原因 + 不显示无关缓存（搜索无结果时旧实现会回落渲染全量缓存，这里由调用方给提示）。
+        /// 这类空态**不是** M8：设计 §六 里 M9「组合无匹配」的联动位是「显示」，
+        /// 所以这里不打 _fetchFailed，联动位保持亮色。
         /// </summary>
         public void SetMessage(string title, string detail, bool showRetry)
         {
             _rows = new List<QuoteViewRow>();
             _state = QuoteTableModel.CardState.NoDataAtAll;
+            _fetchFailed = false;     // M9 等业务空态：联动位按设计仍显示
             _emptyTitle = title ?? "";
             _emptyDetail = detail ?? "";
             _showRetry = showRetry;
@@ -195,6 +204,16 @@ namespace AlbionCompanion.UI.Controls
 
         public int RowCount { get { return _rows.Count; } }
         public QuoteTableModel.CardState State { get { return _state; } }
+
+        /// <summary>
+        /// 联动位是否该灰化（设计 §六 联动位列）：只有 M6 加载中、以及真·M8（回源失败且无旧数据）灰化。
+        /// 不能直接用 State==NoDataAtAll —— M9 组合无匹配 / 搜索无结果 / 「尚未查询」共用这个枚举值，
+        /// 但设计里这三态联动位都是「显示」。
+        /// </summary>
+        public bool LinkRowDimmed
+        {
+            get { return !QuoteTableModel.LinkRowEnabled(_state, _fetchFailed); }
+        }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
@@ -659,8 +678,8 @@ namespace AlbionCompanion.UI.Controls
     /// 不跳转、不展开」。所以这里不接任何跳转逻辑，只画一条入口行 + 一个外链图标。
     ///
     /// 模块边界（用户原话「跑商相关不要放到市场模块，市场只是查价的」）：
-    /// 本控件只承载「入口 / 后续扩展」这一层，**不出现跨城价差、套利、税后净额、利润**——
-    /// 那些归跑商页。文案由 QuoteTableModel 的常量给出，避免 UI 里散落字符串。
+    /// 本控件只承载「入口 / 后续扩展」这一层，不承载任何算账内容——那些归跑商页。
+    /// 文案由 QuoteTableModel 的常量给出，避免 UI 里散落字符串。
     ///
     /// 状态：M6 加载中 / M8 无旧数据灰化（规范 §六），其余状态亮色。
     /// </summary>
@@ -689,7 +708,20 @@ namespace AlbionCompanion.UI.Controls
         /// <summary>按报价卡状态灰化/点亮（规范 §六：M6 / M8 灰化）。</summary>
         public void SetEnabled(QuoteTableModel.CardState cardState)
         {
-            bool enabled = QuoteTableModel.LinkRowEnabled(cardState);
+            ApplyEnabled(QuoteTableModel.LinkRowEnabled(cardState));
+        }
+
+        /// <summary>
+        /// 按卡片给出的精确灰化判定设置（M6 / 真·M8 灰，M9 组合无匹配等业务空态仍亮）。
+        /// 与 SetEnabled(CardState) 并存：后者是纯枚举映射，前者补上「同为 NoDataAtAll 但语义不同」的区分。
+        /// </summary>
+        public void SetDimmed(bool dimmed)
+        {
+            ApplyEnabled(!dimmed);
+        }
+
+        private void ApplyEnabled(bool enabled)
+        {
             if (_enabled == enabled) return;
             _enabled = enabled;
             Cursor = _enabled ? Cursors.Hand : Cursors.Default;
@@ -719,9 +751,10 @@ namespace AlbionCompanion.UI.Controls
             g.Clear(Th.Bg);
             int w = ClientSize.Width > 0 ? ClientSize.Width : QuoteTableModel.LinkRowWidth;
 
-            // 灰化态用次要色，亮色态用主文字 + 悬停转 accent（悬停才轻反馈，不改变「标注位」的性质）
-            Color titleColor = !_enabled ? Th.Sub : (_hover ? Th.Accent : Th.Text);
-            Color subColor = Th.Sub;
+            // 设计 §3.5：左段 L5 取 text-3、右段 L6 取 text-4，这一段是标注位不是主信息，
+            // 所以亮色态也不用主文字色；悬停转 accent 只给轻反馈，不改变「标注位」的性质。
+            Color titleColor = _enabled ? (_hover ? Th.Accent : Th.Sub) : Th.Line;
+            Color subColor = _enabled ? Th.Sub : Th.Line;
 
             var titleRect = new Rectangle(0, 0, 300, QuoteTableModel.LinkRowHeight);
             TextRenderer.DrawText(g, QuoteTableModel.LinkRowTitle, _titleFont, titleRect, titleColor,
@@ -732,7 +765,7 @@ namespace AlbionCompanion.UI.Controls
             int iconSize = 16;
             var iconRect = new Rectangle(w - 16 - iconSize, (QuoteTableModel.LinkRowHeight - iconSize) / 2,
                 iconSize, iconSize);
-            DrawExternalIcon(g, iconRect, _enabled ? Th.Sub : Th.Sub);
+            DrawExternalIcon(g, iconRect, subColor);
             TextRenderer.DrawText(g, QuoteTableModel.LinkRowBadge, _badgeFont,
                 new Rectangle(iconRect.X - 8 - 64, 0, 64, QuoteTableModel.LinkRowHeight), subColor,
                 TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
